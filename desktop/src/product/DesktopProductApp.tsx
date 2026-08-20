@@ -68,11 +68,7 @@ function withSessionDocumentEvolution(
   task: ScienceProjectConfigV2["task"],
   targets: ScienceProjectConfigV2["evolution"]["targets"],
 ): ScienceProjectConfigV2 {
-  return {
-    ...config,
-    task,
-    evolution: { targets },
-  } as ScienceProjectConfigV2;
+  return { ...config, task, evolution: { targets } } as ScienceProjectConfigV2;
 }
 
 export interface DesktopProductAppProps {
@@ -260,10 +256,12 @@ export function DesktopProductApp({
   const mutationIntents = provider.listMutationIntents();
   const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
   const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
-  const sessionEvolutionAvailable = developmentAgentBridge || (
+  const developmentEvolutionActive = developmentAgentBridge && (
+    snapshot.runtimePresentation?.evolutionRuns?.some((run) => run.state === "running") === true
+  );
+  const sessionEvolutionAvailable = !developmentAgentBridge && (
     displayedProject !== null && snapshot.capability?.project_id === displayedProject.project_id
   );
-
   const runProject = async (
     project: ProjectV2,
     task: ScienceProjectConfigV2["task"],
@@ -330,7 +328,7 @@ export function DesktopProductApp({
       setWorkspace("research");
       setSelectedTaskId(submittedTask.task_id);
       setActionStatus(developmentAgentBridge
-        ? "The remote Session started. Codex and the selected evolution methods are running in the background."
+        ? "The remote Session started. Its transcript will become reusable evidence in Evolution."
         : "Task admitted with immutable Project Head and execution authority.");
     } catch (error) {
       setActionError(userMessageV2(error));
@@ -449,7 +447,7 @@ export function DesktopProductApp({
               capability={snapshot.capability}
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
-              busy={busy}
+              busy={busy || developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
@@ -523,10 +521,36 @@ export function DesktopProductApp({
               project={displayedProject}
               snapshot={snapshot}
               provider={provider}
-              busy={busy}
+              busy={busy || developmentEvolutionActive}
               onSave={(config) => void act(
                 () => provider.updateProject(displayedProject.project_id, displayedProject.display_name, config, intentFor(snapshot, "save-evolution")),
                 "Project configuration saved. Validate again before the next Task.",
+              )}
+              onStartRun={(sourceTaskIds, selections) => void act(
+                async () => {
+                  if (!provider.startEvolutionRun) throw new Error("Standalone Evolution Runs are unavailable in this build.");
+                  await provider.startEvolutionRun(
+                    displayedProject.project_id,
+                    sourceTaskIds,
+                    selections,
+                    intentFor(snapshot, "start-evolution-run"),
+                  );
+                },
+                "Evolution Run started. Its outputs remain candidates until you apply them.",
+              )}
+              onApplyRun={(runId) => void act(
+                async () => {
+                  if (!provider.applyEvolutionRun) throw new Error("Evolution candidate apply is unavailable in this build.");
+                  await provider.applyEvolutionRun(runId, intentFor(snapshot, "apply-evolution-run"));
+                },
+                "Evolution candidate applied. Future Sessions will use the updated context.",
+              )}
+              onRetryJob={(jobId) => void act(
+                async () => {
+                  if (!provider.retryEvolutionJob) throw new Error("Evolution retry is unavailable in this build.");
+                  await provider.retryEvolutionJob(jobId, intentFor(snapshot, "retry-evolution-job"));
+                },
+                "Evolution method retry started with the same evidence.",
               )}
             />
           ) : (
@@ -1296,38 +1320,12 @@ function ResearchWorkspaceV2({
           <p className="form-help">Starting the session saves these instructions and runs them as the next task.</p>
         </div>
         {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy}>
-          <legend>Evolution after this session <span>Optional · select any number</span></legend>
-          <div className="session-evolution-options">
-            {sessionEvolutionCapabilities.map((target) => {
-              const selection = selectedEvolutionTargets[target.target_id]!;
-              return <article key={target.target_id} className={selection.enabled ? "selected" : ""}>
-                <label>
-                  <input type="checkbox" checked={selection.enabled} onChange={(event) => {
-                    setSelectedEvolutionTargets((current) => ({
-                      ...current,
-                      [target.target_id]: { ...selection, enabled: event.target.checked },
-                    }));
-                  }} />
-                  <span><strong>{target.display_name}</strong><small>{target.description}</small></span>
-                </label>
-                {target.methods.length > 1 ? <select aria-label={`${target.display_name} method`} value={selection.method ?? ""} onChange={(event) => {
-                  const method = target.methods.find((candidate) => candidate.method_id === event.target.value)!;
-                  let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
-                  try { defaultConfig = JSON.parse(method.default_config_json) as typeof defaultConfig; } catch { defaultConfig = {}; }
-                  setSelectedEvolutionTargets((current) => ({
-                    ...current,
-                    [target.target_id]: { enabled: true, method: method.method_id, config: defaultConfig },
-                  }));
-                }}>{target.methods.map((method) => <option key={method.method_id} value={method.method_id}>{method.display_name}</option>)}</select> : null}
-              </article>;
-            })}
-          </div>
-          <p>{selectedEvolutionCount === 0
-            ? "No evolution will run after this session."
-            : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
+          <legend>Evolution after this session <span>Optional · formal contract</span></legend>
+          <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
+          <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
         </fieldset> : null}
         {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? selectedEvolutionCount : Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} selected</strong></div></div>
+        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? `${selectedEvolutionCount} selected` : "Run separately"}</strong></div></div>
       </section>
       <section className="product-panel active-run-panel">
         <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
@@ -1684,9 +1682,9 @@ function TaskAuthorityCardV2({
         ) : null}
       </section>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
-        <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title="Evolution" description="Changes learned from this Session and prepared for future Sessions." metric={`${producedArtifacts.length} produced`} icon={Sparkles} tone="evolution" />
+        <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title={presentation?.selectedEvolution?.length ? "Evolution" : "Evolution evidence"} description={presentation?.selectedEvolution?.length ? "Evolution methods attached by the legacy per-Session workflow." : "This Session transcript can be combined with other completed Sessions from the Evolution workspace."} metric={presentation?.selectedEvolution?.length ? `${producedArtifacts.length} produced` : "Available"} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
-          <div><span className="panel-kicker">Selected for this session</span><strong>{presentation?.selectedEvolution?.length ?? 0} methods</strong></div>
+          <div><span className="panel-kicker">{presentation?.selectedEvolution?.length ? "Selected for this legacy session" : "Independent workflow"}</span><strong>{presentation?.selectedEvolution?.length ? `${presentation.selectedEvolution.length} methods` : "Ready for selection"}</strong></div>
           {presentation?.selectedEvolution?.length ? (
             <EvolutionJobStatusCollectionV2
               selections={presentation.selectedEvolution}
@@ -1695,7 +1693,7 @@ function TaskAuthorityCardV2({
               busy={busy}
               onRetry={onRetryEvolutionJob}
             />
-          ) : <p>No Evolution method was selected for this Session.</p>}
+          ) : <p>No Evolution method ran inside this Session. Open Evolution to select this transcript, combine evidence, and create a reviewable candidate.</p>}
         </div>
         <EvolutionResultCollection
           artifacts={producedArtifacts}
@@ -1949,15 +1947,39 @@ function EvolutionWorkspaceV2({
   provider,
   busy,
   onSave,
+  onStartRun,
+  onApplyRun,
+  onRetryJob,
 }: {
   readonly project: ProjectV2;
   readonly snapshot: DesktopProductSnapshotV2;
   readonly provider: DesktopProductProviderV2;
   readonly busy: boolean;
   readonly onSave: (config: ScienceProjectConfigV2) => void;
+  readonly onStartRun: (
+    sourceTaskIds: readonly string[],
+    selections: readonly {
+      readonly targetId: string;
+      readonly method: string;
+      readonly config: Readonly<Record<string, unknown>>;
+    }[],
+  ) => void;
+  readonly onApplyRun: (runId: string) => void;
+  readonly onRetryJob: (jobId: string) => void;
 }) {
   const [targets, setTargets] = useState(project.config.evolution.targets);
   useEffect(() => setTargets(project.config.evolution.targets), [project.project_config_sha256]);
+  const standaloneAvailable = provider.startEvolutionRun !== undefined
+    && provider.applyEvolutionRun !== undefined;
+  const completedTasks = useMemo(() => snapshot.tasks.filter((task) => (
+    task.project_id === project.project_id && task.state === "closed"
+  )), [project.project_id, snapshot.tasks]);
+  const completedTaskKey = completedTasks.map((task) => task.task_id).join("|");
+  const [selectedTaskIds, setSelectedTaskIds] = useState<readonly string[]>([]);
+  useEffect(() => {
+    if (!standaloneAvailable) return;
+    setSelectedTaskIds(completedTasks.map((task) => task.task_id));
+  }, [completedTaskKey, project.project_id, standaloneAvailable]);
   const capabilities = snapshot.capability?.project_id === project.project_id
     ? snapshot.capability.capabilities.targets.filter((target) => target.exposure === "desktop")
     : [];
@@ -1965,12 +1987,42 @@ function EvolutionWorkspaceV2({
     artifact.project_id === project.project_id
     && !["dataset", "workspace_result", "diagnostic"].includes(artifact.artifact_type)
   ));
+  const runs = [...(snapshot.runtimePresentation?.evolutionRuns ?? [])
+    .filter((run) => run.projectId === project.project_id)]
+    .reverse();
+  const latestRun = runs[0];
+  useEffect(() => {
+    if (!standaloneAvailable || latestRun === undefined) return;
+    setTargets({
+      ...project.config.evolution.targets,
+      ...Object.fromEntries(latestRun.selections.map((selection) => [selection.targetId, {
+        enabled: true,
+        method: selection.method,
+        config: selection.config as ScienceProjectConfigV2["evolution"]["targets"][string]["config"],
+      }])),
+    });
+  }, [latestRun?.runId, project.project_config_sha256, standaloneAvailable]);
+  const allJobs = Object.values(snapshot.runtimePresentation?.tasks ?? {})
+    .flatMap((task) => task.evolutionJobs ?? []);
+  const enabledSelections = Object.entries(targets).flatMap(([targetId, selection]) => (
+    selection.enabled && selection.method
+      ? [{ targetId, method: selection.method, config: selection.config }]
+      : []
+  ));
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
-      <div className="workspace-heading"><div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Review what changed and which Project Head the next session will use.</p></div></div>
+      <div className="workspace-heading"><div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p></div></div>
       {project.active_project_head ? <section className="revision-strip"><div className="revision-node active"><span>Active Project Head</span><strong>Project Head {project.active_project_head.generation}</strong><small>Used by the next session</small></div></section> : null}
+      {standaloneAvailable ? <section className="product-panel task-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
+        {completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task) => {
+          const selected = selectedTaskIds.includes(task.task_id);
+          const title = snapshot.runtimePresentation?.tasks[task.task_id]?.instruction?.title ?? task.task_id;
+          return <article key={task.task_id} className={selected ? "selected" : ""}><label><input type="checkbox" checked={selected} disabled={busy} onChange={(event) => setSelectedTaskIds((current) => event.target.checked ? [...current, task.task_id] : current.filter((id) => id !== task.task_id))} /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)} · transcript evidence</small></span></label></article>;
+        })}</div>}
+      </section> : null}
       <section className="product-panel task-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">Verified remote registry</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
+        <div className="panel-heading"><div><span className="panel-kicker">{standaloneAvailable ? "Step 2 · Methods" : "Verified remote registry"}</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
         {capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
           const methodId = current.method ?? target.effective_default_method_id ?? "";
@@ -1988,15 +2040,22 @@ function EvolutionWorkspaceV2({
           const selectedResolver = resolvers.find((resolver) => resolver.selection_value === methodId);
           const selectionAccepted = target.accepted_methods.some((method) => method.method_id === methodId)
             || selectedResolver?.supported === true;
-          return <article key={target.target_id}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><label>Method<select value={methodId} disabled={!current.enabled} onChange={(event) => {
+          return <article key={target.target_id}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} disabled={busy} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><label>Method<select value={methodId} disabled={busy || !current.enabled} onChange={(event) => {
             const selected = methods.find((method) => method.method_id === event.target.value);
             let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
             try { defaultConfig = selected ? JSON.parse(selected.default_config_json) as typeof defaultConfig : {}; } catch { defaultConfig = {}; }
             setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: true, method: event.target.value, config: defaultConfig } }));
-          }}><option value="">No supported default</option>{resolvers.map((resolver) => <option key={`resolver:${resolver.selection_value}`} value={resolver.selection_value} disabled={!resolver.supported}>{resolver.display_name}</option>)}{methods.map((method) => <option key={`method:${method.method_id}`} value={method.method_id}>{method.display_name}</option>)}</select></label>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This enabled target has no method accepted by the active remote registry and blocks Task admission.</p> : null}</article>;
+          }}><option value="">No supported default</option>{resolvers.map((resolver) => <option key={`resolver:${resolver.selection_value}`} value={resolver.selection_value} disabled={!resolver.supported}>{resolver.display_name}</option>)}{methods.map((method) => <option key={`method:${method.method_id}`} value={method.method_id}>{method.display_name}</option>)}</select></label>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This target has no method accepted by the active registry.</p> : null}</article>;
         })}</div>}
-        <div className="v2-primary-row"><button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button></div>
+        <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div>
       </section>
+      {standaloneAvailable ? <section className="product-panel task-panel">
+        <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Evolution Runs</h2></div><span className="muted-pill">{runs.length} total</span></div>
+        {runs.length === 0 ? <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div> : <div className="v2-evolution-job-list">{runs.map((run) => {
+          const jobs = allJobs.filter((job) => run.jobIds.includes(job.jobId));
+          return <article className={`v2-evolution-job ${run.state}`} key={run.runId}><header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={16} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{run.selections.map((selection) => selection.targetId.replaceAll("_", " ")).join(", ")}</strong><small>{run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(run.createdAt)}</small></div></div><span className={`state-pill ${run.state}`}>{run.state.replaceAll("_", " ")}</span></header>{run.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{run.error}</p></div> : null}<div className="v2-card-actions">{run.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy} onClick={() => onApplyRun(run.runId)}>Apply to future Sessions</button> : null}{run.state === "applied" ? <span className="muted-pill">Active context</span> : null}{jobs.filter((job) => job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {job.targetId.replaceAll("_", " ")}</button>)}</div></article>;
+        })}</div>}
+      </section> : null}
       <EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} />
     </div>
   );

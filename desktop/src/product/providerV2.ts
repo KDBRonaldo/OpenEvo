@@ -59,6 +59,22 @@ export interface DesktopProductSnapshotV2 {
 }
 
 export interface RuntimePresentationV2 {
+  readonly evolutionRuns?: readonly {
+    readonly runId: string;
+    readonly projectId: string;
+    readonly sourceTaskIds: readonly string[];
+    readonly selections: readonly {
+      readonly targetId: string;
+      readonly method: string;
+      readonly config: Readonly<Record<string, unknown>>;
+    }[];
+    readonly state: "running" | "candidate_ready" | "applied" | "failed";
+    readonly artifactIds: readonly string[];
+    readonly jobIds: readonly string[];
+    readonly error: string | null;
+    readonly createdAt: string;
+    readonly updatedAt: string;
+  }[];
   readonly tasks: Readonly<Record<string, {
     readonly instruction: { readonly title: string; readonly objective: string } | null;
     readonly transcript: readonly { readonly speaker: "user" | "agent" | "system"; readonly text: string }[];
@@ -118,6 +134,8 @@ export interface RuntimePresentationV2 {
     readonly statusDetail: string;
     readonly documents: readonly { readonly path: string; readonly content: string }[];
     readonly previousArtifactId: string | null;
+    readonly evolutionRunId?: string | null;
+    readonly applied?: boolean;
     readonly diffLines: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
   }>>;
   readonly workspaces?: Readonly<Record<string, {
@@ -219,6 +237,17 @@ export interface DesktopProductProviderV2 {
   cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
   retryEvolutionJob?(jobId: string, intent: ProductMutationIntentV2): Promise<void>;
+  startEvolutionRun?(
+    projectId: string,
+    sourceTaskIds: readonly string[],
+    selections: readonly {
+      readonly targetId: string;
+      readonly method: string;
+      readonly config: Readonly<Record<string, unknown>>;
+    }[],
+    intent: ProductMutationIntentV2,
+  ): Promise<void>;
+  applyEvolutionRun?(runId: string, intent: ProductMutationIntentV2): Promise<void>;
   uploadWorkspaceFile?(
     projectId: string,
     upload: WorkspaceFileUploadV2,

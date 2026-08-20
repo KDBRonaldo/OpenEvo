@@ -129,21 +129,23 @@ For the narrower "ask the remote Codex and evolve selected documents" loop, use
 its target, method, support, schema, and renderer metadata from the Core framework
 catalog at `GET /openevo-dev-agent/v1/capabilities`. The response is explicitly
 marked `development_catalog_unverified`; it is not a verified release registry.
-The development bridge executes compatible legacy-worker methods selected for each
-successful Session and rejects unknown target/method pairs or undeclared outputs. A
+The development bridge seals every successful Session as reusable transcript evidence.
+Evolution is started separately from the Evolution workspace: the user selects one or
+more completed Sessions plus compatible legacy-worker methods, and the bridge rejects
+unknown target/method pairs or undeclared outputs. A
 selection value such as `agent_system.method=auto` is resolved through the Core-owned
 method-selection boundary; the daemon records and invokes only the resulting concrete
-method. Each completed Session is also sealed as a persistent transcript dataset. Input
-artifacts are assembled from the method descriptor's binding sources, so history methods
-receive the project's ordered prior datasets plus the current dataset without method-ID
-branches in Desktop or the daemon. The
+method. Input artifacts are assembled from the method descriptor's binding sources, so
+history methods receive exactly the selected ordered datasets without method-ID branches
+in Desktop or the daemon. Outputs remain reviewable candidates and are excluded from
+runtime context until the user explicitly applies the Evolution Run. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
 SSH command, or remote address. The development daemon stores Projects, active
 Project selection, Session state, instructions, Codex responses, model label,
-duration, errors, process-log summaries, per-Session evolution selections,
-per-target method/config/job state/artifact IDs, and versioned typed artifacts in
+duration, errors, process-log summaries, standalone Evolution Runs, their selected
+Session evidence, per-target method/config/job state/artifact IDs, and versioned typed artifacts in
 the remote SQLite database `~/.openevo/dev-agent/state.sqlite3`. Dataset and
 generated artifact payloads live under
 `~/.openevo/dev-agent/evolution-artifacts/`. Before the next Project Session, the
@@ -566,14 +568,17 @@ same ownership boundary as release responses.
 ## Real-agent development Session lifecycle
 
 The loopback development bridge admits `POST /openevo-dev-agent/v1/sessions`
-asynchronously. It returns HTTP 202 with a durable `session_id`; Codex and the
-selected evolution methods then run on a daemon-owned background thread. The
+asynchronously. It returns HTTP 202 with a durable `session_id`; Codex runs on a
+daemon-owned background thread and completion seals its transcript dataset without
+running Evolution. The
 Desktop provider refreshes the persisted remote state while a Session is
 `running` or `cancelling`, so transcript, logs, workspace changes, failures and
 terminal status survive renderer refreshes. A running Session can be cancelled
 through `POST /openevo-dev-agent/v1/sessions/<id>/cancel`.
 
-Every selected Evolution method owns a durable Job plus ordered Attempts. Each
+`POST /openevo-dev-agent/v1/evolution-runs` admits a separate durable Evolution Run
+against an explicit set of completed Session IDs and method selections. Every selected
+method owns a durable Job plus ordered Attempts. Each
 Attempt records its current stage, bounded diagnostic log, typed error code,
 error message, timestamps, and produced artifact IDs. A failed method can be
 retried independently through
@@ -582,7 +587,10 @@ original Session transcript dataset, ordered history dataset IDs, previous
 target artifact, resolved concrete method, and normalized method config; it
 does not rerun the Agent or silently adopt newer Project settings. Desktop
 polls while that Attempt is active and exposes both failure details and the
-complete Attempt history in the Session's Evolution section.
+complete Attempt history in the Evolution workspace. Successful outputs remain
+unapplied candidates. `POST /openevo-dev-agent/v1/evolution-runs/<run-id>/apply`
+atomically replaces the active artifact for each produced target; only then can later
+Sessions receive those artifacts as runtime context.
 
 Harness mechanics are isolated behind `HarnessAdapter`. The first concrete
 implementation is `CodexHarnessAdapter`, which owns runtime preparation,

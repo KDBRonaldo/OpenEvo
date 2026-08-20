@@ -62,6 +62,7 @@ describe("development agent provider", () => {
     const sessions: Record<string, unknown>[] = [];
     const artifacts: Record<string, unknown>[] = [];
     const evolutionJobs: Record<string, unknown>[] = [];
+    const evolutionRuns: Record<string, unknown>[] = [];
     const workspaces: Record<string, unknown>[] = [];
     let activeProjectId: string | null = null;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -77,6 +78,7 @@ describe("development agent provider", () => {
           sessions,
           artifacts,
           evolution_jobs: evolutionJobs,
+          evolution_runs: evolutionRuns,
           workspaces,
         });
       }
@@ -223,6 +225,27 @@ describe("development agent provider", () => {
         });
         return jsonResponse({ schema_version: "1", job: evolutionJobs[0] }, 202);
       }
+      if (url.endsWith("/evolution-runs") && init?.method === "POST") {
+        evolutionRuns.push({
+          run_id: "evolution-run-1",
+          project_id: body!.project_id,
+          source_session_ids: body!.session_ids,
+          selections: body!.selections,
+          state: "candidate_ready",
+          artifact_ids: [],
+          error: null,
+          created_at: "2026-08-14T10:04:00Z",
+          updated_at: "2026-08-14T10:04:01Z",
+        });
+        return jsonResponse({ schema_version: "1", run: evolutionRuns[0] }, 202);
+      }
+      if (url.endsWith("/evolution-runs/evolution-run-1/apply") && init?.method === "POST") {
+        Object.assign(evolutionRuns[0]!, {
+          state: "applied",
+          updated_at: "2026-08-14T10:05:00Z",
+        });
+        return jsonResponse({ schema_version: "1", run: evolutionRuns[0] });
+      }
       if (url.includes("/workspace/files?") && init?.method === "PUT") {
         const requestUrl = new URL(url, "http://localhost");
         const path = requestUrl.searchParams.get("path")!;
@@ -312,6 +335,26 @@ describe("development agent provider", () => {
       state: "completed",
       attempts: [{ ordinal: 1, state: "failed" }, { ordinal: 2, state: "completed" }],
     });
+    await provider.startEvolutionRun?.(
+      project.project_id,
+      [task.task_id],
+      [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
+      { actionId: "evolve-evidence", streamEpoch: retried.snapshot.stream.epoch },
+    );
+    let afterEvolution = await provider.refresh();
+    if (afterEvolution.status !== "fresh") throw new Error("Evolution provider was not fresh");
+    expect(afterEvolution.snapshot.runtimePresentation?.evolutionRuns?.[0]).toMatchObject({
+      runId: "evolution-run-1",
+      sourceTaskIds: [task.task_id],
+      state: "candidate_ready",
+    });
+    await provider.applyEvolutionRun?.(
+      "evolution-run-1",
+      { actionId: "apply-evolution", streamEpoch: afterEvolution.snapshot.stream.epoch },
+    );
+    afterEvolution = await provider.refresh();
+    if (afterEvolution.status !== "fresh") throw new Error("Applied Evolution provider was not fresh");
+    expect(afterEvolution.snapshot.runtimePresentation?.evolutionRuns?.[0]?.state).toBe("applied");
     await provider.uploadWorkspaceFile?.(
       project.project_id,
       {

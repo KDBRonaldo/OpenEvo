@@ -11,6 +11,7 @@ const artifactSchema = z.object({
   artifact_id: z.string().min(1),
   project_id: z.string().min(1),
   session_id: z.string().min(1),
+  run_id: z.string().min(1).nullable().default(null),
   target_id: z.string().min(1),
   artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory", "report"]),
   method: z.string().min(1),
@@ -26,6 +27,7 @@ const artifactSchema = z.object({
   content_sha256: z.string().regex(/^[0-9a-f]{64}$/),
   byte_size: z.number().int().nonnegative(),
   previous_artifact_id: z.string().min(1).nullable(),
+  promoted: z.boolean().default(true),
   created_at: z.string().min(1),
 }).strict();
 
@@ -125,6 +127,7 @@ const stateSchema = z.object({
   evolution_jobs: z.array(z.object({
     job_id: z.string().min(1),
     session_id: z.string().min(1),
+    run_id: z.string().min(1).nullable().default(null),
     target_id: z.string().min(1),
     method_id: z.string().min(1),
     requested_method_id: z.string().min(1).optional(),
@@ -152,6 +155,21 @@ const stateSchema = z.object({
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
   }).strict()),
+  evolution_runs: z.array(z.object({
+    run_id: z.string().min(1),
+    project_id: z.string().min(1),
+    source_session_ids: z.array(z.string().min(1)).min(1),
+    selections: z.array(z.object({
+      target_id: z.string().min(1),
+      method: z.string().min(1),
+      config: z.record(z.string(), z.unknown()).default({}),
+    }).strict()).min(1),
+    state: z.enum(["running", "candidate_ready", "applied", "failed"]),
+    artifact_ids: z.array(z.string().min(1)),
+    error: z.string().nullable(),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
+  }).strict()).default([]),
   workspaces: z.array(workspaceSnapshotSchema).default([]),
 }).strict();
 
@@ -272,6 +290,7 @@ export function createDevelopmentAgentProvider(
         evolutionJobs: payload.evolution_jobs.map((job) => ({
           jobId: job.job_id,
           sessionId: job.session_id,
+          runId: job.run_id,
           targetId: job.target_id,
           methodId: job.method_id,
           requestedMethodId: job.requested_method_id ?? job.method_id,
@@ -298,6 +317,21 @@ export function createDevelopmentAgentProvider(
           })),
           createdAt: job.created_at,
           updatedAt: job.updated_at,
+        })),
+        evolutionRuns: payload.evolution_runs.map((run) => ({
+          runId: run.run_id,
+          projectId: run.project_id,
+          sourceSessionIds: run.source_session_ids,
+          selections: run.selections.map((selection) => ({
+            targetId: selection.target_id,
+            method: selection.method,
+            config: selection.config,
+          })),
+          state: run.state,
+          artifactIds: run.artifact_ids,
+          error: run.error,
+          createdAt: run.created_at,
+          updatedAt: run.updated_at,
         })),
         workspaces: payload.workspaces.map(toWorkspaceSnapshot),
         capabilities: capabilityPayload.capabilities,
@@ -342,6 +376,27 @@ export function createDevelopmentAgentProvider(
     retryEvolutionJob: async (jobId) => {
       await requestJson(
         `/evolution-jobs/${encodeURIComponent(jobId)}/retry`,
+        jsonRequest("POST", { schema_version: "1" }),
+      );
+    },
+    startEvolutionRun: async (projectId, sourceSessionIds, selections) => {
+      await requestJson(
+        "/evolution-runs",
+        jsonRequest("POST", {
+          schema_version: "1",
+          project_id: projectId,
+          session_ids: sourceSessionIds,
+          selections: selections.map((selection) => ({
+            target_id: selection.targetId,
+            method: selection.method,
+            config: selection.config,
+          })),
+        }),
+      );
+    },
+    applyEvolutionRun: async (runId) => {
+      await requestJson(
+        `/evolution-runs/${encodeURIComponent(runId)}/apply`,
         jsonRequest("POST", { schema_version: "1" }),
       );
     },
@@ -403,6 +458,7 @@ function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
     artifactId: artifact.artifact_id,
     projectId: artifact.project_id,
     sessionId: artifact.session_id,
+    runId: artifact.run_id,
     targetId: artifact.target_id,
     artifactType: artifact.artifact_type,
     method: artifact.method,
@@ -418,6 +474,7 @@ function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
     contentSha256: artifact.content_sha256,
     byteSize: artifact.byte_size,
     previousArtifactId: artifact.previous_artifact_id,
+    promoted: artifact.promoted,
     createdAt: artifact.created_at,
   };
 }

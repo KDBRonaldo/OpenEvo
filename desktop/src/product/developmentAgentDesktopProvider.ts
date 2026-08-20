@@ -72,6 +72,7 @@ export interface PersistedDevelopmentArtifact {
   readonly artifactId: string;
   readonly projectId: string;
   readonly sessionId: string;
+  readonly runId: string | null;
   readonly targetId: string;
   readonly artifactType: "text_memory" | "skill_bundle" | "agent_system" | "parametric_memory" | "report";
   readonly method: string;
@@ -83,12 +84,14 @@ export interface PersistedDevelopmentArtifact {
   readonly contentSha256: string;
   readonly byteSize: number;
   readonly previousArtifactId: string | null;
+  readonly promoted: boolean;
   readonly createdAt: string;
 }
 
 export interface PersistedDevelopmentEvolutionJob {
   readonly jobId: string;
   readonly sessionId: string;
+  readonly runId: string | null;
   readonly targetId: string;
   readonly methodId: string;
   readonly requestedMethodId: string;
@@ -99,6 +102,18 @@ export interface PersistedDevelopmentEvolutionJob {
   readonly artifactIds: readonly string[];
   readonly error: string | null;
   readonly attempts: readonly PersistedDevelopmentEvolutionAttempt[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PersistedDevelopmentEvolutionRun {
+  readonly runId: string;
+  readonly projectId: string;
+  readonly sourceSessionIds: readonly string[];
+  readonly selections: readonly PersistedDevelopmentEvolutionSelection[];
+  readonly state: "running" | "candidate_ready" | "applied" | "failed";
+  readonly artifactIds: readonly string[];
+  readonly error: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -151,6 +166,7 @@ export interface PersistedDevelopmentState {
   readonly sessions: readonly PersistedDevelopmentSession[];
   readonly artifacts: readonly PersistedDevelopmentArtifact[];
   readonly evolutionJobs: readonly PersistedDevelopmentEvolutionJob[];
+  readonly evolutionRuns: readonly PersistedDevelopmentEvolutionRun[];
   readonly workspaces: readonly PersistedDevelopmentWorkspace[];
   readonly capabilities: EvolutionCapabilitiesV2;
 }
@@ -171,6 +187,12 @@ export interface DevelopmentAgentBackend {
   submitAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnSubmission>;
   cancelAgentTurn(sessionId: string): Promise<void>;
   retryEvolutionJob(jobId: string): Promise<void>;
+  startEvolutionRun(
+    projectId: string,
+    sourceSessionIds: readonly string[],
+    selections: readonly PersistedDevelopmentEvolutionSelection[],
+  ): Promise<void>;
+  applyEvolutionRun(runId: string): Promise<void>;
   uploadWorkspaceFile(
     projectId: string,
     path: string,
@@ -225,7 +247,7 @@ function createRemoteBackedDesktopProductProvider(
     (presentation) => presentation.evolutionJobs?.some(
       (job) => job.state === "queued" || job.state === "running",
     ),
-  );
+  ) || snapshot.runtimePresentation?.evolutionRuns?.some((run) => run.state === "running") === true;
 
   const schedulePolling = () => {
     if (pollingTimer !== null || !hasActiveSession()) return;
@@ -448,6 +470,27 @@ function createRemoteBackedDesktopProductProvider(
       notifySubscribers();
       schedulePolling();
     },
+    startEvolutionRun: async (projectId, sourceTaskIds, selections) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.startEvolutionRun(
+        projectId,
+        sourceTaskIds,
+        selections.map((selection) => ({
+          targetId: selection.targetId,
+          method: selection.method,
+          config: selection.config,
+        })),
+      );
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+      schedulePolling();
+    },
+    applyEvolutionRun: async (runId) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.applyEvolutionRun(runId);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+    },
     uploadWorkspaceFile: async (projectId, upload) => {
       await ensureDevelopmentState();
       await options.developmentBackend.uploadWorkspaceFile(
@@ -512,6 +555,7 @@ function createDevelopmentAgentSnapshot(
     sessions: [],
     artifacts: [],
     evolutionJobs: [],
+    evolutionRuns: [],
     workspaces: [],
     capabilities: {
       schema_version: "1",
@@ -597,7 +641,9 @@ function createDevelopmentAgentSnapshot(
         created_at: session.createdAt,
         updated_at: session.updatedAt,
       });
-      const produced = persisted.artifacts.filter((artifact) => artifact.sessionId === session.sessionId);
+      const produced = persisted.artifacts.filter((artifact) => (
+        artifact.sessionId === session.sessionId && artifact.runId === null
+      ));
       taskPresentation[session.sessionId] = {
         instruction: sessionConfig.task,
         transcript: [
@@ -643,7 +689,18 @@ function createDevelopmentAgentSnapshot(
   }));
   const artifactPresentation = Object.fromEntries(persisted.artifacts.map((stored) => {
     const previous = persisted.artifacts.find((candidate) => candidate.artifactId === stored.previousArtifactId);
-    return [stored.artifactId, developmentArtifactPresentation(stored, previous?.documents ?? null)];
+    const presentation = developmentArtifactPresentation(stored, previous?.documents ?? null);
+    const runApplied = stored.runId === null
+      ? stored.promoted
+      : persisted.evolutionRuns.some((run) => run.runId === stored.runId && run.state === "applied");
+    return [stored.artifactId, {
+      ...presentation,
+      statusDetail: stored.runId === null
+        ? presentation.statusDetail
+        : `${runApplied ? "Applied" : "Candidate · not applied"}. ${presentation.statusDetail}`,
+      evolutionRunId: stored.runId,
+      applied: runApplied,
+    }];
   }));
   return {
     state: {
@@ -673,6 +730,20 @@ function createDevelopmentAgentSnapshot(
     validation: null,
     activeOperation: null,
     runtimePresentation: {
+      evolutionRuns: persisted.evolutionRuns.map((run) => ({
+        runId: run.runId,
+        projectId: run.projectId,
+        sourceTaskIds: run.sourceSessionIds,
+        selections: run.selections,
+        state: run.state,
+        artifactIds: run.artifactIds,
+        jobIds: persisted.evolutionJobs
+          .filter((job) => job.runId === run.runId)
+          .map((job) => job.jobId),
+        error: run.error,
+        createdAt: run.createdAt,
+        updatedAt: run.updatedAt,
+      })),
       tasks: taskPresentation,
       artifacts: artifactPresentation,
       workspaces: Object.fromEntries(persisted.workspaces.map((workspace) => [

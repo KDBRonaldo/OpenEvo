@@ -411,6 +411,182 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
     }
 
 
+def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project_id = "development-project-decoupled"
+    store.create_project({
+        "project_id": project_id,
+        "display_name": "Decoupled project",
+        "config": {
+            "evolution": {
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                        "config": {},
+                    }
+                }
+            }
+        },
+    })
+    for index in (1, 2):
+        session_id = f"dev-session-evidence-{index}"
+        store.start_session(session_id, {
+            "project_id": project_id,
+            "project_name": "Decoupled project",
+            "task_title": f"Evidence {index}",
+            "instruction": f"Collect evidence {index}",
+        })
+        store.complete_session(session_id, {
+            "response": f"Observation {index}",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        })
+        dataset = tmp_path / f"dataset-{index}.json"
+        dataset.write_text("{}", encoding="utf-8")
+        store.record_dataset_artifact(
+            artifact_id=f"dataset-{session_id}",
+            project_id=project_id,
+            session_id=session_id,
+            uri=dataset.resolve().as_uri(),
+            name=f"Evidence {index}",
+        )
+
+    assert all(
+        session["selected_evolution"] == []
+        for session in store.snapshot()["sessions"]
+    )
+    request = MODULE.validate_evolution_run_request({
+        "schema_version": "1",
+        "project_id": project_id,
+        "session_ids": ["dev-session-evidence-1", "dev-session-evidence-2"],
+        "selections": [{
+            "target_id": "text_memory",
+            "method": "text_memory_reflector",
+            "config": {},
+        }],
+    })
+    run = store.start_evolution_run("evolution-run-1", request)
+    attempt = store.start_evolution_job(
+        job_id="job-memory-evolution-run-1",
+        session_id="dev-session-evidence-2",
+        run_id=run["run_id"],
+        target_id="text_memory",
+        method_id="text_memory_reflector",
+        requested_method_id="text_memory_reflector",
+        resolver_input_artifact_ids=["dataset-dev-session-evidence-1"],
+        previous_artifact_id=None,
+        config={},
+    )
+    artifact = store.record_evolution_artifact(
+        artifact_id="candidate-memory-1",
+        project_id=project_id,
+        session_id="dev-session-evidence-2",
+        run_id=run["run_id"],
+        target_id="text_memory",
+        artifact_type="text_memory",
+        method_id="text_memory_reflector",
+        renderer_kind="markdown",
+        documents=[{
+            "path": "memory.md",
+            "media_type": "text/markdown",
+            "content": "# Candidate memory",
+        }],
+        manifest={"content_path": "memory.md"},
+        previous_artifact_id=None,
+        promoted=False,
+    )
+    store.finish_evolution_job(
+        "job-memory-evolution-run-1",
+        attempt_id=attempt["attempt_id"],
+        artifact_ids=[artifact["artifact_id"]],
+    )
+    candidate = store.finish_evolution_run(
+        run["run_id"],
+        artifact_ids=[artifact["artifact_id"]],
+        error=None,
+    )
+
+    assert candidate["state"] == "candidate_ready"
+    assert store.latest_context_artifacts(project_id) == []
+    applied = store.apply_evolution_run(run["run_id"])
+    assert applied["state"] == "applied"
+    assert [item["artifact_id"] for item in store.latest_context_artifacts(project_id)] == [
+        "candidate-memory-1"
+    ]
+    second_run = store.start_evolution_run("evolution-run-2", request)
+    second_attempt = store.start_evolution_job(
+        job_id="job-memory-evolution-run-2",
+        session_id="dev-session-evidence-2",
+        run_id=second_run["run_id"],
+        target_id="text_memory",
+        method_id="text_memory_reflector",
+        requested_method_id="text_memory_reflector",
+        resolver_input_artifact_ids=["dataset-dev-session-evidence-1"],
+        previous_artifact_id="candidate-memory-1",
+        config={},
+    )
+    assert second_attempt["ordinal"] == 1
+
+
+def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE development_evolution_jobs (
+                job_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                method_id TEXT NOT NULL,
+                requested_method_id TEXT NOT NULL,
+                resolver_input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                previous_artifact_id TEXT,
+                config_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(session_id, target_id)
+            );
+            CREATE TABLE development_evolution_job_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                error_code TEXT,
+                error_message TEXT,
+                logs_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, ordinal)
+            );
+            """
+        )
+
+    MODULE.DevelopmentStateStore(database)
+
+    with sqlite3.connect(database) as connection:
+        job_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'development_evolution_jobs'"
+        ).fetchone()[0]
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(development_evolution_jobs)"
+            )
+        }
+    assert "run_id" in columns
+    assert "UNIQUE(run_id, target_id)" in job_sql
+    assert "UNIQUE(session_id, target_id)" not in job_sql
+
+
 def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
