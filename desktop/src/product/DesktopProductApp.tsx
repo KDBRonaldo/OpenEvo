@@ -3,6 +3,7 @@ import {
   AlertCircle,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
   BookOpen,
   CheckCircle2,
   ChevronDown,
@@ -391,8 +392,8 @@ export function DesktopProductApp({
     project: ProjectV2,
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
-  ): Promise<void> => {
-    if (project.state !== "ready") return;
+  ): Promise<boolean> => {
+    if (project.state !== "ready") return false;
     setBusy(true);
     setActionError(null);
     setActionStatus(null);
@@ -434,7 +435,7 @@ export function DesktopProductApp({
       );
       if (!validation.valid) {
         setActionError("The active remote registry rejected this project configuration. Correct the failed checks before running.");
-        return;
+        return false;
       }
       // Project validation is itself an authoritative remote mutation and can
       // emit a Desktop event. Refresh again so Task admission is bound to the
@@ -455,9 +456,11 @@ export function DesktopProductApp({
       setActionStatus(developmentAgentBridge
         ? "The remote Session started. Its transcript will become reusable evidence in Evolution."
         : "Task admitted with immutable Project Head and execution authority.");
+      return true;
     } catch (error) {
       setActionError(userMessageV2(error));
       await refresh();
+      return false;
     } finally {
       setBusy(false);
     }
@@ -630,7 +633,7 @@ export function DesktopProductApp({
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
-              onRun={(task, selectedEvolutionTargets) => void runProject(displayedProject, task, selectedEvolutionTargets)}
+              onRun={(task, selectedEvolutionTargets) => runProject(displayedProject, task, selectedEvolutionTargets)}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
                 "Task cancellation requested.",
@@ -1473,7 +1476,7 @@ function ResearchWorkspaceV2({
   readonly onRun: (
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
-  ) => void;
+  ) => Promise<boolean>;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
@@ -1558,6 +1561,8 @@ function ResearchWorkspaceV2({
           timeline={timelines[selectedTask.task_id] ?? []}
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
+          canContinue={ready && activeTask === null}
+          onContinue={(task) => onRun(task, selectedEvolutionTargets)}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
           onRetryEvolutionJob={onRetryEvolutionJob}
@@ -1565,10 +1570,6 @@ function ResearchWorkspaceV2({
           onRetryTransition={() => transition && onRetryTransition(transition)}
           onAbandonTransition={() => transition && onAbandonTransition(transition)}
         />
-        <details className="v2-authority-details session-authority-details">
-          <summary>View this Session's pinned authority</summary>
-          <TaskPinnedAuthorityCardsV2 task={selectedTask} />
-        </details>
       </div>
     );
   }
@@ -1576,7 +1577,7 @@ function ResearchWorkspaceV2({
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
         <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task at a time against the current Project Head.</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => onRun(normalizedTask, selectedEvolutionTargets)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => void onRun(normalizedTask, selectedEvolutionTargets)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
       </div>
       {!ready ? (
         <div className="disabled-reason">
@@ -1876,6 +1877,8 @@ function TaskAuthorityCardV2({
   timeline,
   logs,
   busy,
+  canContinue,
+  onContinue,
   onCancel,
   onRetry,
   onRetryEvolutionJob,
@@ -1892,6 +1895,8 @@ function TaskAuthorityCardV2({
   readonly timeline: DesktopProductSnapshotV2["timelines"][string];
   readonly logs: readonly LogEntryV2[];
   readonly busy: boolean;
+  readonly canContinue: boolean;
+  readonly onContinue: (task: ScienceProjectConfigV2["task"]) => Promise<boolean>;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
@@ -1925,9 +1930,24 @@ function TaskAuthorityCardV2({
     | { readonly kind: "output"; readonly fileName: string }
     | null
   >(null);
-  useEffect(() => setSelectedResult(null), [task.task_id]);
-  const selectedProducedArtifact = selectedResult?.kind === "artifact"
-    && producedArtifacts.some((artifact) => artifact.artifact_id === selectedResult.artifactId);
+  const [followUp, setFollowUp] = useState("");
+  const [submittingFollowUp, setSubmittingFollowUp] = useState(false);
+  useEffect(() => {
+    setSelectedResult(null);
+    setFollowUp("");
+  }, [task.task_id]);
+  const submitFollowUp = async (): Promise<void> => {
+    const objective = followUp.trim();
+    if (!objective || !canContinue || busy || submittingFollowUp) return;
+    const firstLine = objective.split(/\r?\n/, 1)[0]!.trim();
+    const title = (firstLine || "Follow-up research task").slice(0, 256);
+    setSubmittingFollowUp(true);
+    try {
+      if (await onContinue({ title, objective })) setFollowUp("");
+    } finally {
+      setSubmittingFollowUp(false);
+    }
+  };
   const [inspectorWidth, setInspectorWidth] = usePersistedPaneWidth(
     SESSION_INSPECTOR_WIDTH_KEY,
     340,
@@ -1962,10 +1982,49 @@ function TaskAuthorityCardV2({
           </div>
         ) : null}
       </section>
+      <form
+        className="session-chat-composer"
+        aria-label="Continue this project"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submitFollowUp();
+        }}
+      >
+        <div className="session-chat-composer-box">
+          <textarea
+            aria-label="Message for the next Session"
+            placeholder={canContinue
+              ? "Continue this research..."
+              : "The next Session will be available when the current Project Head is ready."}
+            rows={2}
+            maxLength={65_536}
+            value={followUp}
+            disabled={busy || submittingFollowUp || !canContinue}
+            onChange={(event) => setFollowUp(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+          />
+          <button
+            type="submit"
+            aria-label="Start next Session"
+            disabled={!followUp.trim() || busy || submittingFollowUp || !canContinue}
+          >
+            {submittingFollowUp || busy
+              ? <LoaderCircle className="spin" size={18} />
+              : <ArrowUp size={18} />}
+          </button>
+        </div>
+        <small>Starts a new Session with the current Project context. Shift+Enter adds a new line.</small>
+      </form>
       </div>
       <aside className="session-inspector-pane" aria-label="Session inspector">
       <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={340} minimum={280} maximum={560} onChange={setInspectorWidth} direction={-1} edge="left" />
-      <header className="session-inspector-heading"><div><span className="panel-kicker">Session</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
+      {selectedResult ? <div className="session-inspector-preview-mode">{resultInspector}</div> : <>
+      <header className="session-inspector-heading"><div><span className="panel-kicker">Session details</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
         <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title={presentation?.selectedEvolution?.length ? "Evolution" : "Evolution evidence"} description={presentation?.selectedEvolution?.length ? "Evolution methods attached by the legacy per-Session workflow." : "This Session transcript can be combined with other completed Sessions from the Evolution workspace."} metric={presentation?.selectedEvolution?.length ? `${producedArtifacts.length} produced` : "Available"} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
@@ -1986,16 +2045,16 @@ function TaskAuthorityCardV2({
           jobs={presentation?.evolutionJobs ?? []}
           onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })}
         />
-        {selectedProducedArtifact ? resultInspector : null}
       </section>
       <section className="v2-supporting-module v2-session-module" data-session-priority="supporting">
         <SessionModuleHeadingV2 index="03" label="Workspace evidence" title="Context and files" description="Inputs, workspace changes, and files associated with this Session." metric={`${supportingItemCount} items`} icon={FolderOpen} tone="context" />
         <div className="v2-supporting-results"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></div>
-        {selectedResult && !selectedProducedArtifact ? resultInspector : null}
       </section>
-      <section className="v2-session-technical-details v2-session-module" data-session-priority="technical">
+      <details className="session-troubleshooting-disclosure" data-session-priority="technical">
+      <summary><span><Activity size={17} /><span><strong>Technical details</strong><small>IDs, attempts, logs, pinned authority, and recovery controls</small></span></span><ChevronDown size={16} /></summary>
+      <section className="v2-session-technical-details v2-session-module">
         <SessionModuleHeadingV2 index="04" label="Execution trace" title="Technical details" description="Execution status and immutable identifiers for troubleshooting." metric={task.state.replaceAll("_", " ")} icon={Activity} tone="technical" />
-      <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
+      <div className="v2-task-authority"><div><span>Task</span><code>Task {task.task_id}</code><small>{task.state.replaceAll("_", " ")}</small></div><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => {
         const authoritative = attempt.attempt_id === task.authoritative_attempt_id;
         return <div key={attempt.attempt_id}><strong>Attempt {attempt.ordinal}</strong><code>{attempt.attempt_id}</code><small>{formatTimeV2(attempt.created_at)}</small><span className="muted-pill">{authoritative ? `authoritative · ${task.state.replaceAll("_", " ")}` : "superseded"}</span></div>;
@@ -2008,8 +2067,14 @@ function TaskAuthorityCardV2({
         <LifecycleOperationPanelV2 model={transitionPanelModelV2(transition, timeline)} />
       ) : null}
       {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
-      </section>
+      <details className="v2-authority-details session-pinned-authority">
+        <summary>View pinned Project and runtime authority</summary>
+        <TaskPinnedAuthorityCardsV2 task={task} />
+      </details>
       <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadLogs()}>Refresh task logs</button>{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
+      </section>
+      </details>
+      </>}
       </aside>
     </article>
   );
@@ -2055,7 +2120,7 @@ function SessionResultInspectorV2({
           <h3>{title}</h3>
           <p>{artifactPreview?.statusDetail ?? output?.summary ?? "Readable artifact content is unavailable."}</p>
         </div>
-        <button type="button" className="icon-button" aria-label="Close result preview" onClick={onClose}><X size={16} /></button>
+        <button type="button" className="session-result-back-button" aria-label="Back to Session details" onClick={onClose}><ArrowLeft size={14} /> Session details</button>
       </div>
       <div className="segmented-control session-result-tabs" role="tablist" aria-label="Result preview mode">
         <button type="button" role="tab" aria-selected={view === "content"} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Current content</button>

@@ -3881,11 +3881,13 @@ pre.json {
 .session-conversation-pane {
   position: sticky;
   top: 76px;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: min(720px, calc(100dvh - 96px));
   max-height: calc(100dvh - 96px);
   align-self: start;
-  overflow-y: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
   background: var(--surface);
 }
@@ -4003,12 +4005,181 @@ pre.json {
 }
 
 .session-conversation-pane .session-chat-canvas {
-  min-height: 100%;
+  flex: 1;
+  min-height: 0;
   margin: 0;
-  padding: 0;
+  padding: 0 0 24px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 0;
   background: transparent;
   box-shadow: none;
+}
+
+.session-chat-composer {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  padding: 14px 28px 18px;
+  background: linear-gradient(180deg, rgb(255 255 255 / 0%) 0, var(--surface) 24%);
+}
+
+.session-chat-composer-box {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  width: min(820px, 100%);
+  margin: 0 auto;
+  padding: 8px 8px 8px 16px;
+  border: 1px solid #cbd5d0;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 8px 28px rgb(23 48 40 / 10%);
+}
+
+.session-chat-composer-box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgb(46 113 93 / 10%), 0 8px 28px rgb(23 48 40 / 10%);
+}
+
+.session-chat-composer textarea {
+  width: 100%;
+  min-height: 42px;
+  max-height: 150px;
+  padding: 8px 0;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.session-chat-composer textarea::placeholder {
+  color: #87938e;
+}
+
+.session-chat-composer textarea:disabled {
+  cursor: not-allowed;
+}
+
+.session-chat-composer button {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  color: #fff;
+  cursor: pointer;
+}
+
+.session-chat-composer button:disabled {
+  background: #d6ddda;
+  color: #86918c;
+  cursor: not-allowed;
+}
+
+.session-chat-composer > small {
+  display: block;
+  width: min(820px, 100%);
+  margin: 7px auto 0;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.session-inspector-preview-mode {
+  min-height: 100%;
+}
+
+.session-inspector-preview-mode .session-result-inspector {
+  margin: 0;
+  border: 0;
+  background: transparent;
+}
+
+.session-result-back-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.session-result-back-button:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+.session-troubleshooting-disclosure {
+  margin-top: 18px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.session-troubleshooting-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 2px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.session-troubleshooting-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-troubleshooting-disclosure > summary > span {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.session-troubleshooting-disclosure > summary > span > span {
+  display: grid;
+  gap: 2px;
+}
+
+.session-troubleshooting-disclosure > summary strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.session-troubleshooting-disclosure > summary small {
+  font-size: 9px;
+}
+
+.session-troubleshooting-disclosure > summary > svg {
+  flex: 0 0 auto;
+  transition: transform 160ms ease;
+}
+
+.session-troubleshooting-disclosure[open] > summary > svg {
+  transform: rotate(180deg);
+}
+
+.session-inspector-pane .session-troubleshooting-disclosure .v2-session-technical-details {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.session-pinned-authority {
+  margin-top: 4px;
 }
 
 .session-conversation-pane .v2-agent-activity {

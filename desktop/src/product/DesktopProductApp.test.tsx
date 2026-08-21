@@ -1123,6 +1123,7 @@ describe("Desktop v2 product renderer", () => {
       "Mark every unsupported conclusion as a hypothesis",
     );
 
+    await click("Session details");
     await click("results/evidence-review.md");
     expect(document.body.textContent).toContain(
       "workspace-before-session/results/evidence-review.md",
@@ -1223,6 +1224,45 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
+  });
+
+  it("starts the next immutable Session from the conversation composer", async () => {
+    const snapshot = authoritySnapshot();
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Review evidence");
+
+    const composer = document.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Message for the next Session"]',
+    );
+    const submit = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Start next Session"]',
+    );
+    expect(composer).toBeTruthy();
+    expect(submit).toBeTruthy();
+
+    setAriaTextarea("Message for the next Session", "Check the revised report\nand list any remaining gaps.");
+    await act(async () => {
+      submit!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      {
+        ...snapshot.projects[0]!.config,
+        task: {
+          title: "Check the revised report",
+          objective: "Check the revised report\nand list any remaining gaps.",
+        },
+      },
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+    expect(provider.validateProject).toHaveBeenCalled();
+    expect(provider.submitTask).toHaveBeenCalled();
   });
 
   it("shows the latest standalone Evolution result inline and collapses history", async () => {
@@ -2185,6 +2225,21 @@ function setTextarea(label: string, value: string): void {
     candidate.textContent?.includes(label),
   );
   const input = owner?.querySelector<HTMLTextAreaElement>("textarea");
+  if (!input) throw new Error(`textarea not found: ${label}`);
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+function setAriaTextarea(label: string, value: string): void {
+  const input = document.querySelector<HTMLTextAreaElement>(
+    `textarea[aria-label="${label}"]`,
+  );
   if (!input) throw new Error(`textarea not found: ${label}`);
   act(() => {
     const setter = Object.getOwnPropertyDescriptor(
