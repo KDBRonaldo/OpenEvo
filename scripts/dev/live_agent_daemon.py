@@ -979,6 +979,7 @@ class DevelopmentStateStore:
                     selected_evolution_json TEXT NOT NULL DEFAULT '[]',
                     evolution_errors_json TEXT NOT NULL DEFAULT '[]',
                     workspace_changes_json TEXT NOT NULL DEFAULT '[]',
+                    context_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
                     runtime_activation_json TEXT NOT NULL DEFAULT 'null',
                     cancellation_requested INTEGER NOT NULL DEFAULT 0
                         CHECK (cancellation_requested IN (0, 1)),
@@ -1134,6 +1135,11 @@ class DevelopmentStateStore:
                 connection.execute(
                     "ALTER TABLE development_sessions "
                     "ADD COLUMN workspace_changes_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "context_artifact_ids_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN context_artifact_ids_json TEXT NOT NULL DEFAULT '[]'"
                 )
             if "runtime_activation_json" not in session_columns:
                 connection.execute(
@@ -1554,13 +1560,32 @@ class DevelopmentStateStore:
                 raise KeyError(request["project_id"])
             if project["display_name"] != request["project_name"]:
                 raise StateConflictError("project_name does not match the persisted project")
+            context_rows = connection.execute(
+                """
+                SELECT artifact.artifact_id
+                FROM development_evolution_artifacts_v2 AS artifact
+                JOIN (
+                    SELECT target_id, MAX(created_at || artifact_id) AS latest
+                    FROM development_evolution_artifacts_v2
+                    WHERE project_id = ? AND artifact_type != 'report' AND promoted = 1
+                    GROUP BY target_id
+                ) AS selected
+                  ON selected.target_id = artifact.target_id
+                 AND selected.latest = artifact.created_at || artifact.artifact_id
+                WHERE artifact.project_id = ?
+                ORDER BY artifact.target_id
+                """,
+                (request["project_id"], request["project_id"]),
+            ).fetchall()
+            context_artifact_ids = [row["artifact_id"] for row in context_rows]
             connection.execute(
                 """
                 INSERT INTO development_sessions(
                     session_id, project_id, task_title, instruction, response, model,
                     state, duration_ms, logs_json, selected_evolution_json,
-                    evolution_errors_json, workspace_changes_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', NULL, ?, ?)
+                    evolution_errors_json, workspace_changes_json, context_artifact_ids_json,
+                    error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', ?, NULL, ?, ?)
                 """,
                 (
                     session_id,
@@ -1569,6 +1594,7 @@ class DevelopmentStateStore:
                     request["instruction"],
                     canonical_json(["Remote development daemon admitted the session."]),
                     "[]",
+                    canonical_json(context_artifact_ids),
                     now,
                     now,
                 ),
@@ -2427,6 +2453,7 @@ class DevelopmentStateStore:
             ),
             "evolution_errors": json.loads(row["evolution_errors_json"]),
             "workspace_changes": json.loads(row["workspace_changes_json"]),
+            "context_artifact_ids": json.loads(row["context_artifact_ids_json"]),
             "runtime_activation": json.loads(row["runtime_activation_json"]),
             "evolution_evidence_ready": evolution_evidence_ready,
             "error": row["error"],

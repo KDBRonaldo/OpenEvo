@@ -156,6 +156,7 @@ export interface PersistedDevelopmentSession {
   readonly evolutionErrors: readonly PersistedDevelopmentEvolutionError[];
   readonly evolutionEvidenceReady: boolean;
   readonly workspaceChanges: readonly PersistedDevelopmentWorkspaceChange[];
+  readonly contextArtifactIds: readonly string[];
   readonly error: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -658,7 +659,10 @@ function createDevelopmentAgentSnapshot(
         evolutionEvidenceReady: session.evolutionEvidenceReady,
         evolutionJobs: persisted.evolutionJobs
           .filter((job) => job.sessionId === session.sessionId),
-        usedArtifactIds: produced.flatMap((artifact) => artifact.previousArtifactId ? [artifact.previousArtifactId] : []),
+        usedArtifactIds: [...new Set([
+          ...session.contextArtifactIds,
+          ...produced.flatMap((artifact) => artifact.previousArtifactId ? [artifact.previousArtifactId] : []),
+        ])],
         producedArtifactIds: produced.map((artifact) => artifact.artifactId),
       };
       if (session.state === "completed") {

@@ -371,10 +371,11 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "state": "completed",
         "duration_ms": 123,
         "logs": ["Remote development daemon admitted the session.", "admitted", "completed"],
-        "selected_evolution": [],
-        "evolution_errors": [],
-        "workspace_changes": [],
-        "runtime_activation": {
+            "selected_evolution": [],
+            "evolution_errors": [],
+            "workspace_changes": [],
+            "context_artifact_ids": [],
+            "runtime_activation": {
             "schema_version": "1",
             "adapter_id": "codex-development-v1",
             "fully_supported": True,
@@ -520,6 +521,18 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
     assert [item["artifact_id"] for item in store.latest_context_artifacts(project_id)] == [
         "candidate-memory-1"
     ]
+    store.start_session("dev-session-uses-applied-context", {
+        "project_id": project_id,
+        "project_name": "Decoupled project",
+        "task_title": "Use applied context",
+        "instruction": "Use the current memory",
+    })
+    started_session = next(
+        session
+        for session in store.snapshot()["sessions"]
+        if session["session_id"] == "dev-session-uses-applied-context"
+    )
+    assert started_session["context_artifact_ids"] == ["candidate-memory-1"]
     second_run = store.start_evolution_run("evolution-run-2", request)
     second_attempt = store.start_evolution_job(
         job_id="job-memory-evolution-run-2",

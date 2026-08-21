@@ -662,6 +662,9 @@ describe("Desktop v2 product renderer", () => {
   beforeEach(() => {
     document.body.innerHTML = '<div id="root"></div>';
     window.sessionStorage.clear();
+    window.localStorage.removeItem("openevo.desktop.layout.project-pane-width");
+    window.localStorage.removeItem("openevo.desktop.layout.session-pane-width");
+    window.localStorage.removeItem("openevo.desktop.layout.session-inspector-width");
     window.history.replaceState(null, "", window.location.pathname);
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -767,6 +770,11 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-activitybar")).toBeTruthy();
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
+    const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize Project pane"]');
+    expect(projectResizer).toBeTruthy();
+    await act(async () => projectResizer!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
+    expect(document.querySelector<HTMLElement>(".product-v2-shell")?.style.getPropertyValue("--project-pane-width")).toBe("260px");
+    expect(window.localStorage.getItem("openevo.desktop.layout.project-pane-width")).toBe("260");
     expect(document.body.textContent).toContain("report.md");
     expect(document.body.textContent).toContain("Review evidence");
 
@@ -776,6 +784,8 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Review evidence");
     expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
+    expect(document.querySelector('[aria-label="Session inspector"]')).toBeTruthy();
+    expect(document.querySelector('[role="separator"][aria-label="Resize Session inspector"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
     expect(document.body.textContent).toContain("I checked the evidence table");
     expect(document.body.textContent).toContain("Context used");

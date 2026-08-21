@@ -1396,7 +1396,7 @@ pre.json {
 }
 
 .product-v2-shell {
-  grid-template-columns: 64px 248px 232px minmax(0, 1fr);
+  grid-template-columns: 64px var(--project-pane-width, 248px) var(--session-pane-width, 232px) minmax(0, 1fr);
   min-width: 1120px;
 }
 
@@ -1479,6 +1479,46 @@ pre.json {
   flex-direction: column;
   overflow: hidden;
   background: #f7f9f7;
+}
+
+.product-pane-resizer {
+  position: absolute;
+  z-index: 40;
+  top: 0;
+  right: -5px;
+  bottom: 0;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.product-pane-resizer.edge-left {
+  right: auto;
+  left: -5px;
+}
+
+.product-pane-resizer > span {
+  position: absolute;
+  top: 0;
+  right: 4px;
+  bottom: 0;
+  width: 1px;
+  background: transparent;
+  transition: width 120ms ease, background 120ms ease;
+}
+
+.product-pane-resizer:hover > span,
+.product-pane-resizer:focus-visible > span,
+.product-pane-resizing .product-pane-resizer > span {
+  width: 3px;
+  background: var(--accent);
+}
+
+.product-pane-resizing,
+.product-pane-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 .session-explorer {
@@ -3454,7 +3494,7 @@ pre.json {
   }
 
   .product-v2-shell {
-    grid-template-columns: 56px 200px 190px minmax(0, 1fr);
+    grid-template-columns: 56px var(--project-pane-width, 200px) var(--session-pane-width, 190px) minmax(0, 1fr);
   }
 
   .product-main {
@@ -3794,14 +3834,19 @@ pre.json {
 }
 
 .product-v2-shell .v2-task-result-detail {
-  padding: 20px;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(420px, 1fr) var(--session-inspector-width, 340px);
+  align-items: start;
+  overflow: visible;
+  padding: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
 }
 
 .session-detail-workspace {
-  width: min(1120px, 100%);
+  width: 100%;
   margin: 0 auto;
 }
 
@@ -3831,6 +3876,115 @@ pre.json {
 
 .session-detail-workspace > .v2-task-result-detail {
   width: 100%;
+}
+
+.session-conversation-pane {
+  min-width: 0;
+  padding: 24px 28px 32px;
+}
+
+.session-inspector-pane {
+  position: sticky;
+  top: 76px;
+  min-width: 0;
+  max-height: calc(100dvh - 96px);
+  align-self: start;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 18px 16px 22px;
+  border-left: 1px solid var(--line);
+  border-radius: 0 8px 8px 0;
+  background: #f7f9f7;
+}
+
+.session-inspector-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 2px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-inspector-heading h2 {
+  margin: 4px 0 0;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.session-inspector-pane .v2-evolution-priority,
+.session-inspector-pane .v2-supporting-module,
+.session-inspector-pane .v2-session-technical-details {
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.session-inspector-pane .v2-evolution-priority {
+  margin-top: 0;
+  padding-top: 16px;
+  border-top: 0;
+}
+
+.session-inspector-pane .v2-session-module-heading {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.session-inspector-pane .v2-session-module-identity {
+  gap: 9px;
+}
+
+.session-inspector-pane .v2-session-module-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+}
+
+.session-inspector-pane .v2-session-module-heading h2 {
+  font-size: 16px;
+}
+
+.session-inspector-pane .v2-session-module-heading p {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.session-inspector-pane .v2-session-module-heading > strong {
+  width: max-content;
+  margin: 0 0 0 39px;
+  padding: 4px 7px;
+  font-size: 9px;
+}
+
+.session-inspector-pane .session-evolution-summary,
+.session-inspector-pane .v2-evolution-result-collection,
+.session-inspector-pane .v2-result-section,
+.session-inspector-pane .session-result-inspector {
+  padding: 12px !important;
+}
+
+.session-inspector-pane .v2-supporting-results,
+.session-inspector-pane .v2-task-authority {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.session-inspector-pane .v2-result-artifacts button,
+.session-inspector-pane .v2-output-files button {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.session-inspector-pane .v2-card-actions {
+  flex-wrap: wrap;
+}
+
+.session-conversation-pane .v2-conversation-section {
+  margin-top: 24px;
 }
 
 .product-v2-shell .v2-evolution-results .artifact-body {

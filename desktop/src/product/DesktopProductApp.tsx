@@ -32,6 +32,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
 } from "react";
 import { DesktopApiErrorV2 } from "../api/v2/client";
 import type { LogEntryV2 } from "../api/v2/logs";
@@ -62,6 +63,109 @@ import {
 } from "./providerV2";
 
 type Workspace = "research" | "evolution" | "system";
+
+const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
+const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
+const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width";
+
+function clampPaneWidth(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, Math.round(value)));
+}
+
+function usePersistedPaneWidth(
+  storageKey: string,
+  initialWidth: number,
+  minimum: number,
+  maximum: number,
+): readonly [number, (width: number) => void] {
+  const [width, setWidth] = useState(() => {
+    try {
+      const stored = Number.parseInt(globalThis.localStorage?.getItem(storageKey) ?? "", 10);
+      return Number.isFinite(stored)
+        ? clampPaneWidth(stored, minimum, maximum)
+        : initialWidth;
+    } catch {
+      return initialWidth;
+    }
+  });
+  const updateWidth = useCallback((nextWidth: number) => {
+    const normalized = clampPaneWidth(nextWidth, minimum, maximum);
+    setWidth(normalized);
+    try {
+      globalThis.localStorage?.setItem(storageKey, String(normalized));
+    } catch {
+      // Layout persistence is a convenience; browser privacy settings may disable it.
+    }
+  }, [maximum, minimum, storageKey]);
+  return [width, updateWidth] as const;
+}
+
+function VerticalResizeHandle({
+  label,
+  value,
+  defaultValue,
+  minimum,
+  maximum,
+  onChange,
+  direction = 1,
+  edge = "right",
+}: {
+  readonly label: string;
+  readonly value: number;
+  readonly defaultValue: number;
+  readonly minimum: number;
+  readonly maximum: number;
+  readonly onChange: (width: number) => void;
+  readonly direction?: 1 | -1;
+  readonly edge?: "left" | "right";
+}) {
+  const drag = useRef<{ readonly pointerId: number; readonly startX: number; readonly startWidth: number } | null>(null);
+  useEffect(() => () => {
+    if (drag.current) document.body.classList.remove("product-pane-resizing");
+  }, []);
+  const finish = (target: HTMLDivElement, pointerId: number): void => {
+    if (drag.current?.pointerId !== pointerId) return;
+    drag.current = null;
+    target.releasePointerCapture?.(pointerId);
+    document.body.classList.remove("product-pane-resizing");
+  };
+  return (
+    <div
+      className={`product-pane-resizer edge-${edge}`}
+      role="separator"
+      aria-label={label}
+      aria-orientation="vertical"
+      aria-valuemin={minimum}
+      aria-valuemax={maximum}
+      aria-valuenow={value}
+      tabIndex={0}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        drag.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: value };
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+        document.body.classList.add("product-pane-resizing");
+        event.preventDefault();
+      }}
+      onPointerMove={(event) => {
+        const activeDrag = drag.current;
+        if (activeDrag?.pointerId !== event.pointerId) return;
+        onChange(activeDrag.startWidth + ((event.clientX - activeDrag.startX) * direction));
+      }}
+      onPointerUp={(event) => finish(event.currentTarget, event.pointerId)}
+      onPointerCancel={(event) => finish(event.currentTarget, event.pointerId)}
+      onDoubleClick={() => onChange(defaultValue)}
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? 32 : 12;
+        if (event.key === "ArrowLeft") onChange(value - (step * direction));
+        else if (event.key === "ArrowRight") onChange(value + (step * direction));
+        else if (event.key === "Home") onChange(minimum);
+        else if (event.key === "End") onChange(maximum);
+        else return;
+        event.preventDefault();
+      }}
+    ><span /></div>
+  );
+}
 
 function withSessionDocumentEvolution(
   config: ScienceProjectConfigV2,
@@ -94,6 +198,18 @@ export function DesktopProductApp({
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
+  const [projectPaneWidth, setProjectPaneWidth] = usePersistedPaneWidth(
+    PROJECT_PANE_WIDTH_KEY,
+    248,
+    180,
+    440,
+  );
+  const [sessionPaneWidth, setSessionPaneWidth] = usePersistedPaneWidth(
+    SESSION_PANE_WIDTH_KEY,
+    232,
+    180,
+    420,
+  );
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectEditing, setProjectEditing] = useState(false);
@@ -402,7 +518,15 @@ export function DesktopProductApp({
   };
 
   return (
-    <div className="product-shell product-v2-shell" data-provider-kind="desktop_sidecar" data-api-version="2">
+    <div
+      className="product-shell product-v2-shell"
+      data-provider-kind="desktop_sidecar"
+      data-api-version="2"
+      style={{
+        "--project-pane-width": `${projectPaneWidth}px`,
+        "--session-pane-width": `${sessionPaneWidth}px`,
+      } as CSSProperties}
+    >
       <aside className="product-activitybar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop" title="OpenEvo Desktop">
           <span className="product-mark"><OpenEvoMark /></span>
@@ -427,6 +551,8 @@ export function DesktopProductApp({
         onSelectFile={(path) => { setWorkspace("research"); setSelectedTaskId(null); setSelectedWorkspacePath(path); }}
         onUpload={uploadWorkspaceFiles}
         generation={generation}
+        paneWidth={projectPaneWidth}
+        onResizePane={setProjectPaneWidth}
       />
 
       <SessionExplorerV2
@@ -436,6 +562,8 @@ export function DesktopProductApp({
         selectedTaskId={selectedTaskId}
         onSelectTask={(taskId) => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(taskId); }}
         onNewSession={() => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(null); }}
+        paneWidth={sessionPaneWidth}
+        onResizePane={setSessionPaneWidth}
       />
 
       <div className="product-stage">
@@ -1184,6 +1312,8 @@ function ProjectExplorerV2({
   onSelectFile,
   onUpload,
   generation,
+  paneWidth,
+  onResizePane,
 }: {
   readonly projects: readonly ProjectV2[];
   readonly activeProject: ProjectV2 | null;
@@ -1196,6 +1326,8 @@ function ProjectExplorerV2({
   readonly onSelectFile: (path: string) => void;
   readonly onUpload: (files: readonly File[], overwrite: boolean) => void;
   readonly generation: number;
+  readonly paneWidth: number;
+  readonly onResizePane: (width: number) => void;
 }) {
   const entries = [...(workspace?.entries ?? [])].sort((left, right) => left.path.localeCompare(right.path));
   const files = entries.filter((entry) => entry.kind === "file");
@@ -1245,6 +1377,7 @@ function ProjectExplorerV2({
       </div>
       {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
       <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
+      <VerticalResizeHandle label="Resize Project pane" value={paneWidth} defaultValue={248} minimum={180} maximum={440} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1256,6 +1389,8 @@ function SessionExplorerV2({
   selectedTaskId,
   onSelectTask,
   onNewSession,
+  paneWidth,
+  onResizePane,
 }: {
   readonly project: ProjectV2 | null;
   readonly tasks: readonly TaskV2[];
@@ -1263,6 +1398,8 @@ function SessionExplorerV2({
   readonly selectedTaskId: string | null;
   readonly onSelectTask: (taskId: string) => void;
   readonly onNewSession: () => void;
+  readonly paneWidth: number;
+  readonly onResizePane: (width: number) => void;
 }) {
   return (
     <aside className="session-explorer" aria-label="Project sessions">
@@ -1271,6 +1408,7 @@ function SessionExplorerV2({
       <div className="session-explorer-list">
         {tasks.length ? tasks.map((task, index) => <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{presentation?.[task.task_id]?.instruction?.title ?? `Session ${tasks.length - index}`}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{task.state.replaceAll("_", " ")}</em></button>) : <div className="explorer-empty">No Sessions yet. Create the first task in the central workspace.</div>}
       </div>
+      <VerticalResizeHandle label="Resize Session list pane" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1792,6 +1930,12 @@ function TaskAuthorityCardV2({
   useEffect(() => setSelectedResult(null), [task.task_id]);
   const selectedProducedArtifact = selectedResult?.kind === "artifact"
     && producedArtifacts.some((artifact) => artifact.artifact_id === selectedResult.artifactId);
+  const [inspectorWidth, setInspectorWidth] = usePersistedPaneWidth(
+    SESSION_INSPECTOR_WIDTH_KEY,
+    340,
+    280,
+    560,
+  );
   const resultInspector = selectedResult ? (
     <SessionResultInspectorV2
       selection={selectedResult}
@@ -1802,7 +1946,11 @@ function TaskAuthorityCardV2({
     />
   ) : null;
   return (
-    <article className="v2-task-card v2-task-result-detail">
+    <article
+      className="v2-task-card v2-task-result-detail"
+      style={{ "--session-inspector-width": `${inspectorWidth}px` } as CSSProperties}
+    >
+      <div className="session-conversation-pane">
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
       <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
@@ -1819,6 +1967,10 @@ function TaskAuthorityCardV2({
           </div>
         ) : null}
       </section>
+      </div>
+      <aside className="session-inspector-pane" aria-label="Session inspector">
+      <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={340} minimum={280} maximum={560} onChange={setInspectorWidth} direction={-1} edge="left" />
+      <header className="session-inspector-heading"><div><span className="panel-kicker">Session inspector</span><h2>Context, Evolution and run details</h2></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
         <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title={presentation?.selectedEvolution?.length ? "Evolution" : "Evolution evidence"} description={presentation?.selectedEvolution?.length ? "Evolution methods attached by the legacy per-Session workflow." : "This Session transcript can be combined with other completed Sessions from the Evolution workspace."} metric={presentation?.selectedEvolution?.length ? `${producedArtifacts.length} produced` : "Available"} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
@@ -1863,6 +2015,7 @@ function TaskAuthorityCardV2({
       {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
       </section>
       <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadLogs()}>Refresh task logs</button>{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
+      </aside>
     </article>
   );
 }
