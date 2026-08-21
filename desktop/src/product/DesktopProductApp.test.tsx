@@ -1083,12 +1083,16 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
-    expect(document.body.textContent).toContain("Task result");
     expect(document.body.textContent).toContain("Review evidence");
     expect(document.body.textContent).toContain("I checked the evidence table");
     expect(document.body.textContent).toContain("results/evidence-review.md");
     expect(document.body.textContent).toContain("Evolution produced");
-    expect(document.body.textContent).toContain("01 / Session dialogue");
+    expect(document.body.textContent).not.toContain("Conversation");
+    const chatCanvas = document.querySelector('[aria-label="Session conversation"]');
+    expect(chatCanvas).toBeTruthy();
+    expect(chatCanvas?.querySelector(".v2-session-module-heading")).toBeNull();
+    expect(chatCanvas?.querySelector("article.user")?.textContent).toContain("Review the evidence");
+    expect(chatCanvas?.querySelector("article.agent")?.textContent).toContain("I checked the evidence table");
     expect(document.body.textContent).toContain("02 / Cross-session adaptation");
     expect(document.body.textContent).toContain("03 / Workspace evidence");
     expect(document.body.textContent).toContain("Context and files");
@@ -1106,7 +1110,7 @@ describe("Desktop v2 product renderer", () => {
       [...document.querySelectorAll("[data-session-priority]")].map((node) =>
         node.getAttribute("data-session-priority"),
       ),
-    ).toEqual(["task", "conversation", "evolution", "supporting", "technical"]);
+    ).toEqual(["conversation", "evolution", "supporting", "technical"]);
 
     await click("Memory · Update");
     expect(
@@ -1613,7 +1617,7 @@ describe("Desktop v2 product renderer", () => {
 
     const conversation = document.querySelector(".v2-conversation-section")!;
     expect(conversation.textContent).toContain("Review the evidence and update the workspace.");
-    expect(conversation.textContent).toContain("2 messages");
+    expect(conversation.textContent).not.toContain("Conversation");
     expect(conversation.textContent).not.toContain("Task closed after successor activation.");
   });
 

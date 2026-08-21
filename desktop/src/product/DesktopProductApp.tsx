@@ -13,7 +13,6 @@ import {
   FileText,
   History,
   LoaderCircle,
-  MessageSquareText,
   PanelLeft,
   Play,
   Plus,
@@ -1917,7 +1916,6 @@ function TaskAuthorityCardV2({
       sequence: entry.sequence,
     })),
   ];
-  const conversationCount = presentation?.transcript.length ?? fallbackTranscript.length;
   const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
@@ -1951,11 +1949,8 @@ function TaskAuthorityCardV2({
       style={{ "--session-inspector-width": `${inspectorWidth}px` } as CSSProperties}
     >
       <div className="session-conversation-pane">
-      <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
-      <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
-      <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
-        <SessionModuleHeadingV2 index="01" label="Session dialogue" title="Conversation" description="The request and the Agent's response from this Session." metric={sessionInProgress ? "Agent working" : `${conversationCount} messages`} icon={MessageSquareText} tone="conversation" />
-        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && transcriptLogs.length ? <div className="v2-transcript">{fallbackTranscript.map((entry, index) => <article key={("sequence" in entry ? entry.sequence : `${entry.speaker}-${index}`)} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="v2-empty-copy">The agent response is not loaded yet.</p> : null}
+      <section className="v2-conversation-section session-chat-canvas" data-session-priority="conversation" aria-label="Session conversation">
+        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && transcriptLogs.length ? <div className="v2-transcript">{fallbackTranscript.map((entry, index) => <article key={("sequence" in entry ? entry.sequence : `${entry.speaker}-${index}`)} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
             <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
@@ -1970,7 +1965,7 @@ function TaskAuthorityCardV2({
       </div>
       <aside className="session-inspector-pane" aria-label="Session inspector">
       <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={340} minimum={280} maximum={560} onChange={setInspectorWidth} direction={-1} edge="left" />
-      <header className="session-inspector-heading"><div><span className="panel-kicker">Session inspector</span><h2>Context, Evolution and run details</h2></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
+      <header className="session-inspector-heading"><div><span className="panel-kicker">Session</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
         <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title={presentation?.selectedEvolution?.length ? "Evolution" : "Evolution evidence"} description={presentation?.selectedEvolution?.length ? "Evolution methods attached by the legacy per-Session workflow." : "This Session transcript can be combined with other completed Sessions from the Evolution workspace."} metric={presentation?.selectedEvolution?.length ? `${producedArtifacts.length} produced` : "Available"} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
