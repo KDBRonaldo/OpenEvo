@@ -6,8 +6,10 @@ External Beta product boundary or replace the canonical product specification.
 ## Purpose
 
 This slice adopts the useful part of nanobot's WebUI shape: one remote gateway origin serves
-the browser application and REST calls. OpenEvo keeps its existing Daemon authority. A durable
-event channel is not part of this development slice yet.
+the browser application and REST calls. OpenEvo keeps its existing Daemon authority. The Web
+Layer now exposes the existing strict Desktop v2 SSE channel with bounded in-process replay;
+after a Web Layer restart, the renderer recovers from the Daemon's authoritative snapshot rather
+than treating an event payload as domain state.
 
 ```text
 browser (desktop/src exactly as of 52ed54a)
@@ -16,6 +18,7 @@ browser (desktop/src exactly as of 52ed54a)
 OpenEvo development Web Layer (remote loopback service)
   |- bundled copy of the existing Desktop renderer
   |- existing browser bootstrap -> Desktop session
+  |- /desktop/v2/events -> bounded change notification and cursor replay
   `- /openevo-dev-agent/v1 compatibility proxy and daemon credential isolation
   |
   v
@@ -94,7 +97,8 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `GET /openevo`: the bundled, unchanged Desktop renderer.
 - `POST /openevo-native/browser/bootstrap`: existing browser bootstrap exchange.
 - `/desktop/v2/*`: primary Project/Task control plane used by the unchanged renderer through a
-  formal provider adapter.
+  formal provider adapter. `/desktop/v2/events` reports daemon snapshot changes, accepts the
+  renderer's `Last-Event-ID`, and wakes the renderer to reload authoritative state.
 - `/openevo-dev-agent/v1/*`: authenticated development-only presentation and standalone
   Evolution compatibility surface; it no longer owns Project or Task browser mutations.
 

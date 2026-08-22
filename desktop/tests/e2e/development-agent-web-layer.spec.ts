@@ -15,6 +15,15 @@ async function assertNoProductErrors(page: Page): Promise<void> {
 test("real browser can create a project, run an agent session, and produce evolution output", async ({ page }, testInfo: TestInfo) => {
   const browserErrors: string[] = [];
   const observedRequests: string[] = [];
+  let eventConnectionAttempts = 0;
+  await page.route("**/desktop/v2/events", async (route) => {
+    eventConnectionAttempts += 1;
+    if (eventConnectionAttempts === 1) {
+      await route.abort("connectionfailed");
+      return;
+    }
+    await route.continue();
+  });
   page.on("request", (request) => {
     const url = new URL(request.url());
     observedRequests.push(`${request.method()} ${url.pathname}`);
@@ -39,6 +48,8 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
     expect(observedRequests).toContain("GET /desktop/v2/state");
+    await expect.poll(() => eventConnectionAttempts, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
+    expect(observedRequests).toContain("GET /desktop/v2/events");
     await assertNoProductErrors(page);
   });
 
@@ -74,6 +85,15 @@ test("real browser can create a project, run an agent session, and produce evolu
       timeout: 10 * 60 * 1000,
     });
     await expect(detail.getByLabel("Agent")).toContainText(RESULT_MARKER, { timeout: 60_000 });
+    await assertNoProductErrors(page);
+  });
+
+  await test.step("reload the browser and hydrate the same authoritative Session", async () => {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+    const detail = page.getByTestId("session-detail-workspace");
+    await expect(detail).toBeVisible({ timeout: 120_000 });
+    await expect(detail.locator(".session-inspector-heading .state-pill")).toHaveText("closed");
+    await expect(detail.getByLabel("Agent")).toContainText(RESULT_MARKER);
     await assertNoProductErrors(page);
   });
 

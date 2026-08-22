@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,13 +40,18 @@ from desktop.server.browser_host import install_browser_host_routes
 from desktop.server.app import create_desktop_app
 from desktop.sidecar.contracts.v2 import models as m
 from desktop.sidecar.contracts.v2.app import create_desktop_local_v2_contract_app
+from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from openevo.backend.contracts.v2 import models as core
 
 
 OPENAPI_SHA256 = "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af"
 EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
 RELEASE_VERSION = "0.1.10-dev-agent-web-v1"
-FEATURES = ["development_agent_bridge_v2", "mutation_idempotency_v2"]
+FEATURES = [
+    "development_agent_bridge_v2",
+    "event_replay_v2",
+    "mutation_idempotency_v2",
+]
 PROFILE_ID = "development-agent-profile"
 ETAG = f'"{"b" * 64}"'
 DIGEST = "a" * 64
@@ -53,6 +59,7 @@ MAX_DEVELOPMENT_DAEMON_STATE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
 STATE_CACHE_SECONDS = 1.0
+STATE_EVENT_POLL_SECONDS = 0.25
 LOGGER = logging.getLogger("openevo.development_agent_web_layer")
 
 
@@ -134,13 +141,21 @@ class DevelopmentDaemonClient:
 
 
 class DevelopmentAgentDesktopV2Provider:
-    def __init__(self, client: DevelopmentDaemonClient, *, source_commit: str) -> None:
+    def __init__(
+        self,
+        client: DevelopmentDaemonClient,
+        *,
+        source_commit: str,
+        event_broker: DesktopEventBrokerV2 | None = None,
+    ) -> None:
         self._client = client
         self._source_commit = source_commit
+        self._event_broker = event_broker or DesktopEventBrokerV2()
         self._operations: dict[str, m.LifecycleOperationV2] = {}
         self._actions: dict[str, str] = {}
         self._state_cache: dict[str, object] | None = None
         self._state_cache_deadline = 0.0
+        self._state_lock = threading.RLock()
         self._started_at = _now()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
@@ -183,19 +198,29 @@ class DevelopmentAgentDesktopV2Provider:
         return handler(arguments)
 
     def _remote_state(self, *, refresh: bool = False) -> dict[str, object]:
-        now = time.monotonic()
-        if not refresh and self._state_cache is not None and now < self._state_cache_deadline:
-            return self._state_cache
+        with self._state_lock:
+            now = time.monotonic()
+            if not refresh and self._state_cache is not None and now < self._state_cache_deadline:
+                return self._state_cache
         payload = self._client.request("/state")
         if not isinstance(payload, dict) or payload.get("schema_version") != "1":
             raise HTTPException(status_code=503, detail="development daemon returned an invalid state")
-        self._state_cache = payload
-        self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
+        with self._state_lock:
+            self._state_cache = payload
+            self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
         return payload
 
     def _invalidate_state(self) -> None:
-        self._state_cache = None
-        self._state_cache_deadline = 0.0
+        with self._state_lock:
+            self._state_cache = None
+            self._state_cache_deadline = 0.0
+
+    def observe_remote_state(self, payload: dict[str, object]) -> None:
+        """Publish one authoritative snapshot for the next browser refresh."""
+
+        with self._state_lock:
+            self._state_cache = payload
+            self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
 
     def _version(self, _: Mapping[str, object]) -> m.DesktopVersionV2:
         build_id = _canonical_digest({"source_commit": self._source_commit, "features": FEATURES})
@@ -481,19 +506,126 @@ class DevelopmentAgentDesktopV2Provider:
                                      checks=[], validated_at=_now())
 
     def _events(self, _: Mapping[str, object]) -> StreamingResponse:
-        async def stream():
-            while True:
-                yield ": development bridge heartbeat\n\n"
-                import asyncio
-                await asyncio.sleep(15)
-        return StreamingResponse(stream(), media_type="text/event-stream")
+        last_event_id = _.get("last_event_id")
+        if last_event_id is not None and type(last_event_id) is not str:
+            raise TypeError("Desktop event cursor has the wrong type")
+        subscription = self._event_broker.subscribe(last_event_id)
+        return StreamingResponse(subscription, media_type="text/event-stream")
+
+
+class DevelopmentAgentStateEventRelay:
+    """Translate daemon snapshot changes into bounded Desktop v2 replay events.
+
+    This is the development equivalent of nanobot's gateway hydration loop: the
+    daemon remains the authority, while the Web Layer detects a changed
+    authoritative snapshot and wakes every connected renderer.  The renderer
+    then reloads the closed v2 snapshot; event payloads never become a second
+    copy of domain state.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: DevelopmentDaemonClient,
+        provider: DevelopmentAgentDesktopV2Provider,
+        broker: DesktopEventBrokerV2,
+        poll_seconds: float = STATE_EVENT_POLL_SECONDS,
+    ) -> None:
+        if not 0.05 <= poll_seconds <= 5:
+            raise ValueError("development event polling interval is outside the supported bound")
+        self._client = client
+        self._provider = provider
+        self._broker = broker
+        self._poll_seconds = poll_seconds
+        self._last_digest: str | None = None
+        self._core_sequence = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def poll_once(self) -> bool:
+        payload = self._client.request("/state")
+        if not isinstance(payload, dict) or payload.get("schema_version") != "1":
+            raise RuntimeError("development daemon returned an invalid event snapshot")
+        digest = _canonical_digest(payload)
+        self._provider.observe_remote_state(payload)
+        if self._last_digest is None:
+            self._last_digest = digest
+            return False
+        if digest == self._last_digest:
+            return False
+        self._last_digest = digest
+        active_project_id = payload.get("active_project_id")
+        if not isinstance(active_project_id, str) or not active_project_id:
+            # Project creation is synchronously reconciled by its lifecycle
+            # operation. Wait until an active project gives this event an exact
+            # authority scope instead of publishing a misleading global event.
+            return False
+        self._core_sequence += 1
+        self._broker.publish(
+            m.CoreAuthorityEventPayloadV2(
+                payload_kind="core_authority_changed",
+                profile_id=PROFILE_ID,
+                project_id=active_project_id,
+                core_event_id=f"development-state-{digest[:32]}",
+                core_event_sequence=self._core_sequence,
+                core_event_type="transition_changed",
+                core_payload_sha256=digest,
+            )
+        )
+        return True
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="development-agent-state-events",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None:
+            thread.join(timeout=max(2.0, self._poll_seconds * 4))
+        self._broker.close()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.poll_once()
+            except Exception:
+                LOGGER.exception("Development daemon state event polling failed")
+            self._stop.wait(self._poll_seconds)
 
 
 def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str, session_token: str,
                                      bootstrap_token: str, browser_endpoint: str, source_commit: str,
                                      static_root: Path | str | None = None) -> FastAPI:
-    provider = DevelopmentAgentDesktopV2Provider(DevelopmentDaemonClient(daemon_endpoint, daemon_token), source_commit=source_commit)
+    daemon_client = DevelopmentDaemonClient(daemon_endpoint, daemon_token)
+    event_broker = DesktopEventBrokerV2()
+    provider = DevelopmentAgentDesktopV2Provider(
+        daemon_client,
+        source_commit=source_commit,
+        event_broker=event_broker,
+    )
+    event_relay = DevelopmentAgentStateEventRelay(
+        client=daemon_client,
+        provider=provider,
+        broker=event_broker,
+    )
     app = create_desktop_local_v2_contract_app(provider)
+
+    @app.on_event("startup")
+    async def start_development_event_relay() -> None:
+        event_relay.start()
+
+    @app.on_event("shutdown")
+    async def stop_development_event_relay() -> None:
+        event_relay.stop()
 
     @app.api_route(
         "/openevo-dev-agent/v1/{path:path}",

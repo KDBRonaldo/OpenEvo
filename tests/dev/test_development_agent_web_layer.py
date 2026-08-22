@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import json
@@ -11,10 +12,12 @@ from fastapi.testclient import TestClient
 from scripts.dev.development_agent_web_layer import (
     DevelopmentDaemonClient,
     DevelopmentAgentDesktopV2Provider,
+    DevelopmentAgentStateEventRelay,
     EVENT_SCHEMA_SHA256,
     OPENAPI_SHA256,
     create_development_agent_web_app,
 )
+from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 
 
 class FakeDaemonClient:
@@ -86,9 +89,60 @@ def test_provider_exposes_only_honest_development_features() -> None:
     assert version.event_schema_sha256 == EVENT_SCHEMA_SHA256
     assert version.feature_flags == [
         "development_agent_bridge_v2",
+        "event_replay_v2",
         "mutation_idempotency_v2",
     ]
     assert "daemon_bundle_v2" not in version.feature_flags
+
+
+def _event_from_sse(frame: bytes) -> dict[str, object]:
+    data_line = next(
+        line for line in frame.decode("utf-8").splitlines() if line.startswith("data: ")
+    )
+    return json.loads(data_line.removeprefix("data: "))
+
+
+def test_state_event_relay_publishes_changes_and_replays_after_disconnect() -> None:
+    fake = FakeDaemonClient()
+    fake.state["active_project_id"] = "project-1"
+    broker = DesktopEventBrokerV2(
+        max_events=8,
+        max_subscriber_events=8,
+        heartbeat_interval=1,
+        poll_interval=0.001,
+        event_id_factory=iter(("event-one", "event-two")).__next__,
+    )
+    provider = DevelopmentAgentDesktopV2Provider(
+        fake,
+        source_commit="a" * 40,
+        event_broker=broker,
+    )
+    relay = DevelopmentAgentStateEventRelay(
+        client=fake,
+        provider=provider,
+        broker=broker,
+    )
+
+    assert relay.poll_once() is False
+    first_subscription = broker.subscribe()
+    fake.state["sessions"] = [{"session_id": "session-1", "status": "running"}]
+    assert relay.poll_once() is True
+    first_event = _event_from_sse(asyncio.run(anext(first_subscription)))
+    asyncio.run(first_subscription.aclose())
+
+    fake.state["sessions"] = [{"session_id": "session-1", "status": "closed"}]
+    assert relay.poll_once() is True
+    replay_subscription = broker.subscribe(str(first_event["event_id"]))
+    replayed_event = _event_from_sse(asyncio.run(anext(replay_subscription)))
+    asyncio.run(replay_subscription.aclose())
+
+    assert first_event["event_type"] == "core_authority_changed"
+    assert first_event["payload"]["core_event_sequence"] == 1
+    assert replayed_event["event_type"] == "core_authority_changed"
+    assert replayed_event["payload"]["core_event_sequence"] == 2
+    assert replayed_event["event_id"] != first_event["event_id"]
+    assert relay.poll_once() is False
+    broker.close()
 
 
 def test_daemon_client_accepts_bounded_aggregate_state_larger_than_one_mib(
