@@ -29,6 +29,7 @@ import { subscribeOpenEvoEvents } from "./api/sse";
 import { OpenEvoMark } from "./components/OpenEvoMark";
 import { DesktopProductApp } from "./product/DesktopProductApp";
 import type { DesktopProductProviderV2 } from "./product/providerV2";
+import { DEVELOPMENT_AGENT_WEB_CONTRACT } from "./product/releaseContract";
 import {
   createReleaseDesktopProductProvider,
   getReleaseDesktopStartupStatus,
@@ -51,6 +52,16 @@ import {
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
+const isDevelopmentAgentWebBuild =
+  import.meta.env.VITE_OPENEVO_DEVELOPMENT_AGENT_WEB === "true";
+
+function createConfiguredDesktopProductProvider(): Promise<DesktopProductProviderV2> {
+  return createReleaseDesktopProductProvider(
+    isDevelopmentAgentWebBuild
+      ? { contract: DEVELOPMENT_AGENT_WEB_CONTRACT }
+      : undefined,
+  );
+}
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -858,7 +869,7 @@ export function ReleaseDesktopProductShell({
 // dashboard code from OpenEvo-only bundles.
 export default function App() {
   return isOpenEvoDesktopOnlyBuild ? (
-    <ReleaseDesktopProductShell />
+    <ReleaseDesktopProductShell createProvider={createConfiguredDesktopProductProvider} />
   ) : (
     <SharedDashboardShell />
   );

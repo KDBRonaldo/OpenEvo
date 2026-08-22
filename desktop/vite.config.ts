@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
+  const selfHostedWebuiBuild = mode === "openevo-self-hosted-webui";
   const sourceDevelopmentBuild =
+    selfHostedWebuiBuild ||
     process.env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1" ||
     env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1";
   const developmentAgentMode = mode === "openevo-live-agent";
@@ -39,10 +41,16 @@ export default defineConfig(({ mode }) => {
       "import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT": JSON.stringify(
         sourceDevelopmentBuild ? "1" : "",
       ),
+      "import.meta.env.VITE_OPENEVO_DESKTOP_ONLY": JSON.stringify(
+        selfHostedWebuiBuild ? "true" : env.VITE_OPENEVO_DESKTOP_ONLY ?? "",
+      ),
+      "import.meta.env.VITE_OPENEVO_DEVELOPMENT_AGENT_WEB": JSON.stringify(
+        selfHostedWebuiBuild ? "true" : "",
+      ),
     },
     resolve: {
       alias:
-        mode === "openevo-desktop"
+        mode === "openevo-desktop" || mode === "openevo-self-hosted-webui"
           ? [
               {
                 find: /^\.\/providerKinds$/,
