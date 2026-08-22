@@ -5,12 +5,15 @@ import subprocess
 import sys
 import json
 import re
+import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 
 from scripts.dev.development_agent_web_layer import (
     DevelopmentDaemonClient,
+    DevelopmentDaemonEventCursorExpired,
     DevelopmentAgentDesktopV2Provider,
     DevelopmentAgentStateEventRelay,
     EVENT_SCHEMA_SHA256,
@@ -33,12 +36,49 @@ class FakeDaemonClient:
             "evolution_runs": [],
             "workspaces": [],
         }
+        self.events: list[dict[str, object]] = []
+        self.expire_next_event_cursor = False
+
+    def emit_event(self, project_id: str) -> None:
+        sequence = len(self.events) + 1
+        self.events.append(
+            {
+                "sequence": sequence,
+                "event_id": f"development-event-{sequence}",
+                "project_id": project_id,
+                "event_type": "state_changed",
+                "payload_sha256": f"{sequence:064x}",
+                "occurred_at": "2026-08-23T00:00:00Z",
+            }
+        )
 
     def request(self, path: str, *, method: str = "GET", body: object | None = None) -> object:
         del method, body
         if path == "/state":
             self.state_requests += 1
             return self.state
+        if path.startswith("/events?"):
+            query = parse_qs(urlsplit(path).query)
+            if "after" not in query:
+                return {
+                    "schema_version": "1",
+                    "events": [],
+                    "latest_sequence": len(self.events),
+                    "has_more": False,
+                }
+            if self.expire_next_event_cursor:
+                self.expire_next_event_cursor = False
+                raise DevelopmentDaemonEventCursorExpired
+            after = int(query["after"][0])
+            if int(query.get("wait_ms", ["0"])[0]):
+                time.sleep(0.01)
+            events = [event for event in self.events if event["sequence"] > after]
+            return {
+                "schema_version": "1",
+                "events": events[:100],
+                "latest_sequence": len(self.events),
+                "has_more": len(events) > 100,
+            }
         if path == "/capabilities":
             return {
                 "schema_version": "1",
@@ -126,12 +166,14 @@ def test_state_event_relay_publishes_changes_and_replays_after_disconnect() -> N
     assert relay.poll_once() is False
     first_subscription = broker.subscribe()
     fake.state["sessions"] = [{"session_id": "session-1", "status": "running"}]
-    assert relay.poll_once() is True
+    fake.emit_event("project-1")
+    assert relay.poll_once(wait_milliseconds=0) is True
     first_event = _event_from_sse(asyncio.run(anext(first_subscription)))
     asyncio.run(first_subscription.aclose())
 
     fake.state["sessions"] = [{"session_id": "session-1", "status": "closed"}]
-    assert relay.poll_once() is True
+    fake.emit_event("project-1")
+    assert relay.poll_once(wait_milliseconds=0) is True
     replay_subscription = broker.subscribe(str(first_event["event_id"]))
     replayed_event = _event_from_sse(asyncio.run(anext(replay_subscription)))
     asyncio.run(replay_subscription.aclose())
@@ -141,7 +183,42 @@ def test_state_event_relay_publishes_changes_and_replays_after_disconnect() -> N
     assert replayed_event["event_type"] == "core_authority_changed"
     assert replayed_event["payload"]["core_event_sequence"] == 2
     assert replayed_event["event_id"] != first_event["event_id"]
-    assert relay.poll_once() is False
+    assert relay.poll_once(wait_milliseconds=0) is False
+    broker.close()
+
+
+def test_state_event_relay_resynchronizes_from_daemon_after_cursor_expiry() -> None:
+    fake = FakeDaemonClient()
+    fake.state["active_project_id"] = "project-1"
+    broker = DesktopEventBrokerV2(
+        max_events=8,
+        max_subscriber_events=8,
+        heartbeat_interval=1,
+        poll_interval=0.001,
+        event_id_factory=lambda: "resync-event",
+    )
+    provider = DevelopmentAgentDesktopV2Provider(
+        fake,
+        source_commit="a" * 40,
+        event_broker=broker,
+    )
+    relay = DevelopmentAgentStateEventRelay(
+        client=fake,
+        provider=provider,
+        broker=broker,
+    )
+
+    assert relay.poll_once(wait_milliseconds=0) is False
+    fake.state["sessions"] = [{"session_id": "session-1", "status": "closed"}]
+    fake.emit_event("project-1")
+    fake.expire_next_event_cursor = True
+    subscription = broker.subscribe()
+    assert relay.poll_once(wait_milliseconds=0) is True
+    event = _event_from_sse(asyncio.run(anext(subscription)))
+    asyncio.run(subscription.aclose())
+
+    assert event["payload"]["core_event_id"].startswith("development-resync-")
+    assert event["payload"]["core_event_sequence"] == 1
     broker.close()
 
 

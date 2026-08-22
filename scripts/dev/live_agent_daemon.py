@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 from urllib.parse import parse_qs, quote, urlsplit
 from xml.etree import ElementTree
@@ -67,6 +68,9 @@ MAX_WORKSPACE_UPLOAD_FILE_BYTES = 32 * 1024 * 1024
 MAX_WORKSPACE_DOWNLOAD_FILE_BYTES = 64 * 1024 * 1024
 MAX_WORKSPACE_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_AGENT_WORKSPACE_CONTEXT_BYTES = 512 * 1024
+MAX_DEVELOPMENT_STATE_EVENTS = 4_096
+MAX_DEVELOPMENT_EVENT_PAGE = 100
+MAX_DEVELOPMENT_EVENT_WAIT_SECONDS = 10.0
 DEFAULT_TIMEOUT_SECONDS = 300
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ALLOWED_REQUEST_FIELDS = {
@@ -93,6 +97,7 @@ EVOLUTION_RUN_APPLY_PATH_PATTERN = re.compile(
 WORKSPACE_FILES_PATH_PATTERN = re.compile(
     r"^/openevo-dev-agent/v1/projects/([^/]+)/workspace/files$"
 )
+DEVELOPMENT_EVENTS_PATH = "/openevo-dev-agent/v1/events"
 
 
 class RequestError(ValueError):
@@ -108,6 +113,10 @@ class EvolutionRunError(RuntimeError):
 
 
 class StateConflictError(RuntimeError):
+    pass
+
+
+class EventCursorExpiredError(RuntimeError):
     pass
 
 
@@ -946,6 +955,7 @@ class DevelopmentStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self._event_condition = threading.Condition(self._lock)
         self.workspaces = ProjectWorkspaceStore(path.parent / "workspaces")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
@@ -959,6 +969,16 @@ class DevelopmentStateStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS development_state_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL CHECK (event_type = 'state_changed'),
+                    payload_sha256 TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS development_state_events_project_sequence
+                    ON development_state_events(project_id, sequence);
                 CREATE TABLE IF NOT EXISTS development_projects (
                     project_id TEXT PRIMARY KEY,
                     display_name TEXT NOT NULL,
@@ -1371,15 +1391,133 @@ class DevelopmentStateStore:
             pass
 
     @contextmanager
-    def _connection(self) -> Iterator[sqlite3.Connection]:
+    def _connection(self, *, emit_event: bool = True) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        emitted = False
         try:
             with connection:
+                initial_changes = connection.total_changes
                 yield connection
+                if emit_event and connection.total_changes > initial_changes:
+                    emitted = self._append_state_event(connection)
         finally:
             connection.close()
+        if emitted:
+            with self._event_condition:
+                self._event_condition.notify_all()
+
+    @staticmethod
+    def _append_state_event(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str | None = None,
+    ) -> bool:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'development_state_events'"
+        ).fetchone()
+        if table is None:
+            return False
+        if project_id is None:
+            active = connection.execute(
+                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
+            ).fetchone()
+            project_id = active["value"] if active is not None else None
+        if not project_id:
+            latest = connection.execute(
+                "SELECT project_id FROM development_projects "
+                "ORDER BY updated_at DESC, project_id DESC LIMIT 1"
+            ).fetchone()
+            project_id = latest["project_id"] if latest is not None else None
+        if not project_id:
+            return False
+        occurred_at = utc_now()
+        event_id = f"development-event-{secrets.token_hex(16)}"
+        payload_sha256 = hashlib.sha256(
+            canonical_json(
+                {
+                    "event_id": event_id,
+                    "event_type": "state_changed",
+                    "occurred_at": occurred_at,
+                    "project_id": project_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            "INSERT INTO development_state_events("
+            "event_id, project_id, event_type, payload_sha256, occurred_at"
+            ") VALUES (?, ?, 'state_changed', ?, ?)",
+            (event_id, project_id, payload_sha256, occurred_at),
+        )
+        connection.execute(
+            "DELETE FROM development_state_events WHERE sequence < ("
+            "SELECT sequence FROM development_state_events "
+            "ORDER BY sequence DESC LIMIT 1 OFFSET ?)",
+            (MAX_DEVELOPMENT_STATE_EVENTS - 1,),
+        )
+        return True
+
+    def _emit_project_event(self, project_id: str) -> None:
+        with self._event_condition:
+            with self._connection(emit_event=False) as connection:
+                emitted = self._append_state_event(connection, project_id=project_id)
+            if emitted:
+                self._event_condition.notify_all()
+
+    def read_events(
+        self,
+        *,
+        after_sequence: int | None,
+        limit: int,
+        wait_seconds: float,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + wait_seconds
+        with self._event_condition:
+            while True:
+                with self._connection(emit_event=False) as connection:
+                    bounds = connection.execute(
+                        "SELECT MIN(sequence) AS earliest, MAX(sequence) AS latest "
+                        "FROM development_state_events"
+                    ).fetchone()
+                    earliest = bounds["earliest"] if bounds is not None else None
+                    latest = bounds["latest"] if bounds is not None else None
+                    latest_sequence = int(latest or 0)
+                    if after_sequence is None:
+                        return {
+                            "schema_version": "1",
+                            "events": [],
+                            "latest_sequence": latest_sequence,
+                            "has_more": False,
+                        }
+                    if after_sequence > latest_sequence:
+                        raise EventCursorExpiredError("event cursor is ahead of daemon authority")
+                    if earliest is not None and after_sequence < int(earliest) - 1:
+                        raise EventCursorExpiredError("event cursor is outside the replay window")
+                    rows = connection.execute(
+                        "SELECT * FROM development_state_events WHERE sequence > ? "
+                        "ORDER BY sequence LIMIT ?",
+                        (after_sequence, limit + 1),
+                    ).fetchall()
+                has_more = len(rows) > limit
+                page = rows[:limit]
+                if page:
+                    return {
+                        "schema_version": "1",
+                        "events": [self._event_record(row) for row in page],
+                        "latest_sequence": latest_sequence,
+                        "has_more": has_more,
+                    }
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {
+                        "schema_version": "1",
+                        "events": [],
+                        "latest_sequence": latest_sequence,
+                        "has_more": False,
+                    }
+                self._event_condition.wait(remaining)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
@@ -1488,6 +1626,7 @@ class DevelopmentStateStore:
     def apply_workspace_mutations(self, project_id: str, mutations: object) -> None:
         self.workspace_path(project_id)
         self.workspaces.apply_mutations(project_id, mutations)
+        self._emit_project_event(project_id)
 
     def upload_workspace_file(
         self,
@@ -1498,12 +1637,14 @@ class DevelopmentStateStore:
         overwrite: bool,
     ) -> dict[str, Any]:
         self.workspace_path(project_id)
-        return self.workspaces.upload_file(
+        result = self.workspaces.upload_file(
             project_id,
             relative_path,
             payload,
             overwrite=overwrite,
         )
+        self._emit_project_event(project_id)
+        return result
 
     def download_workspace_file(
         self,
@@ -2483,6 +2624,17 @@ class DevelopmentStateStore:
             "previous_artifact_id": row["previous_artifact_id"],
             "promoted": bool(row["promoted"]),
             "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _event_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "sequence": row["sequence"],
+            "event_id": row["event_id"],
+            "project_id": row["project_id"],
+            "event_type": row["event_type"],
+            "payload_sha256": row["payload_sha256"],
+            "occurred_at": row["occurred_at"],
         }
 
     @staticmethod
@@ -3903,6 +4055,48 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/openevo-dev-agent/v1/state":
             self._json(HTTPStatus.OK, self.server.store.snapshot())
+            return
+        if parsed_path.path == DEVELOPMENT_EVENTS_PATH:
+            try:
+                parameters = parse_qs(
+                    parsed_path.query,
+                    keep_blank_values=True,
+                    strict_parsing=True,
+                )
+                if set(parameters) - {"after", "limit", "wait_ms"}:
+                    raise RequestError("event query contains unknown parameters")
+                if any(len(values) != 1 for values in parameters.values()):
+                    raise RequestError("event query parameters must be singular")
+                after_raw = parameters.get("after", [None])[0]
+                if after_raw is None:
+                    after_sequence = None
+                elif not after_raw.isascii() or not after_raw.isdigit():
+                    raise RequestError("event cursor must be a non-negative integer")
+                else:
+                    after_sequence = int(after_raw)
+                limit_raw = parameters.get("limit", [str(MAX_DEVELOPMENT_EVENT_PAGE)])[0]
+                wait_raw = parameters.get("wait_ms", ["0"])[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("event limit must be an integer")
+                if not wait_raw.isascii() or not wait_raw.isdigit():
+                    raise RequestError("event wait_ms must be an integer")
+                limit = int(limit_raw)
+                wait_ms = int(wait_raw)
+                if not 1 <= limit <= MAX_DEVELOPMENT_EVENT_PAGE:
+                    raise RequestError("event limit is outside the supported bound")
+                if not 0 <= wait_ms <= int(MAX_DEVELOPMENT_EVENT_WAIT_SECONDS * 1000):
+                    raise RequestError("event wait_ms is outside the supported bound")
+                result = self.server.store.read_events(
+                    after_sequence=after_sequence,
+                    limit=limit,
+                    wait_seconds=wait_ms / 1000,
+                )
+            except (RequestError, ValueError) as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except EventCursorExpiredError as exc:
+                self._json_error(HTTPStatus.GONE, "event_cursor_expired", str(exc))
+            else:
+                self._json(HTTPStatus.OK, result)
             return
         if self.path == "/openevo-dev-agent/v1/capabilities":
             if self.server.evolution_runner is None:

@@ -7,9 +7,11 @@ External Beta product boundary or replace the canonical product specification.
 
 This slice adopts the useful part of nanobot's WebUI shape: one remote gateway origin serves
 the browser application and REST calls. OpenEvo keeps its existing Daemon authority. The Web
-Layer now exposes the existing strict Desktop v2 SSE channel with bounded in-process replay;
-after a Web Layer restart, the renderer recovers from the Daemon's authoritative snapshot rather
-than treating an event payload as domain state.
+Layer exposes the existing strict Desktop v2 SSE channel. The development Daemon owns a bounded,
+persistent SQLite event journal and an ordered long-poll interface; the Web Layer projects those
+notifications into Desktop v2 SSE. After a browser or Web Layer restart, replay resumes from the
+Daemon authority and the renderer reloads the authoritative snapshot rather than treating an
+event payload as domain state.
 
 ```text
 browser (desktop/src exactly as of 52ed54a)
@@ -18,12 +20,13 @@ browser (desktop/src exactly as of 52ed54a)
 OpenEvo development Web Layer (remote loopback service)
   |- bundled copy of the existing Desktop renderer
   |- existing browser bootstrap -> Desktop session
-  |- /desktop/v2/events -> bounded change notification and cursor replay
+  |- /desktop/v2/events -> authenticated SSE projection and browser cursor replay
   `- /openevo-dev-agent/v1 compatibility proxy and daemon credential isolation
   |
   v
 development agent daemon
-  `- Project Head, Task admission, run, artifact, and Evolution authority
+  |- Project Head, Task admission, run, artifact, and Evolution authority
+  `- persistent ordered state-event journal and bounded long poll
 ```
 
 The Gateway owns no project, task, run, artifact, capability, or evolution state. It never
@@ -99,6 +102,9 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `/desktop/v2/*`: primary Project/Task control plane used by the unchanged renderer through a
   formal provider adapter. `/desktop/v2/events` reports daemon snapshot changes, accepts the
   renderer's `Last-Event-ID`, and wakes the renderer to reload authoritative state.
+- `/openevo-dev-agent/v1/events`: authenticated development-daemon long poll used only by the
+  Web Layer. An omitted cursor establishes the current daemon sequence; `after=<sequence>` returns
+  contiguous committed events and `410 event_cursor_expired` forces snapshot resynchronization.
 - `/openevo-dev-agent/v1/*`: authenticated development-only presentation and standalone
   Evolution compatibility surface; it no longer owns Project or Task browser mutations.
 

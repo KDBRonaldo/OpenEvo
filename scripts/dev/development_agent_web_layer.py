@@ -59,7 +59,7 @@ MAX_DEVELOPMENT_DAEMON_STATE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
 STATE_CACHE_SECONDS = 1.0
-STATE_EVENT_POLL_SECONDS = 0.25
+DAEMON_EVENT_WAIT_MILLISECONDS = 5_000
 LOGGER = logging.getLogger("openevo.development_agent_web_layer")
 
 
@@ -89,7 +89,11 @@ class DevelopmentDaemonClient:
                 if declared_length is not None and int(declared_length) > MAX_DEVELOPMENT_DAEMON_STATE_BYTES:
                     raise HTTPException(status_code=503, detail="development daemon response exceeds the bounded bridge limit")
                 payload = response.read(MAX_DEVELOPMENT_DAEMON_STATE_BYTES + 1)
-        except (OSError, urllib.error.HTTPError) as exc:
+        except urllib.error.HTTPError as exc:
+            if exc.code == 410 and path.startswith("/events?"):
+                raise DevelopmentDaemonEventCursorExpired from exc
+            raise HTTPException(status_code=503, detail="development daemon is unavailable") from exc
+        except OSError as exc:
             raise HTTPException(status_code=503, detail="development daemon is unavailable") from exc
         if len(payload) > MAX_DEVELOPMENT_DAEMON_STATE_BYTES:
             raise HTTPException(status_code=503, detail="development daemon response exceeds the bounded bridge limit")
@@ -513,14 +517,18 @@ class DevelopmentAgentDesktopV2Provider:
         return StreamingResponse(subscription, media_type="text/event-stream")
 
 
+class DevelopmentDaemonEventCursorExpired(RuntimeError):
+    pass
+
+
 class DevelopmentAgentStateEventRelay:
-    """Translate daemon snapshot changes into bounded Desktop v2 replay events.
+    """Relay the daemon's persistent event authority into Desktop v2 SSE.
 
     This is the development equivalent of nanobot's gateway hydration loop: the
-    daemon remains the authority, while the Web Layer detects a changed
-    authoritative snapshot and wakes every connected renderer.  The renderer
-    then reloads the closed v2 snapshot; event payloads never become a second
-    copy of domain state.
+    daemon owns mutation order and replay, while the Web Layer only authenticates
+    the browser, projects an event into the closed Desktop v2 envelope, and
+    reloads authoritative state. Event payloads never become a second copy of
+    domain state.
     """
 
     def __init__(
@@ -529,50 +537,144 @@ class DevelopmentAgentStateEventRelay:
         client: DevelopmentDaemonClient,
         provider: DevelopmentAgentDesktopV2Provider,
         broker: DesktopEventBrokerV2,
-        poll_seconds: float = STATE_EVENT_POLL_SECONDS,
+        wait_milliseconds: int = DAEMON_EVENT_WAIT_MILLISECONDS,
     ) -> None:
-        if not 0.05 <= poll_seconds <= 5:
-            raise ValueError("development event polling interval is outside the supported bound")
+        if type(wait_milliseconds) is not int or not 0 <= wait_milliseconds <= 10_000:
+            raise ValueError("development event wait is outside the supported bound")
         self._client = client
         self._provider = provider
         self._broker = broker
-        self._poll_seconds = poll_seconds
-        self._last_digest: str | None = None
-        self._core_sequence = 0
+        self._wait_milliseconds = wait_milliseconds
+        self._daemon_sequence: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def poll_once(self) -> bool:
+    def poll_once(self, *, wait_milliseconds: int | None = None) -> bool:
+        wait = self._wait_milliseconds if wait_milliseconds is None else wait_milliseconds
+        if type(wait) is not int or not 0 <= wait <= 10_000:
+            raise ValueError("development event wait is outside the supported bound")
+        if self._daemon_sequence is None:
+            page = self._event_page(self._client.request("/events?limit=100"))
+            self._daemon_sequence = page["latest_sequence"]
+            self._refresh_state()
+            return False
+        try:
+            page = self._event_page(
+                self._client.request(
+                    f"/events?after={self._daemon_sequence}&limit=100&wait_ms={wait}"
+                )
+            )
+        except DevelopmentDaemonEventCursorExpired:
+            return self._resynchronize_after_gap()
+        events = page["events"]
+        if events:
+            # Refresh the provider cache before waking the renderer. Otherwise
+            # a fast browser could consume the SSE notification and observe the
+            # previous one-second cache entry.
+            self._refresh_state()
+        expected = self._daemon_sequence + 1
+        for event in events:
+            sequence = event["sequence"]
+            if sequence != expected:
+                raise RuntimeError("development daemon event sequence is not contiguous")
+            expected += 1
+            self._broker.publish(
+                m.CoreAuthorityEventPayloadV2(
+                    payload_kind="core_authority_changed",
+                    profile_id=PROFILE_ID,
+                    project_id=event["project_id"],
+                    core_event_id=event["event_id"],
+                    core_event_sequence=sequence,
+                    core_event_type="transition_changed",
+                    core_payload_sha256=event["payload_sha256"],
+                )
+            )
+            self._daemon_sequence = sequence
+        return bool(events)
+
+    def _refresh_state(self) -> dict[str, object]:
         payload = self._client.request("/state")
         if not isinstance(payload, dict) or payload.get("schema_version") != "1":
-            raise RuntimeError("development daemon returned an invalid event snapshot")
-        digest = _canonical_digest(payload)
+            raise RuntimeError("development daemon returned an invalid state snapshot")
         self._provider.observe_remote_state(payload)
-        if self._last_digest is None:
-            self._last_digest = digest
+        return payload
+
+    def _resynchronize_after_gap(self) -> bool:
+        previous_sequence = self._daemon_sequence
+        self._daemon_sequence = None
+        page = self._event_page(self._client.request("/events?limit=100"))
+        self._daemon_sequence = page["latest_sequence"]
+        state = self._refresh_state()
+        active_project_id = state.get("active_project_id")
+        if previous_sequence is None or not isinstance(active_project_id, str) or not active_project_id:
             return False
-        if digest == self._last_digest:
-            return False
-        self._last_digest = digest
-        active_project_id = payload.get("active_project_id")
-        if not isinstance(active_project_id, str) or not active_project_id:
-            # Project creation is synchronously reconciled by its lifecycle
-            # operation. Wait until an active project gives this event an exact
-            # authority scope instead of publishing a misleading global event.
-            return False
-        self._core_sequence += 1
+        digest = _canonical_digest(state)
         self._broker.publish(
             m.CoreAuthorityEventPayloadV2(
                 payload_kind="core_authority_changed",
                 profile_id=PROFILE_ID,
                 project_id=active_project_id,
-                core_event_id=f"development-state-{digest[:32]}",
-                core_event_sequence=self._core_sequence,
+                core_event_id=f"development-resync-{digest[:32]}",
+                core_event_sequence=page["latest_sequence"],
                 core_event_type="transition_changed",
                 core_payload_sha256=digest,
             )
         )
         return True
+
+    @staticmethod
+    def _event_page(payload: object) -> dict[str, object]:
+        if not isinstance(payload, dict) or set(payload) != {
+            "schema_version",
+            "events",
+            "latest_sequence",
+            "has_more",
+        }:
+            raise RuntimeError("development daemon returned an invalid event page")
+        if payload.get("schema_version") != "1":
+            raise RuntimeError("development daemon returned an incompatible event page")
+        events = payload.get("events")
+        latest_sequence = payload.get("latest_sequence")
+        has_more = payload.get("has_more")
+        if not isinstance(events, list) or len(events) > 100:
+            raise RuntimeError("development daemon event page exceeds its bound")
+        if type(latest_sequence) is not int or latest_sequence < 0:
+            raise RuntimeError("development daemon event cursor is invalid")
+        if type(has_more) is not bool:
+            raise RuntimeError("development daemon event pagination flag is invalid")
+        normalized: list[dict[str, object]] = []
+        for event in events:
+            if not isinstance(event, dict) or set(event) != {
+                "sequence",
+                "event_id",
+                "project_id",
+                "event_type",
+                "payload_sha256",
+                "occurred_at",
+            }:
+                raise RuntimeError("development daemon event is not a closed object")
+            if type(event.get("sequence")) is not int or event["sequence"] < 1:
+                raise RuntimeError("development daemon event sequence is invalid")
+            if event.get("event_type") != "state_changed":
+                raise RuntimeError("development daemon event type is unsupported")
+            if not isinstance(event.get("event_id"), str):
+                raise RuntimeError("development daemon event identity is invalid")
+            if not isinstance(event.get("project_id"), str):
+                raise RuntimeError("development daemon event project is invalid")
+            digest = event.get("payload_sha256")
+            if not isinstance(digest, str) or len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise RuntimeError("development daemon event digest is invalid")
+            if not isinstance(event.get("occurred_at"), str):
+                raise RuntimeError("development daemon event timestamp is invalid")
+            normalized.append(event)
+        return {
+            "schema_version": "1",
+            "events": normalized,
+            "latest_sequence": latest_sequence,
+            "has_more": has_more,
+        }
 
     def start(self) -> None:
         if self._thread is not None:
@@ -590,7 +692,7 @@ class DevelopmentAgentStateEventRelay:
         thread = self._thread
         self._thread = None
         if thread is not None:
-            thread.join(timeout=max(2.0, self._poll_seconds * 4))
+            thread.join(timeout=max(2.0, self._wait_milliseconds / 1000 + 2.0))
         self._broker.close()
 
     def _run(self) -> None:
@@ -598,8 +700,8 @@ class DevelopmentAgentStateEventRelay:
             try:
                 self.poll_once()
             except Exception:
-                LOGGER.exception("Development daemon state event polling failed")
-            self._stop.wait(self._poll_seconds)
+                LOGGER.exception("Development daemon event relay failed")
+                self._stop.wait(1.0)
 
 
 def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str, session_token: str,

@@ -396,6 +396,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         }
     assert {
         "development_metadata",
+        "development_state_events",
         "development_projects",
         "development_sessions",
         "development_artifacts",
@@ -411,6 +412,116 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "entries": [],
         "truncated": False,
     }
+
+
+def test_daemon_event_journal_persists_ordered_state_changes(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    project_id = "development-project-events"
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Event project",
+            "config": {},
+        }
+    )
+    baseline = store.read_events(after_sequence=None, limit=100, wait_seconds=0)
+    assert baseline["events"] == []
+    assert baseline["latest_sequence"] == 1
+
+    store.start_session(
+        "dev-session-events",
+        {
+            "project_id": project_id,
+            "project_name": "Event project",
+            "task_title": "Observe events",
+            "instruction": "Return one line.",
+        },
+    )
+    store.complete_session(
+        "dev-session-events",
+        {
+            "response": "done",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": ["completed"],
+        },
+    )
+    page = store.read_events(
+        after_sequence=baseline["latest_sequence"],
+        limit=100,
+        wait_seconds=0,
+    )
+
+    assert [event["sequence"] for event in page["events"]] == [2, 3]
+    assert {event["project_id"] for event in page["events"]} == {project_id}
+    assert {event["event_type"] for event in page["events"]} == {"state_changed"}
+    assert all(len(event["payload_sha256"]) == 64 for event in page["events"])
+
+    restored = MODULE.DevelopmentStateStore(database)
+    restored_page = restored.read_events(after_sequence=1, limit=100, wait_seconds=0)
+    assert restored_page == page
+
+
+def test_daemon_event_long_poll_wakes_after_committed_change(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project_id = "development-project-event-wait"
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Waiting project",
+            "config": {},
+        }
+    )
+    cursor = store.read_events(after_sequence=None, limit=100, wait_seconds=0)[
+        "latest_sequence"
+    ]
+    result: dict[str, object] = {}
+
+    def wait_for_event() -> None:
+        result.update(
+            store.read_events(after_sequence=cursor, limit=100, wait_seconds=2)
+        )
+
+    thread = threading.Thread(target=wait_for_event)
+    thread.start()
+    time.sleep(0.05)
+    store.update_project(
+        project_id,
+        {"display_name": "Updated project", "config": {}},
+    )
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(result["events"]) == 1
+    assert result["events"][0]["sequence"] == cursor + 1
+
+
+def test_daemon_event_journal_rejects_an_evicted_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(MODULE, "MAX_DEVELOPMENT_STATE_EVENTS", 3)
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project_id = "development-project-event-bound"
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Bounded project",
+            "config": {},
+        }
+    )
+    for index in range(4):
+        store.update_project(
+            project_id,
+            {"display_name": f"Bounded project {index}", "config": {}},
+        )
+
+    with pytest.raises(MODULE.EventCursorExpiredError, match="outside the replay window"):
+        store.read_events(after_sequence=1, limit=100, wait_seconds=0)
+
+    page = store.read_events(after_sequence=2, limit=100, wait_seconds=0)
+    assert [event["sequence"] for event in page["events"]] == [3, 4, 5]
 
 
 def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: Path) -> None:
@@ -1385,6 +1496,11 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
             "config": {"schema_version": "2"},
         }
         _request_json(base_url, "/openevo-dev-agent/v1/projects", token, project)
+        event_cursor = _request_json(
+            base_url,
+            "/openevo-dev-agent/v1/events?limit=100",
+            token,
+        )["latest_sequence"]
         turn = _request_json(
             base_url,
             "/openevo-dev-agent/v1/sessions",
@@ -1398,6 +1514,14 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
             },
         )
         assert runner_started.wait(timeout=1)
+        event_page = _request_json(
+            base_url,
+            f"/openevo-dev-agent/v1/events?after={event_cursor}&limit=100&wait_ms=1000",
+            token,
+        )
+        assert event_page["events"]
+        assert event_page["events"][0]["sequence"] == event_cursor + 1
+        assert event_page["events"][0]["project_id"] == "development-project-1"
         running = _request_json(base_url, "/openevo-dev-agent/v1/state", token)
         assert running["sessions"][0]["state"] == "running"
         release_runner.set()
