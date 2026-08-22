@@ -29,25 +29,6 @@ export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object
   ]),
 });
 
-/**
- * Development-only contract for the incremental live-agent web layer. It deliberately
- * does not claim the release daemon, registry, lifecycle, or replay capabilities.
- */
-export const DEVELOPMENT_AGENT_WEB_CONTRACT: DesktopReleaseContractV2 = Object.freeze({
-  releaseVersion: "0.1.10-dev-agent-web-v1",
-  acceptedOpenApiDigests: nonEmpty([
-    "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af",
-  ], "a Desktop v2 OpenAPI digest"),
-  acceptedEventSchemaDigests: nonEmpty([
-    "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",
-  ], "a Desktop v2 event schema digest"),
-  allowedProviderKinds: Object.freeze(["desktop_sidecar"] as const),
-  requiredFeatureFlags: Object.freeze([
-    "development_agent_bridge_v2",
-    "mutation_idempotency_v2",
-  ]),
-});
-
 export const CORE_PRODUCT_RELEASE_CONTRACT = Object.freeze({
   releaseVersion: "0.1.10",
   mutationMajor: 2,

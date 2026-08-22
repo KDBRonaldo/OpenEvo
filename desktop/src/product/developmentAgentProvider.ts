@@ -251,8 +251,8 @@ export function createDevelopmentAgentProvider(
   const backend: DevelopmentAgentBackend = {
     loadState: async () => {
       const [payload, capabilityPayload] = await Promise.all([
-        requestJson("/state", undefined, 60_000).then((value) => stateSchema.parse(value)),
-        requestJson("/capabilities", undefined, 60_000).then((value) => capabilityResponseSchema.parse(value)),
+        requestJson("/state").then((value) => stateSchema.parse(value)),
+        requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
       ]);
       return {
         activeProjectId: payload.active_project_id,

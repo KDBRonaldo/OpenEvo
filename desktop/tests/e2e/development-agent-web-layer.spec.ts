@@ -4,6 +4,7 @@ const RUN_ID = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const PROJECT_NAME = `Web Layer browser E2E ${RUN_ID}`;
 const TASK_TITLE = `Browser acceptance ${RUN_ID}`;
 const RESULT_MARKER = `OPENEVO_BROWSER_E2E_OK_${RUN_ID}`;
+const PRODUCT_URL = process.env.OPENEVO_E2E_BASE_URL ?? "";
 
 async function assertNoProductErrors(page: Page): Promise<void> {
   await expect(page.getByText("Refresh failed", { exact: true })).toHaveCount(0);
@@ -27,11 +28,11 @@ test("real browser can create a project, run an agent session, and produce evolu
   });
 
   await test.step("open the real development product through Vite and Web Layer", async () => {
-    await page.goto("", { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(PRODUCT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await expect(page.locator(".product-shell")).toBeVisible({ timeout: 60_000 });
     await expect(page.getByText("Real-agent development mode", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Remote workspace settings" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
     await assertNoProductErrors(page);
   });
 

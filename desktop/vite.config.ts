@@ -7,7 +7,6 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const selfHostedWebuiBuild = mode === "openevo-self-hosted-webui";
   const sourceDevelopmentBuild =
-    selfHostedWebuiBuild ||
     process.env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1" ||
     env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1";
   const developmentAgentMode = mode === "openevo-live-agent";
@@ -15,7 +14,6 @@ export default defineConfig(({ mode }) => {
   const developmentAgentToken = env.OPENEVO_DEV_AGENT_TOKEN?.trim();
   const developmentAgentTarget = env.OPENEVO_DEV_AGENT_URL?.trim() || "http://127.0.0.1:8765";
   const developmentWebTarget = env.OPENEVO_DEV_WEB_URL?.trim() || "http://127.0.0.1:8766";
-  const developmentWebToken = env.OPENEVO_DEV_WEB_TOKEN?.trim();
 
   if (developmentAgentMode) {
     if (!developmentAgentToken) {
@@ -26,12 +24,25 @@ export default defineConfig(({ mode }) => {
       throw new Error("OPENEVO_DEV_AGENT_URL must be an HTTP loopback URL reached through the SSH tunnel.");
     }
   }
-  if (developmentAgentWebMode && !developmentWebToken) {
-    throw new Error("OPENEVO_DEV_WEB_TOKEN is required for the development Web Layer mode.");
-  }
-
   return {
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      ...(selfHostedWebuiBuild || developmentAgentWebMode ? [{
+        name: "openevo-web-layer-product-entry",
+        transformIndexHtml(html: string) {
+          return html
+            .replace(
+              '<script type="module" src="/src/main.tsx"></script>',
+              '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
+            )
+            .replace(
+              '<script type="module" src="/src/product/preview.tsx"></script>',
+              '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
+            );
+        },
+      }] : []),
+    ],
     // Source-development browser builds still exercise the formal Desktop
     // contract, but intentionally report a development build channel.  Make
     // the opt-in explicit in the compiled renderer instead of relying on
@@ -40,12 +51,6 @@ export default defineConfig(({ mode }) => {
     define: {
       "import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT": JSON.stringify(
         sourceDevelopmentBuild ? "1" : "",
-      ),
-      "import.meta.env.VITE_OPENEVO_DESKTOP_ONLY": JSON.stringify(
-        selfHostedWebuiBuild ? "true" : env.VITE_OPENEVO_DESKTOP_ONLY ?? "",
-      ),
-      "import.meta.env.VITE_OPENEVO_DEVELOPMENT_AGENT_WEB": JSON.stringify(
-        selfHostedWebuiBuild ? "true" : "",
       ),
     },
     resolve: {
@@ -85,7 +90,6 @@ export default defineConfig(({ mode }) => {
           "/openevo-dev-agent": {
             target: developmentWebTarget,
             changeOrigin: false,
-            headers: { "X-OpenEvo-Development-Web-Token": developmentWebToken },
           },
           "/desktop/v2": { target: developmentWebTarget, changeOrigin: false },
           "/version": { target: developmentWebTarget, changeOrigin: false },

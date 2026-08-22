@@ -22,7 +22,6 @@ import time
 import threading
 import urllib.error
 import urllib.request
-import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -36,7 +35,12 @@ SSH_HOST_PATTERN = re.compile(
 )
 SSH_USER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
-LOCAL_WEB_LAYER_PATH_PREFIXES = ("desktop/", "docs/", "tests/")
+LOCAL_WEB_LAYER_PATH_PREFIXES = (
+    "desktop/",
+    "docs/",
+    "src/openevo/web_gateway/static/",
+    "tests/",
+)
 LOCAL_WEB_LAYER_PATHS = frozenset(
     {
         "scripts/dev/development_agent_web_layer.py",
@@ -731,7 +735,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             print("Remote daemon, Web Layer, unchanged Desktop UI, and SSH tunnel are ready.")
             print(f"OpenEvo Desktop URL: {browser_url}")
-            webbrowser.open(browser_url)
             print("Keep this launcher running; press Ctrl+C to close the local tunnel.")
             try:
                 return tunnel.wait()
@@ -739,7 +742,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
         _wait_for_local_health(args.local_port, token)
-        npm_binary = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+        npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
         if not npm_binary:
             raise LauncherError("npm was not found after the remote daemon was deployed")
         environment = os.environ.copy()
@@ -777,13 +780,22 @@ def main(argv: list[str] | None = None) -> int:
             if not web_server.started:
                 raise LauncherError("development web layer did not start")
             environment["OPENEVO_DEV_WEB_URL"] = f"http://127.0.0.1:{args.web_port}"
-            environment["OPENEVO_DEV_WEB_TOKEN"] = session_token
             npm_script = "dev:agent:web"
-            npm_arguments = ["--", "--open", "/product-preview.html"]
+            npm_arguments = []
+            print(
+                "OpenEvo Desktop URL: "
+                f"http://127.0.0.1:5173/product-preview.html#browser-bootstrap={bootstrap_token}"
+            )
             print("Desktop Local API v2 bridge is ready; the browser will use only the web-layer session token.")
         print("Remote daemon and tunnel are ready. Starting the real product UI...")
+        npm_command = [npm_binary, "run", npm_script, *npm_arguments]
+        if os.name != "nt" and npm_binary.lower().endswith((".cmd", ".bat")):
+            command_interpreter = shutil.which("cmd.exe")
+            if not command_interpreter:
+                raise LauncherError("Windows npm was found from WSL, but cmd.exe was unavailable")
+            npm_command = [command_interpreter, "/d", "/c", "npm.cmd", "run", npm_script, *npm_arguments]
         completed = subprocess.run(
-            [npm_binary, "run", npm_script, *npm_arguments],
+            npm_command,
             cwd=DESKTOP_ROOT,
             env=environment,
             check=False,

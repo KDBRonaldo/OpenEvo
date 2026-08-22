@@ -19,7 +19,6 @@ import type {
   NativeWorkspaceSelectionIntentV2,
 } from "./providerV2";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
-import type { DesktopReleaseContractV2 } from "../api/v2/client";
 
 const nativeStartupStatusV2Schema = z.object({
   schema_version: z.literal("2"),
@@ -96,8 +95,6 @@ export interface ReleaseProviderFactoryDependenciesV2 {
     context: ReleaseProviderAdapterContextV2,
   ) => Promise<DesktopProductProviderV2> | DesktopProductProviderV2;
   readonly reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
-  /** Development hosts may negotiate a smaller, explicitly non-release contract. */
-  readonly contract?: DesktopReleaseContractV2;
 }
 
 const SIDECAR_BOOTSTRAP_POLL_INTERVAL_MS = 100;
@@ -183,18 +180,6 @@ export function isBrowserHostedReleaseRuntime(): boolean {
   }
 }
 
-/** Reset only ephemeral browser-host state when a development launcher issues a new token. */
-export function resetBrowserHostedDevelopmentSession(): void {
-  if (!import.meta.env.DEV || typeof window === "undefined") return;
-  try {
-    window.sessionStorage.removeItem(BROWSER_BOOTSTRAP_STORAGE_KEY);
-    window.localStorage.removeItem(BROWSER_MUTATION_JOURNAL_KEY);
-  } catch {
-    // The explicit bootstrap fragment remains sufficient when browser storage is disabled.
-  }
-  browserBootstrapInFlight = null;
-}
-
 function readStoredBrowserBootstrap(): DesktopBootstrapContextV2 | null {
   let encoded: string | null;
   try {
@@ -251,15 +236,6 @@ async function requestBrowserSidecarBootstrap(): Promise<DesktopBootstrapContext
   }
   let retainedInSessionStorage = false;
   try {
-    // A launcher-issued bootstrap fragment starts a new development authority.
-    // Pending browser mutation identity belongs to the previous provider stream
-    // and must not be restored into the newly deployed Web Layer.
-    if (
-      import.meta.env.DEV
-      || import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT === "1"
-    ) {
-      window.localStorage.removeItem(BROWSER_MUTATION_JOURNAL_KEY);
-    }
     window.sessionStorage.setItem(BROWSER_BOOTSTRAP_STORAGE_KEY, JSON.stringify(context));
     retainedInSessionStorage = true;
   } catch {
@@ -274,10 +250,7 @@ async function requestBrowserSidecarBootstrap(): Promise<DesktopBootstrapContext
 }
 
 async function bootstrapBrowserSidecar(): Promise<DesktopBootstrapContextV2> {
-  const explicitBootstrap = new URLSearchParams(
-    window.location.hash.replace(/^#/, ""),
-  ).has("browser-bootstrap");
-  const stored = explicitBootstrap ? null : readStoredBrowserBootstrap();
+  const stored = readStoredBrowserBootstrap();
   if (stored !== null) return stored;
   if (browserBootstrapInFlight !== null) return browserBootstrapInFlight;
 
@@ -357,14 +330,13 @@ export function reportReleaseDesktopBootstrapStage(stage: ReleaseDesktopBootstra
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependenciesV2 = {},
 ): Promise<DesktopProductProviderV2> {
-  const contract = dependencies.contract ?? DESKTOP_PRODUCT_RELEASE_CONTRACT;
   const native = dependencies.native ?? defaultNativeBridge();
   const reportStage = dependencies.reportStage ?? reportReleaseDesktopBootstrapStage;
   let bootstrap: DesktopBootstrapContextV2;
   try {
     bootstrap = validateDesktopBootstrapContextV2(
       await native.bootstrap(),
-      contract,
+      DESKTOP_PRODUCT_RELEASE_CONTRACT,
     );
     reportStageBestEffort(reportStage, "bootstrap_context_validated");
   } catch (error) {
@@ -376,7 +348,7 @@ export async function createReleaseDesktopProductProvider(
   const client = createDesktopApiClientV2({
     fetch,
     bootstrap: async () => bootstrap,
-    contract,
+    contract: DESKTOP_PRODUCT_RELEASE_CONTRACT,
   });
 
   let version: DesktopVersionV2;
