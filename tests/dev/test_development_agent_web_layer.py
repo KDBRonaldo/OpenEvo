@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import json
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -184,6 +185,48 @@ def test_http_layer_requires_exact_session_and_projects_empty_state() -> None:
             "action": "none",
             "affected_resource_id": None,
         }
+
+
+def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:
+    import scripts.dev.development_agent_web_layer as web
+
+    fake = FakeDaemonClient()
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+            static_root=Path(__file__).resolve().parents[2]
+            / "src"
+            / "openevo"
+            / "web_gateway"
+            / "static",
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        page = client.get("/openevo")
+        bootstrap = client.post(
+            "/openevo-native/browser/bootstrap",
+            headers={"Origin": "http://127.0.0.1:8765"},
+            json={"schema_version": "2", "bootstrap_token": "c" * 64},
+        )
+        asset_paths = re.findall(r'(?:src|href)="(/assets/[^"]+)"', page.text)
+        asset_statuses = [client.get(path).status_code for path in asset_paths]
+
+    assert page.status_code == 200
+    assert "<title>OpenEvo Desktop</title>" in page.text
+    assert asset_paths
+    assert asset_statuses == [200] * len(asset_paths)
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["endpoint"] == "http://127.0.0.1:8765"
+    assert bootstrap.json()["session_token"] == "desktop-secret"
 
 
 def test_provider_projects_persisted_project_and_task_into_closed_v2_models() -> None:

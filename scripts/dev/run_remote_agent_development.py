@@ -22,6 +22,7 @@ import time
 import threading
 import urllib.error
 import urllib.request
+import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -236,6 +237,11 @@ def build_remote_script(
     token: str,
     remote_port: int,
     evolution_model: str,
+    self_hosted_webui: bool = False,
+    web_session_token: str = "",
+    web_bootstrap_token: str = "",
+    remote_web_port: int = 8788,
+    browser_endpoint: str = "http://127.0.0.1:8765",
 ) -> str:
     values = {
         "repository_url": repository_url,
@@ -244,8 +250,76 @@ def build_remote_script(
         "token": token,
         "remote_port": str(remote_port),
         "evolution_model": evolution_model,
+        "web_session_token": web_session_token,
+        "web_bootstrap_token": web_bootstrap_token,
+        "remote_web_port": str(remote_web_port),
+        "browser_endpoint": browser_endpoint,
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
+    webui_script = ""
+    if self_hosted_webui:
+        webui_script = f"""
+web_pid_file="$state_root/web-layer.pid"
+web_log_file="$state_root/web-layer.log"
+web_session_token={quoted['web_session_token']}
+web_bootstrap_token={quoted['web_bootstrap_token']}
+remote_web_port={quoted['remote_web_port']}
+browser_endpoint={quoted['browser_endpoint']}
+
+if [ -f "$web_pid_file" ]; then
+  old_web_pid="$(cat "$web_pid_file" 2>/dev/null || true)"
+  case "$old_web_pid" in
+    ''|*[!0-9]*) old_web_pid='' ;;
+  esac
+  if [ -n "$old_web_pid" ] && kill -0 "$old_web_pid" 2>/dev/null; then
+    old_web_command="$(tr '\\000' ' ' < "/proc/$old_web_pid/cmdline" 2>/dev/null || true)"
+    case "$old_web_command" in
+      *scripts/dev/development_agent_web_layer.py*)
+        kill "$old_web_pid"
+        web_wait_count=0
+        while kill -0 "$old_web_pid" 2>/dev/null && [ "$web_wait_count" -lt 20 ]; do
+          web_wait_count=$((web_wait_count + 1))
+          sleep 0.25
+        done
+        ;;
+      *) echo "Refusing to stop PID $old_web_pid because it is not the managed Web Layer." >&2; exit 29 ;;
+    esac
+  fi
+fi
+
+nohup env \\
+  "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \\
+  "OPENEVO_DEV_WEB_SESSION_TOKEN=$web_session_token" \\
+  "OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN=$web_bootstrap_token" \\
+  "$uv_bin" run --frozen --python 3.11 python \\
+  scripts/dev/development_agent_web_layer.py \\
+  --daemon-endpoint "http://127.0.0.1:$remote_port" \\
+  --browser-endpoint "$browser_endpoint" \\
+  --source-commit "$expected_commit" \\
+  --static-root "$source_root/src/openevo/web_gateway/static" \\
+  --host 127.0.0.1 --port "$remote_web_port" \\
+  >"$web_log_file" 2>&1 </dev/null &
+web_pid=$!
+printf '%s\\n' "$web_pid" > "$web_pid_file"
+
+web_ready=0
+web_attempt=0
+while [ "$web_attempt" -lt 60 ]; do
+  web_attempt=$((web_attempt + 1))
+  if curl --silent --fail "http://127.0.0.1:$remote_web_port/openevo" >/dev/null 2>&1; then
+    web_ready=1
+    break
+  fi
+  if ! kill -0 "$web_pid" 2>/dev/null; then break; fi
+  sleep 1
+done
+if [ "$web_ready" -ne 1 ]; then
+  echo "The self-hosted Web Layer did not become ready. Recent log output:" >&2
+  tail -n 40 "$web_log_file" >&2 || true
+  exit 30
+fi
+echo "Remote Desktop Web Layer is ready on loopback port $remote_web_port."
+"""
     return f"""\
 set -eu
 umask 077
@@ -427,6 +501,7 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 echo "Remote development daemon is ready on loopback port $remote_port."
+{webui_script}
 """
 
 
@@ -499,6 +574,22 @@ def _wait_for_local_health(local_port: int, token: str) -> None:
     raise LauncherError(f"local SSH tunnel health check failed: {last_error}")
 
 
+def _wait_for_local_webui(local_port: int) -> None:
+    url = f"http://127.0.0.1:{local_port}/openevo"
+    last_error = "no response"
+    for _ in range(50):
+        try:
+            with urllib.request.urlopen(url, timeout=1) as response:
+                body = response.read(4096).decode("utf-8", errors="replace")
+            if response.status == 200 and "OpenEvo Desktop" in body:
+                return
+            last_error = f"unexpected response status/body from {url}"
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = str(exc)
+        time.sleep(0.2)
+    raise LauncherError(f"local Desktop Web Layer health check failed: {last_error}")
+
+
 def _stop_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -542,10 +633,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-port", type=_checked_port, default=8765)
     parser.add_argument("--remote-port", type=_checked_port, default=8787)
     parser.add_argument("--web-port", type=_checked_port, default=8766)
+    parser.add_argument("--remote-web-port", type=_checked_port, default=8788)
     parser.add_argument(
         "--web-layer",
         action="store_true",
         help="run the development-only Desktop Local API v2 bridge in front of the daemon",
+    )
+    parser.add_argument(
+        "--self-hosted-webui",
+        action="store_true",
+        help=(
+            "serve the unchanged Desktop renderer and v2 Web Layer beside the remote "
+            "daemon, using one local SSH tunnel"
+        ),
     )
     parser.add_argument("--evolution-model", default="gpt-5.5")
     parser.add_argument(
@@ -558,8 +658,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.web_layer and args.self_hosted_webui:
+        raise LauncherError("--web-layer and --self-hosted-webui are mutually exclusive")
     if not args.deploy_only:
-        local_ports = [args.local_port, DEVELOPMENT_BROWSER_PORT]
+        local_ports = [args.local_port]
+        if not args.self_hosted_webui:
+            local_ports.append(DEVELOPMENT_BROWSER_PORT)
         if args.web_layer:
             local_ports.append(args.web_port)
         ensure_local_ports_available(local_ports)
@@ -567,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
     repository_url = resolve_repository_url(args.repository_url)
     branch = resolve_branch(args.branch)
     local_only_changes = validate_checkout_for_deployment(
-        web_layer=args.web_layer,
+        web_layer=args.web_layer and not args.self_hosted_webui,
         deploy_only=args.deploy_only,
     )
     if local_only_changes:
@@ -577,6 +681,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     expected_commit = _git_output("rev-parse", "HEAD")
     token = secrets.token_urlsafe(32)
+    web_session_token = secrets.token_hex(32) if args.self_hosted_webui else ""
+    web_bootstrap_token = secrets.token_hex(32) if args.self_hosted_webui else ""
     ssh_binary = shutil.which("ssh")
     if not ssh_binary:
         raise LauncherError("system OpenSSH client was not found")
@@ -592,6 +698,11 @@ def main(argv: list[str] | None = None) -> int:
         token=token,
         remote_port=args.remote_port,
         evolution_model=args.evolution_model,
+        self_hosted_webui=args.self_hosted_webui,
+        web_session_token=web_session_token,
+        web_bootstrap_token=web_bootstrap_token,
+        remote_web_port=args.remote_web_port,
+        browser_endpoint=f"http://127.0.0.1:{args.local_port}",
     )
     _run_remote(ssh_binary, connection, remote_script)
     if args.deploy_only:
@@ -604,14 +715,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(
             f"Opening SSH tunnel 127.0.0.1:{args.local_port} -> "
-            f"remote 127.0.0.1:{args.remote_port}..."
+            f"remote 127.0.0.1:{args.remote_web_port if args.self_hosted_webui else args.remote_port}..."
         )
         tunnel = _start_tunnel(
             ssh_binary,
             connection,
             args.local_port,
-            args.remote_port,
+            args.remote_web_port if args.self_hosted_webui else args.remote_port,
         )
+        if args.self_hosted_webui:
+            _wait_for_local_webui(args.local_port)
+            browser_url = (
+                f"http://127.0.0.1:{args.local_port}/openevo"
+                f"#browser-bootstrap={web_bootstrap_token}"
+            )
+            print("Remote daemon, Web Layer, unchanged Desktop UI, and SSH tunnel are ready.")
+            print(f"OpenEvo Desktop URL: {browser_url}")
+            webbrowser.open(browser_url)
+            print("Keep this launcher running; press Ctrl+C to close the local tunnel.")
+            try:
+                return tunnel.wait()
+            except KeyboardInterrupt:
+                return 0
+
         _wait_for_local_health(args.local_port, token)
         npm_binary = shutil.which("npm.cmd" if os.name == "nt" else "npm")
         if not npm_binary:
@@ -669,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
         if web_thread is not None:
             web_thread.join(timeout=5)
         if tunnel is not None:
-            print("Closing the local SSH tunnel. The remote daemon remains running.")
+            suffix = " and Web Layer remain running" if args.self_hosted_webui else " remains running"
+            print(f"Closing the local SSH tunnel. The remote daemon{suffix}.")
             _stop_process(tunnel)
 
 

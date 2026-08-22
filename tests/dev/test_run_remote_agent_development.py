@@ -67,6 +67,15 @@ def test_web_layer_is_an_explicit_opt_in() -> None:
     assert web.web_port == 8766
 
 
+def test_self_hosted_webui_is_an_explicit_opt_in() -> None:
+    args = remote_launcher.parse_args(
+        ["--host", "example.com", "--user", "root", "--self-hosted-webui"]
+    )
+
+    assert args.self_hosted_webui is True
+    assert args.remote_web_port == 8788
+
+
 def test_port_preflight_rejects_an_existing_launcher_before_deployment() -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
@@ -267,6 +276,35 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
             text=True,
             capture_output=True,
             check=False,
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+
+def test_remote_script_can_start_the_unchanged_desktop_ui_beside_daemon() -> None:
+    script = remote_launcher.build_remote_script(
+        repository_url="https://github.com/KDBRonaldo/OpenEvo.git",
+        branch="nanobot-webui-architecture",
+        expected_commit="a" * 40,
+        token="daemon-token",
+        remote_port=8787,
+        evolution_model="gpt-5.5",
+        self_hosted_webui=True,
+        web_session_token="b" * 64,
+        web_bootstrap_token="c" * 64,
+        remote_web_port=8788,
+        browser_endpoint="http://127.0.0.1:8765",
+    )
+
+    assert "scripts/dev/development_agent_web_layer.py" in script
+    assert '--static-root "$source_root/src/openevo/web_gateway/static"' in script
+    assert '"OPENEVO_DEV_WEB_SESSION_TOKEN=$web_session_token"' in script
+    assert '"OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN=$web_bootstrap_token"' in script
+    assert 'curl --silent --fail "http://127.0.0.1:$remote_web_port/openevo"' in script
+
+    shell = shutil.which("sh")
+    if shell is not None:
+        syntax = subprocess.run(
+            [shell, "-n"], input=script, text=True, capture_output=True, check=False
         )
         assert syntax.returncode == 0, syntax.stderr
 

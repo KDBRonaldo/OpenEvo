@@ -75,6 +75,8 @@ include = ["openevo*", "slime_bridge*"]
 openevo = [
     "backend/contracts/v1/*.json",
     "backend/contracts/v2/*.json",
+    "web_gateway/static/*.html",
+    "web_gateway/static/assets/*",
     "wheels/*.whl",
 ]
 slime_bridge = ["README.md"]

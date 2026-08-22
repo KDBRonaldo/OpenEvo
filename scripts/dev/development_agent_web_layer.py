@@ -9,8 +9,10 @@ release Daemon implementation and is never packaged.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import json
 import logging
+import os
 import secrets
 import sys
 import time
@@ -34,6 +36,7 @@ from pydantic import ValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from desktop.server.browser_host import install_browser_host_routes
+from desktop.server.app import create_desktop_app
 from desktop.sidecar.contracts.v2 import models as m
 from desktop.sidecar.contracts.v2.app import create_desktop_local_v2_contract_app
 from openevo.backend.contracts.v2 import models as core
@@ -482,7 +485,8 @@ class DevelopmentAgentDesktopV2Provider:
 
 
 def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str, session_token: str,
-                                     bootstrap_token: str, browser_endpoint: str, source_commit: str) -> FastAPI:
+                                     bootstrap_token: str, browser_endpoint: str, source_commit: str,
+                                     static_root: Path | str | None = None) -> FastAPI:
     provider = DevelopmentAgentDesktopV2Provider(DevelopmentDaemonClient(daemon_endpoint, daemon_token), source_commit=source_commit)
     app = create_desktop_local_v2_contract_app(provider)
 
@@ -561,7 +565,41 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
         "feature_set_sha256": version["feature_set_sha256"], "required_core_api_major": 2, "mutation_compatible": True}
     install_browser_host_routes(app, endpoint=browser_endpoint, bootstrap_token=bootstrap_token,
                                 session_token=session_token, negotiated_contract=negotiated)
+    if static_root is not None:
+        create_desktop_app(app, static_root=static_root)
     return app
+
+
+def _required_secret(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Serve the development Desktop UI and v2 Web Layer.")
+    parser.add_argument("--daemon-endpoint", required=True)
+    parser.add_argument("--browser-endpoint", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--static-root", type=Path, required=True)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8788)
+    args = parser.parse_args(argv)
+
+    import uvicorn
+
+    app = create_development_agent_web_app(
+        daemon_endpoint=args.daemon_endpoint,
+        daemon_token=_required_secret("OPENEVO_DEV_AGENT_TOKEN"),
+        session_token=_required_secret("OPENEVO_DEV_WEB_SESSION_TOKEN"),
+        bootstrap_token=_required_secret("OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN"),
+        browser_endpoint=args.browser_endpoint,
+        source_commit=args.source_commit,
+        static_root=args.static_root,
+    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
 
 
 def _desktop_error_response(
@@ -601,3 +639,7 @@ class _ExactDevelopmentSessionMiddleware:
                 await response(scope, receive, send)
                 return
         await self._app(scope, receive, send)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
