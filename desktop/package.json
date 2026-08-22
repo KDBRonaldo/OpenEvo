@@ -16,7 +16,7 @@
     "dev:openevo": "vite --mode openevo-desktop",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",
-    "build:webui-gateway": "vite build --mode openevo-self-hosted-webui --base / --outDir ../src/openevo/web_gateway/static",
+    "build:webui-gateway": "vite build --mode openevo-self-hosted-webui --base / --outDir ../src/openevo/web_gateway/static && node scripts/verify-webui-gateway-build.mjs",
     "generate:icons": "bash src-tauri/icons/generate-icons.sh",
     "check:icons": "bash src-tauri/icons/generate-icons.sh --check",
     "tauri:dev": "tauri dev",

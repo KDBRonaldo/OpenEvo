@@ -30,16 +30,19 @@ export default defineConfig(({ mode }) => {
       tailwindcss(),
       ...(selfHostedWebuiBuild || developmentAgentWebMode ? [{
         name: "openevo-web-layer-product-entry",
-        transformIndexHtml(html: string) {
-          return html
-            .replace(
-              '<script type="module" src="/src/main.tsx"></script>',
-              '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
-            )
-            .replace(
-              '<script type="module" src="/src/product/preview.tsx"></script>',
-              '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
-            );
+        transformIndexHtml: {
+          order: "pre" as const,
+          handler(html: string) {
+            return html
+              .replace(
+                '<script type="module" src="/src/main.tsx"></script>',
+                '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
+              )
+              .replace(
+                '<script type="module" src="/src/product/preview.tsx"></script>',
+                '<script type="module" src="/self-hosted-product-preview.tsx"></script>',
+              );
+          },
         },
       }] : []),
     ],
