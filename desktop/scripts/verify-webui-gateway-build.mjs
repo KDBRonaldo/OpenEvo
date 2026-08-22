@@ -25,6 +25,8 @@ for (const required of [
   "What should the agent do next?",
   "Run separately",
   "Run Evolution",
+  "desktop/v2",
+  "openevo-dev-agent/v1",
 ]) {
   if (!bundle.includes(required)) {
     throw new Error(`The self-hosted WebUI is missing the preserved Desktop surface: ${required}`);

@@ -7,6 +7,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const selfHostedWebuiBuild = mode === "openevo-self-hosted-webui";
   const sourceDevelopmentBuild =
+    selfHostedWebuiBuild ||
     process.env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1" ||
     env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1";
   const developmentAgentMode = mode === "openevo-live-agent";

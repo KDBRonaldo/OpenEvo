@@ -2,7 +2,8 @@
 
 ## HKUDS nanobot
 
-OpenEvo's self-hosted Desktop Web Layer is architecturally inspired by the WebUI and gateway implementation in
+OpenEvo's self-hosted Desktop Web Layer includes source-level architectural adaptations from the
+WebUI, WebSocket channel, and managed gateway lifecycle implementation in
 [HKUDS/nanobot](https://github.com/HKUDS/nanobot), which is distributed under the MIT License.
 
 Copyright (c) 2025-present Xubin Ren and the nanobot contributors

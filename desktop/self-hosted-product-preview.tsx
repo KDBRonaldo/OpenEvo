@@ -2,20 +2,15 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "./src/styles.css";
 import { DesktopProductApp } from "./src/product/DesktopProductApp";
-import { createDevelopmentAgentProvider } from "./src/product/developmentAgentProvider";
+import { createSelfHostedFormalProvider } from "./src/product/selfHostedFormalProvider";
+import type { DesktopBootstrapContextV2 } from "./src/api/v2/schemas";
 
 const BOOTSTRAP_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 const SESSION_STORAGE_KEY = "openevo.self-hosted.browser-session.v1";
 const DEVELOPMENT_AGENT_PREFIX = "/openevo-dev-agent/";
 const DEVELOPMENT_WEB_TOKEN_HEADER = "X-OpenEvo-Development-Web-Token";
 
-interface BrowserSession {
-  readonly schema_version: "2";
-  readonly endpoint: string;
-  readonly session_token: string;
-}
-
-function parseBrowserSession(value: unknown): BrowserSession {
+function parseBrowserSession(value: unknown): DesktopBootstrapContextV2 {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("The Web Layer returned an invalid browser session.");
   }
@@ -28,14 +23,13 @@ function parseBrowserSession(value: unknown): BrowserSession {
   ) {
     throw new Error("The Web Layer returned an invalid browser session.");
   }
-  return {
-    schema_version: "2",
-    endpoint: record.endpoint,
-    session_token: record.session_token,
-  };
+  if (typeof record.negotiated_contract !== "object" || record.negotiated_contract === null) {
+    throw new Error("The Web Layer returned no negotiated Desktop v2 contract.");
+  }
+  return value as DesktopBootstrapContextV2;
 }
 
-function loadStoredBrowserSession(): BrowserSession | null {
+function loadStoredBrowserSession(): DesktopBootstrapContextV2 | null {
   try {
     const serialized = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
     return serialized === null ? null : parseBrowserSession(JSON.parse(serialized));
@@ -45,7 +39,7 @@ function loadStoredBrowserSession(): BrowserSession | null {
   }
 }
 
-async function establishBrowserSession(): Promise<BrowserSession> {
+async function establishBrowserSession(): Promise<DesktopBootstrapContextV2> {
   const parameters = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   const bootstrapToken = parameters.get("browser-bootstrap");
   if (bootstrapToken === null) {
@@ -92,7 +86,7 @@ function installDevelopmentAgentTransport(sessionToken: string): void {
 async function main(): Promise<void> {
   const session = await establishBrowserSession();
   installDevelopmentAgentTransport(session.session_token);
-  const provider = createDevelopmentAgentProvider();
+  const provider = await createSelfHostedFormalProvider(session);
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <React.StrictMode>
       <DesktopProductApp provider={provider} />

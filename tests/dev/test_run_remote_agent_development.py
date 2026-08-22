@@ -76,6 +76,107 @@ def test_self_hosted_webui_is_an_explicit_opt_in() -> None:
     assert args.remote_web_port == 8788
 
 
+def test_browser_e2e_is_an_explicit_self_hosted_acceptance_mode() -> None:
+    args = remote_launcher.parse_args(
+        [
+            "--host",
+            "example.com",
+            "--user",
+            "root",
+            "--self-hosted-webui",
+            "--browser-e2e",
+        ]
+    )
+
+    assert args.self_hosted_webui is True
+    assert args.browser_e2e is True
+
+
+@pytest.mark.parametrize("flag", ["--status", "--logs", "--stop"])
+def test_remote_lifecycle_actions_are_explicit_and_do_not_deploy(flag: str) -> None:
+    args = remote_launcher.parse_args(
+        ["--host", "example.com", "--user", "root", flag]
+    )
+
+    assert getattr(args, flag.removeprefix("--")) is True
+    assert args.deploy_only is False
+    assert args.browser_e2e is False
+
+
+@pytest.mark.parametrize("action", ["status", "logs", "stop"])
+def test_remote_lifecycle_scripts_are_bounded_and_shell_valid(action: str) -> None:
+    script = remote_launcher.build_remote_lifecycle_script(
+        action=action,
+        tail_lines=37,
+    )
+
+    assert 'state_root="$HOME/.openevo/dev-agent"' in script
+    if action != "logs":
+        assert "scripts/dev/live_agent_daemon.py" in script
+        assert "scripts/dev/development_agent_web_layer.py" in script
+    if action == "logs":
+        assert "tail -n 37" in script
+    if action == "stop":
+        assert "refusing to signal PID" in script
+        assert script.index('stop_managed_process "web-layer"') < script.index(
+            'stop_managed_process "daemon"'
+        )
+
+    shell = shutil.which("sh")
+    if shell is not None:
+        syntax = subprocess.run(
+            [shell, "-n"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert syntax.returncode == 0, syntax.stderr
+
+
+@pytest.mark.parametrize("tail", [0, 2001])
+def test_remote_log_tail_is_bounded(tail: int) -> None:
+    with pytest.raises(remote_launcher.LauncherError, match="--tail"):
+        remote_launcher.build_remote_lifecycle_script(
+            action="logs",
+            tail_lines=tail,
+        )
+
+
+def test_status_runs_without_checkout_validation_or_token_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(remote_launcher.shutil, "which", lambda _: "ssh")
+    monkeypatch.setattr(
+        remote_launcher,
+        "validate_checkout_for_deployment",
+        lambda **_: pytest.fail("status must not inspect or deploy the checkout"),
+    )
+
+    def run_remote(
+        ssh_binary: str,
+        connection: object,
+        script: str,
+    ) -> None:
+        captured.update(
+            ssh_binary=ssh_binary,
+            connection=connection,
+            script=script,
+        )
+
+    monkeypatch.setattr(remote_launcher, "_run_remote", run_remote)
+
+    result = remote_launcher.main(
+        ["--host", "example.com", "--user", "root", "--status"]
+    )
+
+    assert result == 0
+    assert captured["ssh_binary"] == "ssh"
+    assert "OpenEvo remote development stack" in str(captured["script"])
+
+
 def test_port_preflight_rejects_an_existing_launcher_before_deployment() -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))

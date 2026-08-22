@@ -47,6 +47,8 @@ LOCAL_WEB_LAYER_PATHS = frozenset(
         "scripts/dev/run_remote_agent_development.py",
     }
 )
+REMOTE_DEVELOPMENT_STATE_ROOT = "$HOME/.openevo/dev-agent"
+REMOTE_LIFECYCLE_ACTIONS = frozenset({"status", "logs", "stop"})
 
 
 class LauncherError(RuntimeError):
@@ -231,6 +233,142 @@ def resolve_branch(explicit: str | None) -> str:
     if not branch:
         raise LauncherError("detached HEAD is unsupported; pass --branch explicitly")
     return validate_branch(branch)
+
+
+def build_remote_lifecycle_script(*, action: str, tail_lines: int = 200) -> str:
+    """Build a bounded management command for the remote development stack.
+
+    The shape follows nanobot's explicit gateway status/logs/stop management,
+    while retaining OpenEvo's stricter process-command ownership check before a
+    signal is sent. It deliberately does not update the checkout or rotate
+    authentication tokens.
+    """
+
+    if action not in REMOTE_LIFECYCLE_ACTIONS:
+        raise LauncherError(f"unsupported remote lifecycle action: {action}")
+    if not 1 <= tail_lines <= 2_000:
+        raise LauncherError("--tail must be between 1 and 2000")
+
+    common = f"""\
+set -eu
+umask 077
+
+state_root=\"{REMOTE_DEVELOPMENT_STATE_ROOT}\"
+daemon_pid_file=\"$state_root/daemon.pid\"
+daemon_log_file=\"$state_root/daemon.log\"
+web_pid_file=\"$state_root/web-layer.pid\"
+web_log_file=\"$state_root/web-layer.log\"
+
+process_status() {{
+  label=$1
+  pid_file=$2
+  marker=$3
+  log_file=$4
+  if [ ! -f \"$pid_file\" ]; then
+    printf '%s: stopped (no managed PID receipt)\\n' \"$label\"
+    printf '  log: %s\\n' \"$log_file\"
+    return
+  fi
+  pid=\"$(cat \"$pid_file\" 2>/dev/null || true)\"
+  case \"$pid\" in
+    ''|*[!0-9]*)
+      printf '%s: stale (invalid managed PID receipt)\\n' \"$label\"
+      printf '  log: %s\\n' \"$log_file\"
+      return
+      ;;
+  esac
+  if ! kill -0 \"$pid\" 2>/dev/null; then
+    printf '%s: stopped (stale PID %s)\\n' \"$label\" \"$pid\"
+    printf '  log: %s\\n' \"$log_file\"
+    return
+  fi
+  command_line=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null || true)\"
+  case \"$command_line\" in
+    *\"$marker\"*)
+      printf '%s: running\\n' \"$label\"
+      printf '  pid: %s\\n' \"$pid\"
+      printf '  log: %s\\n' \"$log_file\"
+      ;;
+    *)
+      printf '%s: unsafe receipt (PID %s belongs to another command)\\n' \"$label\" \"$pid\"
+      printf '  log: %s\\n' \"$log_file\"
+      ;;
+  esac
+}}
+"""
+
+    if action == "status":
+        return common + """
+printf 'OpenEvo remote development stack\\n'
+printf 'state: %s\\n' "$state_root"
+process_status "daemon" "$daemon_pid_file" "scripts/dev/live_agent_daemon.py" "$daemon_log_file"
+process_status "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py" "$web_log_file"
+if [ -d "$state_root/source/.git" ]; then
+  source_commit="$(git -C "$state_root/source" rev-parse --short=12 HEAD 2>/dev/null || true)"
+  if [ -n "$source_commit" ]; then printf 'source commit: %s\\n' "$source_commit"; fi
+fi
+"""
+
+    if action == "logs":
+        return common + f"""
+printf 'OpenEvo remote development logs (last {tail_lines} lines each)\\n'
+printf '\\n[daemon] %s\\n' "$daemon_log_file"
+if [ -f "$daemon_log_file" ]; then tail -n {tail_lines} "$daemon_log_file"; else printf 'no daemon log yet\\n'; fi
+printf '\\n[web-layer] %s\\n' "$web_log_file"
+if [ -f "$web_log_file" ]; then tail -n {tail_lines} "$web_log_file"; else printf 'no Web Layer log yet\\n'; fi
+"""
+
+    return common + """
+stop_managed_process() {
+  label=$1
+  pid_file=$2
+  marker=$3
+  if [ ! -f "$pid_file" ]; then
+    printf '%s: already stopped\\n' "$label"
+    return
+  fi
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*)
+      printf '%s: refusing invalid managed PID receipt\\n' "$label" >&2
+      exit 41
+      ;;
+  esac
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+    printf '%s: removed stale PID receipt\\n' "$label"
+    return
+  fi
+  command_line="$(tr '\\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  case "$command_line" in
+    *"$marker"*) ;;
+    *)
+      printf '%s: refusing to signal PID %s because it is not the managed process\\n' "$label" "$pid" >&2
+      exit 42
+      ;;
+  esac
+  kill "$pid"
+  wait_count=0
+  while kill -0 "$pid" 2>/dev/null && [ "$wait_count" -lt 40 ]; do
+    wait_count=$((wait_count + 1))
+    sleep 0.25
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid"
+    sleep 0.25
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    printf '%s: PID %s did not stop\\n' "$label" "$pid" >&2
+    exit 43
+  fi
+  rm -f "$pid_file"
+  printf '%s: stopped\\n' "$label"
+}
+
+# Stop the HTTP/WebUI edge before its daemon authority.
+stop_managed_process "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py"
+stop_managed_process "daemon" "$daemon_pid_file" "scripts/dev/live_agent_daemon.py"
+"""
 
 
 def build_remote_script(
@@ -657,6 +795,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="deploy and verify the daemon without opening a tunnel or Vite",
     )
+    parser.add_argument(
+        "--browser-e2e",
+        action="store_true",
+        help=(
+            "run the real Playwright product acceptance path against the self-hosted "
+            "WebUI, then close the local tunnel"
+        ),
+    )
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument(
+        "--status",
+        action="store_true",
+        help="show the managed remote daemon and Web Layer lifecycle state",
+    )
+    lifecycle.add_argument(
+        "--logs",
+        action="store_true",
+        help="show bounded recent logs for the managed remote daemon and Web Layer",
+    )
+    lifecycle.add_argument(
+        "--stop",
+        action="store_true",
+        help="stop only the remote processes owned by this development launcher",
+    )
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=200,
+        help="number of lines per process for --logs (1-2000)",
+    )
     return parser.parse_args(argv)
 
 
@@ -664,6 +832,37 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.web_layer and args.self_hosted_webui:
         raise LauncherError("--web-layer and --self-hosted-webui are mutually exclusive")
+    if args.browser_e2e and not args.self_hosted_webui:
+        raise LauncherError("--browser-e2e requires --self-hosted-webui")
+    if args.browser_e2e and args.deploy_only:
+        raise LauncherError("--browser-e2e cannot be combined with --deploy-only")
+    lifecycle_action = next(
+        (name for name in ("status", "logs", "stop") if getattr(args, name)),
+        None,
+    )
+    if lifecycle_action is not None:
+        if args.browser_e2e or args.deploy_only:
+            raise LauncherError(
+                f"--{lifecycle_action} cannot be combined with deployment or browser acceptance"
+            )
+        connection = resolve_ssh_connection(args)
+        ssh_binary = shutil.which("ssh")
+        if not ssh_binary:
+            raise LauncherError("system OpenSSH client was not found")
+        print(
+            "Managing the OpenEvo remote development stack through SSH "
+            f"{connection.display_name}...",
+            flush=True,
+        )
+        _run_remote(
+            ssh_binary,
+            connection,
+            build_remote_lifecycle_script(
+                action=lifecycle_action,
+                tail_lines=args.tail,
+            ),
+        )
+        return 0
     if not args.deploy_only:
         local_ports = [args.local_port]
         if not args.self_hosted_webui:
@@ -735,6 +934,28 @@ def main(argv: list[str] | None = None) -> int:
             )
             print("Remote daemon, Web Layer, unchanged Desktop UI, and SSH tunnel are ready.")
             print(f"OpenEvo Desktop URL: {browser_url}")
+            if args.browser_e2e:
+                npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
+                if not npm_binary:
+                    raise LauncherError("npm was not found for the browser acceptance test")
+                environment = os.environ.copy()
+                environment["OPENEVO_E2E_BASE_URL"] = browser_url
+                command = [npm_binary, "run", "test:formal:webui:e2e"]
+                if os.name != "nt" and npm_binary.lower().endswith((".cmd", ".bat")):
+                    command_interpreter = shutil.which("cmd.exe")
+                    if not command_interpreter:
+                        raise LauncherError("Windows npm was found from WSL, but cmd.exe was unavailable")
+                    command = [
+                        command_interpreter, "/d", "/c", "npm.cmd", "run",
+                        "test:formal:webui:e2e",
+                    ]
+                print("Running the real browser acceptance path; the tunnel will close afterward.")
+                return subprocess.run(
+                    command,
+                    cwd=DESKTOP_ROOT,
+                    env=environment,
+                    check=False,
+                ).returncode
             print("Keep this launcher running; press Ctrl+C to close the local tunnel.")
             try:
                 return tunnel.wait()

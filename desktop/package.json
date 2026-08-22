@@ -9,6 +9,9 @@
     "dev:agent:remote": "python3 ../scripts/dev/run_remote_agent_development.py",
     "dev:agent:web:remote": "uv run python ../scripts/dev/run_remote_agent_development.py --web-layer",
     "dev:agent:webui:remote": "uv run python ../scripts/dev/run_remote_agent_development.py --self-hosted-webui",
+    "dev:agent:webui:status": "uv run python ../scripts/dev/run_remote_agent_development.py --status",
+    "dev:agent:webui:logs": "uv run python ../scripts/dev/run_remote_agent_development.py --logs",
+    "dev:agent:webui:stop": "uv run python ../scripts/dev/run_remote_agent_development.py --stop",
     "dev:agent:web": "vite --mode openevo-live-agent-web",
     "dev:live": "uv run python ../scripts/dev/run_desktop_live.py",
     "dev:formal": "uv run python ../scripts/dev/run_desktop_live.py --prepare",
@@ -26,6 +29,7 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:agent:web:e2e": "playwright install chromium && playwright test --config playwright.development-agent.config.ts",
+    "test:formal:webui:e2e": "playwright install chromium && playwright test --config playwright.development-agent.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

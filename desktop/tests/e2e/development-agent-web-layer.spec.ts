@@ -14,6 +14,11 @@ async function assertNoProductErrors(page: Page): Promise<void> {
 
 test("real browser can create a project, run an agent session, and produce evolution output", async ({ page }, testInfo: TestInfo) => {
   const browserErrors: string[] = [];
+  const observedRequests: string[] = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    observedRequests.push(`${request.method()} ${url.pathname}`);
+  });
   page.on("console", (message) => {
     if (message.type() === "error" && !message.text().includes("Failed to load resource")) {
       browserErrors.push(`console: ${message.text()}`);
@@ -33,6 +38,7 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(page.getByText("Real-agent development mode", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
+    expect(observedRequests).toContain("GET /desktop/v2/state");
     await assertNoProductErrors(page);
   });
 
@@ -50,6 +56,7 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(page.getByRole("combobox", { name: "Select project" })).toHaveValue(/project:/);
     await expect(page.getByRole("heading", { name: PROJECT_NAME, exact: true })).toBeVisible({ timeout: 120_000 });
     await expect(page.getByRole("button", { name: "Start session" })).toBeEnabled({ timeout: 120_000 });
+    expect(observedRequests).toContain("POST /desktop/v2/projects");
     await assertNoProductErrors(page);
   });
 
@@ -57,6 +64,7 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(page.getByText("Run separately", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Start session" }).click();
     await expect(page.getByTestId("session-detail-workspace")).toBeVisible({ timeout: 120_000 });
+    expect(observedRequests).toContain("POST /desktop/v2/tasks");
     await assertNoProductErrors(page);
   });
 
@@ -100,6 +108,7 @@ test("real browser can create a project, run an agent session, and produce evolu
     await currentRun.getByRole("button", { name: "Apply to future Sessions" }).click();
     await expect(currentRun.locator(".state-pill")).toHaveText("applied", { timeout: 120_000 });
     await expect(currentRun.getByText("Active context", { exact: true })).toBeVisible();
+    expect(observedRequests).toContain("POST /openevo-dev-agent/v1/evolution-runs");
     await assertNoProductErrors(page);
   });
 
