@@ -15,9 +15,11 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,12 +28,20 @@ from urllib.parse import urlsplit, urlunsplit
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPOSITORY_ROOT / "desktop"
+DEVELOPMENT_BROWSER_PORT = 5173
 SSH_ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 SSH_HOST_PATTERN = re.compile(
     r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?"
 )
 SSH_USER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+LOCAL_WEB_LAYER_PATH_PREFIXES = ("desktop/", "docs/", "tests/")
+LOCAL_WEB_LAYER_PATHS = frozenset(
+    {
+        "scripts/dev/development_agent_web_layer.py",
+        "scripts/dev/run_remote_agent_development.py",
+    }
+)
 
 
 class LauncherError(RuntimeError):
@@ -53,6 +63,26 @@ def _checked_port(value: str) -> int:
     if not 1 <= port <= 65_535:
         raise argparse.ArgumentTypeError("port must be between 1 and 65535")
     return port
+
+
+def ensure_local_ports_available(ports: list[int]) -> None:
+    """Fail before remote token rotation when another launcher owns a local port."""
+    unavailable: list[int] = []
+    for port in sorted(set(ports)):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.25)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                unavailable.append(port)
+        finally:
+            probe.close()
+    if unavailable:
+        rendered = ", ".join(str(port) for port in unavailable)
+        raise LauncherError(
+            f"local development port(s) already in use: {rendered}. "
+            "Another OpenEvo launcher may still be running. Keep using that launcher, "
+            "or stop it before starting a replacement. The remote daemon was not changed."
+        )
 
 
 def validate_ssh_alias(value: str) -> str:
@@ -152,6 +182,39 @@ def _git_output(*args: str) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise LauncherError(f"git {' '.join(args)} failed: {detail}")
     return completed.stdout.strip()
+
+
+def changed_checkout_paths() -> tuple[str, ...]:
+    """Return tracked and untracked paths without parsing porcelain rename syntax."""
+
+    tracked = _git_output("diff", "--name-only", "HEAD").splitlines()
+    untracked = _git_output("ls-files", "--others", "--exclude-standard").splitlines()
+    return tuple(sorted({path.replace("\\", "/") for path in [*tracked, *untracked] if path}))
+
+
+def validate_checkout_for_deployment(*, web_layer: bool, deploy_only: bool) -> tuple[str, ...]:
+    changed = changed_checkout_paths()
+    if not changed:
+        return ()
+    local_web_development = web_layer and not deploy_only
+    unsafe = tuple(
+        path
+        for path in changed
+        if not local_web_development
+        or not (
+            path in LOCAL_WEB_LAYER_PATHS
+            or path.startswith(LOCAL_WEB_LAYER_PATH_PREFIXES)
+        )
+    )
+    if unsafe:
+        details = ", ".join(unsafe[:8])
+        if len(unsafe) > 8:
+            details += f", and {len(unsafe) - 8} more"
+        raise LauncherError(
+            "the local checkout contains uncommitted changes used by the remote daemon "
+            f"({details}); commit and push them before deployment"
+        )
+    return changed
 
 
 def resolve_repository_url(explicit: str | None) -> str:
@@ -478,6 +541,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--local-port", type=_checked_port, default=8765)
     parser.add_argument("--remote-port", type=_checked_port, default=8787)
+    parser.add_argument("--web-port", type=_checked_port, default=8766)
+    parser.add_argument(
+        "--web-layer",
+        action="store_true",
+        help="run the development-only Desktop Local API v2 bridge in front of the daemon",
+    )
     parser.add_argument("--evolution-model", default="gpt-5.5")
     parser.add_argument(
         "--deploy-only",
@@ -489,14 +558,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if not args.deploy_only:
+        local_ports = [args.local_port, DEVELOPMENT_BROWSER_PORT]
+        if args.web_layer:
+            local_ports.append(args.web_port)
+        ensure_local_ports_available(local_ports)
     connection = resolve_ssh_connection(args)
     repository_url = resolve_repository_url(args.repository_url)
     branch = resolve_branch(args.branch)
-    dirty = _git_output("status", "--porcelain")
-    if dirty:
-        raise LauncherError(
-            "the local checkout has uncommitted changes; commit and push them before "
-            "deploying so the server cannot silently run older code"
+    local_only_changes = validate_checkout_for_deployment(
+        web_layer=args.web_layer,
+        deploy_only=args.deploy_only,
+    )
+    if local_only_changes:
+        print(
+            "Using uncommitted local Desktop/Web Layer changes; the remote daemon will "
+            "remain pinned to the committed branch head."
         )
     expected_commit = _git_output("rev-parse", "HEAD")
     token = secrets.token_urlsafe(32)
@@ -522,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tunnel: subprocess.Popen[str] | None = None
+    web_server = None
+    web_thread: threading.Thread | None = None
     try:
         print(
             f"Opening SSH tunnel 127.0.0.1:{args.local_port} -> "
@@ -544,15 +623,51 @@ def main(argv: list[str] | None = None) -> int:
                 "OPENEVO_DEV_AGENT_URL": f"http://127.0.0.1:{args.local_port}",
             }
         )
+        npm_script = "dev:agent"
+        npm_arguments: list[str] = []
+        if args.web_layer:
+            import uvicorn
+            from development_agent_web_layer import create_development_agent_web_app
+
+            session_token = secrets.token_hex(32)
+            bootstrap_token = secrets.token_hex(32)
+            browser_endpoint = f"http://127.0.0.1:{DEVELOPMENT_BROWSER_PORT}"
+            app = create_development_agent_web_app(
+                daemon_endpoint=f"http://127.0.0.1:{args.local_port}",
+                daemon_token=token,
+                session_token=session_token,
+                bootstrap_token=bootstrap_token,
+                browser_endpoint=browser_endpoint,
+                source_commit=expected_commit,
+            )
+            web_server = uvicorn.Server(uvicorn.Config(
+                app, host="127.0.0.1", port=args.web_port, log_level="info"
+            ))
+            web_thread = threading.Thread(target=web_server.run, name="development-agent-web", daemon=True)
+            web_thread.start()
+            deadline = time.monotonic() + 10
+            while not web_server.started and web_thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not web_server.started:
+                raise LauncherError("development web layer did not start")
+            environment["OPENEVO_DEV_WEB_URL"] = f"http://127.0.0.1:{args.web_port}"
+            environment["OPENEVO_DEV_WEB_TOKEN"] = session_token
+            npm_script = "dev:agent:web"
+            npm_arguments = ["--", "--open", "/product-preview.html"]
+            print("Desktop Local API v2 bridge is ready; the browser will use only the web-layer session token.")
         print("Remote daemon and tunnel are ready. Starting the real product UI...")
         completed = subprocess.run(
-            [npm_binary, "run", "dev:agent"],
+            [npm_binary, "run", npm_script, *npm_arguments],
             cwd=DESKTOP_ROOT,
             env=environment,
             check=False,
         )
         return completed.returncode
     finally:
+        if web_server is not None:
+            web_server.should_exit = True
+        if web_thread is not None:
+            web_thread.join(timeout=5)
         if tunnel is not None:
             print("Closing the local SSH tunnel. The remote daemon remains running.")
             _stop_process(tunnel)

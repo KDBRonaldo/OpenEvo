@@ -7,6 +7,8 @@
     "dev": "vite",
     "dev:agent": "vite --mode openevo-live-agent --open /product-preview.html",
     "dev:agent:remote": "python3 ../scripts/dev/run_remote_agent_development.py",
+    "dev:agent:web:remote": "uv run python ../scripts/dev/run_remote_agent_development.py --web-layer",
+    "dev:agent:web": "vite --mode openevo-live-agent-web",
     "dev:live": "uv run python ../scripts/dev/run_desktop_live.py",
     "dev:formal": "uv run python ../scripts/dev/run_desktop_live.py --prepare",
     "dev:formal:browser": "uv run python ../scripts/dev/run_desktop_live.py --prepare --browser",
@@ -21,6 +23,7 @@
     "build:desktop": "npm run build:sidecar && npm run tauri:build",
     "preview": "vite preview",
     "test": "vitest",
+    "test:agent:web:e2e": "playwright install chromium && playwright test --config playwright.development-agent.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -35,6 +38,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
+    "@playwright/test": "1.61.1",
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^22.7.0",
     "@types/react": "^19.0.0",

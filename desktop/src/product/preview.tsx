@@ -14,14 +14,23 @@ export function createProductPreviewProvider(mode = import.meta.env.MODE) {
   return createDevelopmentAgentProvider();
 }
 
+async function createPreviewProvider() {
+  if (import.meta.env.MODE === "openevo-live-agent-web") {
+    // Keep the complete, proven development product behavior while changing only its
+    // transport: Vite now sends every daemon API request to the local Web Layer.
+    return createDevelopmentAgentProvider();
+  }
+  return createProductPreviewProvider();
+}
+
 if (!import.meta.env.DEV) {
   throw new Error("The product preview is available only from the Vite development server.");
 }
 
-const provider = createProductPreviewProvider();
-
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <DesktopProductApp provider={provider} />
-  </React.StrictMode>,
-);
+void createPreviewProvider().then((provider) => {
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+      <DesktopProductApp provider={provider} />
+    </React.StrictMode>,
+  );
+});

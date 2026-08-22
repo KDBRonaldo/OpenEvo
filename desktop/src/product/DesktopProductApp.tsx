@@ -221,6 +221,7 @@ export function DesktopProductApp({
   const refreshInFlight = useRef<Promise<DesktopProductSnapshotV2 | null> | null>(null);
   const snapshotRef = useRef<DesktopProductSnapshotV2 | null>(null);
   const projectRecoveryRefreshInFlight = useRef(false);
+  const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
 
   const refresh = useCallback((): Promise<DesktopProductSnapshotV2 | null> => {
     refreshRequestSequence.current += 1;
@@ -279,9 +280,14 @@ export function DesktopProductApp({
 
   useEffect(() => {
     if (!openConnectionSettings || snapshot === null) return;
+    if (developmentAgentBridge) {
+      setConnectionOpen(false);
+      onConnectionSettingsOpened?.();
+      return;
+    }
     setConnectionOpen(true);
     onConnectionSettingsOpened?.();
-  }, [onConnectionSettingsOpened, openConnectionSettings, snapshot]);
+  }, [developmentAgentBridge, onConnectionSettingsOpened, openConnectionSettings, snapshot]);
 
   useEffect(() => {
     if (snapshot === null) return;
@@ -349,6 +355,7 @@ export function DesktopProductApp({
     return (
       <InitialV2View
         error={loadError}
+        developmentAgentBridge={developmentAgentBridge}
         onRetry={() => void refresh()}
         onAddRemote={() => {
           setConnectionOpen(true);
@@ -381,7 +388,6 @@ export function DesktopProductApp({
   const diagnostics = provider.listDiagnostics();
   const mutationIntents = provider.listMutationIntents();
   const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
-  const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
   const developmentEvolutionActive = developmentAgentBridge && (
     snapshot.runtimePresentation?.evolutionRuns?.some((run) => run.state === "running") === true
   );
@@ -538,7 +544,7 @@ export function DesktopProductApp({
           <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
           <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>System</WorkspaceButton>
         </nav>
-        <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
+        {!developmentAgentBridge ? <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button> : null}
       </aside>
 
       <ProjectExplorerV2
@@ -580,11 +586,11 @@ export function DesktopProductApp({
             {activeProfile && activeProfile.profile_kind === "system_openssh" ? (
               <>
                 <div className={`connection-badge ${activeProfile.connection_state === "connected" ? "success" : "neutral"}`} title={`${activeProfile.display_name}: ${connectionLabel(activeProfile.connection_state)}`}><span className="status-dot" /><span>{activeProfile.display_name}</span><strong>{connectionLabel(activeProfile.connection_state)}</strong></div>
-                <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
+                {!developmentAgentBridge ? <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button> : null}
               </>
-            ) : (
+            ) : !developmentAgentBridge ? (
               <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> Add remote workspace</button>
-            )}
+            ) : null}
           </div>
         </header>
 
@@ -712,7 +718,9 @@ export function DesktopProductApp({
               snapshot={snapshot}
               activeProfile={activeProfile}
               busy={busy}
-              onOpenConnections={() => setConnectionOpen(true)}
+              onOpenConnections={() => {
+                if (!developmentAgentBridge) setConnectionOpen(true);
+              }}
               onRestartService={(serviceId) => void act(
                 () => provider.restartService(serviceId, intentFor(snapshot, "restart-service")),
                 "Service restart requested.",
@@ -821,7 +829,7 @@ export function DesktopProductApp({
         </aside>
       ) : null}
 
-      {connectionOpen ? (
+      {connectionOpen && !developmentAgentBridge ? (
         <RemoteWorkspaceSetupV2
           snapshot={snapshot}
           provider={provider}
@@ -867,10 +875,12 @@ export function DesktopProductApp({
 
 function InitialV2View({
   error,
+  developmentAgentBridge,
   onRetry,
   onAddRemote,
 }: {
   readonly error: string | null;
+  readonly developmentAgentBridge: boolean;
   readonly onRetry: () => void;
   readonly onAddRemote: () => void;
 }) {
@@ -880,7 +890,7 @@ function InitialV2View({
         <div className="product-brand"><span className="product-mark"><OpenEvoMark /></span><span>OpenEvo</span></div>
       </aside>
       <div className="product-stage">
-        <header className="product-topbar"><strong>OpenEvo Desktop</strong><button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button></header>
+        <header className="product-topbar"><strong>OpenEvo Desktop</strong>{!developmentAgentBridge ? <button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button> : null}</header>
         <main className="product-main">
           <Notice
             tone={error ? "error" : "info"}

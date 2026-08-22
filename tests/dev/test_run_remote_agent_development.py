@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -53,6 +54,103 @@ def test_resolves_direct_ssh_connection_without_config_alias() -> None:
     assert connection.options == ("-p", "27104")
     assert connection.destination == "root@js4.blockelite.cn"
     assert connection.display_name == "root@js4.blockelite.cn:27104"
+
+
+def test_web_layer_is_an_explicit_opt_in() -> None:
+    regular = remote_launcher.parse_args(["--host", "example.com", "--user", "root"])
+    web = remote_launcher.parse_args(
+        ["--host", "example.com", "--user", "root", "--web-layer"]
+    )
+
+    assert regular.web_layer is False
+    assert web.web_layer is True
+    assert web.web_port == 8766
+
+
+def test_port_preflight_rejects_an_existing_launcher_before_deployment() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    try:
+        with pytest.raises(remote_launcher.LauncherError, match="remote daemon was not changed"):
+            remote_launcher.ensure_local_ports_available([port])
+    finally:
+        listener.close()
+
+
+def test_port_preflight_accepts_a_free_local_port() -> None:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    remote_launcher.ensure_local_ports_available([port])
+
+
+def test_port_preflight_does_not_treat_a_closed_socket_as_a_listener() -> None:
+    previous = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    previous.bind(("127.0.0.1", 0))
+    port = previous.getsockname()[1]
+    previous.listen()
+    previous.close()
+
+    remote_launcher.ensure_local_ports_available([port])
+
+
+def test_web_layer_allows_only_local_development_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        remote_launcher,
+        "changed_checkout_paths",
+        lambda: (
+            "desktop/src/product/preview.tsx",
+            "scripts/dev/development_agent_web_layer.py",
+            "tests/dev/test_development_agent_web_layer.py",
+        ),
+    )
+
+    assert remote_launcher.validate_checkout_for_deployment(
+        web_layer=True, deploy_only=False
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        "scripts/dev/live_agent_daemon.py",
+        "src/openevo/evolution/framework/builtin_handlers.py",
+        "pyproject.toml",
+    ],
+)
+def test_web_layer_rejects_uncommitted_remote_runtime_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_path: str,
+) -> None:
+    monkeypatch.setattr(
+        remote_launcher, "changed_checkout_paths", lambda: (changed_path,)
+    )
+
+    with pytest.raises(remote_launcher.LauncherError, match="remote daemon"):
+        remote_launcher.validate_checkout_for_deployment(
+            web_layer=True, deploy_only=False
+        )
+
+
+def test_direct_launcher_still_requires_a_clean_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        remote_launcher,
+        "changed_checkout_paths",
+        lambda: ("desktop/src/product/preview.tsx",),
+    )
+
+    with pytest.raises(remote_launcher.LauncherError, match="remote daemon"):
+        remote_launcher.validate_checkout_for_deployment(
+            web_layer=False, deploy_only=False
+        )
 
 
 def test_tunnel_enables_keepalive_so_dead_forwarding_does_not_hang(
