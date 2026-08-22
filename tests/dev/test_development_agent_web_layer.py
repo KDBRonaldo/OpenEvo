@@ -266,6 +266,30 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
 
 
+def test_active_project_tunnel_exposes_only_its_bound_project() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": project_id,
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+                for project_id in ("project-1", "project-2")
+            ],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    projects = provider.invoke("listDesktopProjectsV2", {})
+
+    assert [project.project_id for project in projects.items] == ["project-1"]
+
+
 def test_initial_snapshot_projections_share_the_bounded_state_cache() -> None:
     fake = FakeDaemonClient()
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)

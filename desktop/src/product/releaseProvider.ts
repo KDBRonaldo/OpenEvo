@@ -251,6 +251,15 @@ async function requestBrowserSidecarBootstrap(): Promise<DesktopBootstrapContext
   }
   let retainedInSessionStorage = false;
   try {
+    // A launcher-issued bootstrap fragment starts a new development authority.
+    // Pending browser mutation identity belongs to the previous provider stream
+    // and must not be restored into the newly deployed Web Layer.
+    if (
+      import.meta.env.DEV
+      || import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT === "1"
+    ) {
+      window.localStorage.removeItem(BROWSER_MUTATION_JOURNAL_KEY);
+    }
     window.sessionStorage.setItem(BROWSER_BOOTSTRAP_STORAGE_KEY, JSON.stringify(context));
     retainedInSessionStorage = true;
   } catch {

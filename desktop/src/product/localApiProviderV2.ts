@@ -162,6 +162,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       this.ensureEventStream();
       return { status: "fresh", snapshot };
     } catch (error) {
+      if (
+        import.meta.env.DEV
+        || import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT === "1"
+      ) {
+        console.error("OpenEvo Desktop authoritative refresh failed", error);
+      }
       if (sequence !== this.refreshSequence) {
         return { status: "stale", stream: { status: "stale", epoch: this.epoch, reason: "refresh_pending" } };
       }
