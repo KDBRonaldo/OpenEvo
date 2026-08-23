@@ -1735,11 +1735,76 @@ def test_failed_evolution_method_can_retry_with_fixed_inputs_without_rerunning_a
     assert failed_job["attempts"][0]["stage"] == "method_execution"
     assert failed_job["attempts"][0]["error_code"] == "method_execution_failed"
 
-    retry_job, retry_attempt = store.start_evolution_retry(failed_job["job_id"])
-    retried_artifacts = runner.retry(job=retry_job, attempt=retry_attempt, store=store)
+    retry_action_id = "retry-text-memory-after-temporary-failure"
+    token = "evolution-job-v2-token"
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0),
+        token,
+        object(),
+        store,
+        evolution_runner=runner,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = f"http://127.0.0.1:{server.server_address[1]}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    retry_body = json.dumps({
+        "schema_version": "2",
+        "action_id": retry_action_id,
+    }).encode()
+    try:
+        retry_request = urllib.request.Request(
+            f"{root}/v2/development/evolution-jobs/{failed_job['job_id']}/retry",
+            data=retry_body,
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(retry_request, timeout=5) as response:
+            retried = json.loads(response.read())
+        assert retried["job_id"] == failed_job["job_id"]
+        assert retried["attempts"][-1]["action_id"] == retry_action_id
+
+        duplicate_request = urllib.request.Request(
+            f"{root}/v2/development/evolution-jobs/{failed_job['job_id']}/retry",
+            data=retry_body,
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(duplicate_request, timeout=5) as response:
+            duplicate = json.loads(response.read())
+        assert duplicate["attempts"][-1]["attempt_id"] == retried["attempts"][-1]["attempt_id"]
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail_request = urllib.request.Request(
+                f"{root}/v2/development/evolution-jobs/{failed_job['job_id']}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(detail_request, timeout=5) as response:
+                completed_v2_payload = json.loads(response.read())
+            if completed_v2_payload["state"] == "completed":
+                break
+            time.sleep(0.01)
+        assert completed_v2_payload["state"] == "completed"
+
+        inventory_request = urllib.request.Request(
+            f"{root}/v2/development/evolution-jobs?{urlencode({'project_id': project['project_id'], 'limit': 25})}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(inventory_request, timeout=5) as response:
+            page_v2_payload = json.loads(response.read())
+        assert [item["job_id"] for item in page_v2_payload["items"]] == [
+            failed_job["job_id"]
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
     assert invocations == 2
-    assert len(retried_artifacts) == 1
     completed_job = store.get_evolution_job(failed_job["job_id"])
     assert completed_job["state"] == "completed"
     assert [attempt["state"] for attempt in completed_job["attempts"]] == [
@@ -1749,6 +1814,12 @@ def test_failed_evolution_method_can_retry_with_fixed_inputs_without_rerunning_a
     assert completed_job["attempts"][1]["ordinal"] == 2
     assert completed_job["resolver_input_artifact_ids"] == []
     assert len(store.dataset_artifacts(project["project_id"])) == 1
+    completed_v2 = store.evolution_job_v2(failed_job["job_id"])
+    assert completed_v2.state == "completed"
+    assert [attempt.state for attempt in completed_v2.attempts] == [
+        "failed",
+        "completed",
+    ]
 
 
 def test_development_runner_resolves_auto_and_supplies_ordered_project_history(

@@ -41,6 +41,7 @@ class FakeDaemonClient:
         self.expire_next_event_cursor = False
         self.workspace_files: dict[str, bytes] = {}
         self.evolution_action_ids: dict[str, str] = {}
+        self.evolution_retry_action_ids: dict[str, str] = {}
 
     def emit_event(self, project_id: str) -> None:
         sequence = len(self.events) + 1
@@ -246,6 +247,72 @@ class FakeDaemonClient:
     ) -> tuple[int, bytes, dict[str, str]]:
         del content_type
         parameters = parse_qs(query)
+        if path == "development/evolution-jobs" and method == "GET":
+            project_id = parameters["project_id"][0]
+            session_projects = {
+                session["session_id"]: session["project_id"]
+                for session in self.state["sessions"]
+            }
+            items = [
+                self._evolution_job_v2(job, project_id=project_id)
+                for job in self.state["evolution_jobs"]
+                if session_projects[job["session_id"]] == project_id
+            ]
+            payload = {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": None,
+                "has_more": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        evolution_job_retry = re.fullmatch(
+            r"development/evolution-jobs/([^/]+)/retry", path
+        )
+        if evolution_job_retry and method == "POST":
+            retry = json.loads(body)
+            job = next(
+                item for item in self.state["evolution_jobs"]
+                if item["job_id"] == evolution_job_retry.group(1)
+            )
+            attempt_id = self.evolution_retry_action_ids.get(retry["action_id"])
+            if attempt_id is None:
+                attempt_id = f"{job['job_id']}-attempt-{len(job['attempts']) + 1}"
+                self.evolution_retry_action_ids[retry["action_id"]] = attempt_id
+                job["attempts"].append({
+                    "attempt_id": attempt_id,
+                    "job_id": job["job_id"],
+                    "ordinal": len(job["attempts"]) + 1,
+                    "state": "running",
+                    "stage": "input_resolution",
+                    "artifact_ids": [],
+                    "error_code": None,
+                    "error_message": None,
+                    "logs": ["Retry admitted with the original fixed inputs."],
+                    "created_at": "2026-08-23T00:00:01Z",
+                    "started_at": "2026-08-23T00:00:01Z",
+                    "completed_at": None,
+                    "updated_at": "2026-08-23T00:00:01Z",
+                })
+                job["state"] = "running"
+                job["error"] = None
+            project_id = next(
+                session["project_id"] for session in self.state["sessions"]
+                if session["session_id"] == job["session_id"]
+            )
+            payload = self._evolution_job_v2(job, project_id=project_id)
+            return 202, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        evolution_job_detail = re.fullmatch(r"development/evolution-jobs/([^/]+)", path)
+        if evolution_job_detail and method == "GET":
+            job = next(
+                item for item in self.state["evolution_jobs"]
+                if item["job_id"] == evolution_job_detail.group(1)
+            )
+            project_id = next(
+                session["project_id"] for session in self.state["sessions"]
+                if session["session_id"] == job["session_id"]
+            )
+            payload = self._evolution_job_v2(job, project_id=project_id)
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
         if path == "development/evolution-runs" and method == "GET":
             project_id = parameters["project_id"][0]
             items = [
@@ -436,6 +503,43 @@ class FakeDaemonClient:
             "error": run["error"],
             "created_at": run["created_at"],
             "updated_at": run["updated_at"],
+        }
+
+    def _evolution_job_v2(
+        self,
+        job: dict[str, object],
+        *,
+        project_id: str,
+    ) -> dict[str, object]:
+        action_ids = {
+            attempt_id: action_id
+            for action_id, attempt_id in self.evolution_retry_action_ids.items()
+        }
+        return {
+            "schema_version": "2",
+            "job_id": job["job_id"],
+            "project_id": project_id,
+            "task_id": job["session_id"],
+            "run_id": job.get("run_id"),
+            "target_id": job["target_id"],
+            "method_id": job["method_id"],
+            "requested_method_id": job["requested_method_id"],
+            "resolver_input_artifact_ids": job["resolver_input_artifact_ids"],
+            "previous_artifact_id": job["previous_artifact_id"],
+            "config": job["config"],
+            "state": job["state"],
+            "artifact_ids": job["artifact_ids"],
+            "error": job["error"],
+            "attempts": [
+                {
+                    "schema_version": "2",
+                    "action_id": action_ids.get(attempt["attempt_id"]),
+                    **attempt,
+                }
+                for attempt in job["attempts"]
+            ],
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
         }
 
 
@@ -881,6 +985,120 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> No
         detail = client.get(f"{root}/{run_id}", headers=headers)
         assert detail.status_code == 200
         assert detail.json()["artifact_ids"] == ["candidate-memory-v2"]
+
+
+def test_http_layer_uses_authenticated_daemon_v2_evolution_job_authority() -> None:
+    import scripts.dev.development_agent_web_layer as web
+
+    fake = FakeDaemonClient()
+    project_id = "development-project-job-v2"
+    task_id = "development-task-job-v2"
+    job_id = "development-job-v2"
+    fake.state.update({
+        "active_project_id": project_id,
+        "projects": [{
+            "project_id": project_id,
+            "display_name": "Evolution Job v2",
+            "config": _config(),
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+        "sessions": [{
+            "session_id": task_id,
+            "project_id": project_id,
+            "task_title": "Retry failed method",
+            "instruction": "Produce reusable context.",
+            "response": "Captured evidence.",
+            "model": "test",
+            "state": "completed",
+            "duration_ms": 1,
+            "logs": [],
+            "selected_evolution": [],
+            "evolution_errors": [],
+            "workspace_changes": [],
+            "context_artifact_ids": [],
+            "runtime_activation": None,
+            "error": None,
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+        "evolution_jobs": [{
+            "job_id": job_id,
+            "session_id": task_id,
+            "run_id": None,
+            "target_id": "text_memory",
+            "method_id": "text_memory_reflector",
+            "requested_method_id": "text_memory_reflector",
+            "resolver_input_artifact_ids": [],
+            "previous_artifact_id": None,
+            "config": {},
+            "state": "failed",
+            "artifact_ids": [],
+            "error": "temporary failure",
+            "attempts": [{
+                "attempt_id": f"{job_id}-attempt-1",
+                "job_id": job_id,
+                "ordinal": 1,
+                "state": "failed",
+                "stage": "method_execution",
+                "artifact_ids": [],
+                "error_code": "method_execution_failed",
+                "error_message": "temporary failure",
+                "logs": ["Evolution attempt failed."],
+                "created_at": "2026-08-23T00:00:00Z",
+                "started_at": "2026-08-23T00:00:00Z",
+                "completed_at": "2026-08-23T00:00:00Z",
+                "updated_at": "2026-08-23T00:00:00Z",
+            }],
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+    })
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    root = "/desktop/v2/development/evolution-jobs"
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    action_id = "retry-development-job-v2"
+    with TestClient(app) as client:
+        assert client.get(f"{root}?project_id={project_id}").status_code == 401
+        inventory = client.get(
+            f"{root}?project_id={project_id}&limit=25",
+            headers=headers,
+        )
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["job_id"] == job_id
+
+        retried = client.post(
+            f"{root}/{job_id}/retry",
+            headers=headers,
+            json={"schema_version": "2", "action_id": action_id},
+        )
+        assert retried.status_code == 202
+        assert retried.json()["attempts"][-1]["action_id"] == action_id
+
+        duplicate = client.post(
+            f"{root}/{job_id}/retry",
+            headers=headers,
+            json={"schema_version": "2", "action_id": action_id},
+        )
+        assert duplicate.status_code == 202
+        assert len(duplicate.json()["attempts"]) == 2
+
+        detail = client.get(f"{root}/{job_id}", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["project_id"] == project_id
 
 
 def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:

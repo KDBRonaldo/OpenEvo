@@ -265,6 +265,84 @@ class DevelopmentEvolutionRunPageV2(StrictDevelopmentModelV2):
     has_more: bool = False
 
 
+class DevelopmentEvolutionJobRetryV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+
+
+class DevelopmentEvolutionAttemptV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    attempt_id: core.OpaqueId
+    action_id: core.OpaqueId | None = None
+    job_id: core.OpaqueId
+    ordinal: int = Field(ge=1, le=100)
+    state: Literal["queued", "running", "completed", "failed", "cancelled"]
+    stage: str = Field(min_length=1, max_length=128)
+    artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    error_message: str | None = Field(default=None, min_length=1, max_length=32_000)
+    logs: list[str] = Field(max_length=512)
+    created_at: core.UtcTimestamp
+    started_at: core.UtcTimestamp | None = None
+    completed_at: core.UtcTimestamp | None = None
+    updated_at: core.UtcTimestamp
+
+    @field_validator("logs")
+    @classmethod
+    def _validate_logs(cls, value: list[str]) -> list[str]:
+        if any(not item or len(item) > 16_384 for item in value):
+            raise ValueError("Evolution attempt logs must be non-empty and bounded")
+        if sum(len(item.encode("utf-8")) for item in value) > 2 * 1024 * 1024:
+            raise ValueError("Evolution attempt logs exceed the development v2 byte budget")
+        return value
+
+
+class DevelopmentEvolutionJobV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    job_id: core.OpaqueId
+    project_id: core.OpaqueId
+    task_id: core.OpaqueId
+    run_id: core.OpaqueId | None = None
+    target_id: core.OpaqueId
+    method_id: core.OpaqueId
+    requested_method_id: core.OpaqueId
+    resolver_input_artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    previous_artifact_id: core.OpaqueId | None = None
+    config: dict[str, Any]
+    state: Literal["queued", "running", "completed", "failed"]
+    artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    error: str | None = Field(default=None, max_length=32_000)
+    attempts: list[DevelopmentEvolutionAttemptV2] = Field(max_length=100)
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+    @model_validator(mode="after")
+    def _validate_job(self) -> "DevelopmentEvolutionJobV2":
+        encoded = json.dumps(
+            self.config,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 192 * 1024:
+            raise ValueError("Evolution Job config exceeds the development v2 byte budget")
+        if any(attempt.job_id != self.job_id for attempt in self.attempts):
+            raise ValueError("Evolution attempt crossed Job authority")
+        if [attempt.ordinal for attempt in self.attempts] != list(
+            range(1, len(self.attempts) + 1)
+        ):
+            raise ValueError("Evolution attempt ordinals must be contiguous")
+        return self
+
+
+class DevelopmentEvolutionJobPageV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    items: list[DevelopmentEvolutionJobV2] = Field(max_length=25)
+    next_cursor: core.Cursor | None = None
+    has_more: bool = False
+
+
 __all__ = [
     "DevelopmentAttemptAppendedObservationV2",
     "DevelopmentArtifactDocumentV2",
@@ -275,6 +353,10 @@ __all__ = [
     "DevelopmentEvolutionRunPageV2",
     "DevelopmentEvolutionRunV2",
     "DevelopmentEvolutionSelectionV2",
+    "DevelopmentEvolutionAttemptV2",
+    "DevelopmentEvolutionJobPageV2",
+    "DevelopmentEvolutionJobRetryV2",
+    "DevelopmentEvolutionJobV2",
     "DevelopmentDatasetSealedObservationV2",
     "DevelopmentTaskAdmittedObservationV2",
     "DevelopmentTaskObservationPageV2",

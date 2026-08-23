@@ -581,15 +581,18 @@ against an explicit set of completed Session IDs and method selections. Every se
 method owns a durable Job plus ordered Attempts. Each
 Attempt records its current stage, bounded diagnostic log, typed error code,
 error message, timestamps, and produced artifact IDs. A failed method can be
-retried independently through
-`POST /openevo-dev-agent/v1/evolution-jobs/<job-id>/retry`. The retry reuses the
+retried independently. In the self-hosted WebUI path, Job inventory, detail, Attempt history,
+logs, and retry use the Desktop-session authenticated
+`/desktop/v2/development/evolution-jobs*` bridge to daemon
+`/v2/development/evolution-jobs*`. Retry carries a stable action ID that is durably bound to one
+Attempt, so an exact transport retry cannot execute the method twice. The retry reuses the
 original Session transcript dataset, ordered history dataset IDs, previous
 target artifact, resolved concrete method, and normalized method config; it
 does not rerun the Agent or silently adopt newer Project settings. Desktop
 polls while that Attempt is active and exposes both failure details and the
 complete Attempt history in the Evolution workspace. Successful outputs remain
-unapplied candidates. `POST /openevo-dev-agent/v1/evolution-runs/<run-id>/apply`
-atomically replaces the active artifact for each produced target; only then can later
+unapplied candidates. Applying the separate Evolution Run atomically replaces the active
+artifact for each produced target; only then can later
 Sessions receive those artifacts as runtime context.
 
 The self-hosted WebUI path no longer calls those v1 Evolution Run endpoints. It uses the
@@ -597,6 +600,8 @@ Desktop-session authenticated `/desktop/v2/development/evolution-runs*` bridge, 
 closed bounded payloads and forwards to daemon `/v2/development/evolution-runs*`. Creation binds a
 stable action ID so an exact retry returns the existing Run instead of starting the algorithms
 again. The direct development provider retains the v1 calls only as its compatibility fallback.
+The same fallback rule applies to individual Evolution Jobs; the self-hosted provider ignores
+the `evolution_jobs` array embedded in v1 state.
 
 Harness mechanics are isolated behind `HarnessAdapter`. The first concrete
 implementation is `CodexHarnessAdapter`, which owns runtime preparation,

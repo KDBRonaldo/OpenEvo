@@ -55,6 +55,9 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionJobPageV2,
+        DevelopmentEvolutionJobRetryV2,
+        DevelopmentEvolutionJobV2,
         DevelopmentEvolutionRunApplyV2,
         DevelopmentEvolutionRunCreateV2,
         DevelopmentEvolutionRunPageV2,
@@ -70,6 +73,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launch
     from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionJobPageV2,
+        DevelopmentEvolutionJobRetryV2,
+        DevelopmentEvolutionJobV2,
         DevelopmentEvolutionRunApplyV2,
         DevelopmentEvolutionRunCreateV2,
         DevelopmentEvolutionRunPageV2,
@@ -145,6 +151,13 @@ DAEMON_V2_DEVELOPMENT_ARTIFACT_PATH_PATTERN = re.compile(
     r"^/v2/development/artifacts/([^/]+)$"
 )
 DAEMON_V2_DEVELOPMENT_EVOLUTION_RUNS_PATH = "/v2/development/evolution-runs"
+DAEMON_V2_DEVELOPMENT_EVOLUTION_JOBS_PATH = "/v2/development/evolution-jobs"
+DAEMON_V2_DEVELOPMENT_EVOLUTION_JOB_RETRY_PATH_PATTERN = re.compile(
+    r"^/v2/development/evolution-jobs/([^/]+)/retry$"
+)
+DAEMON_V2_DEVELOPMENT_EVOLUTION_JOB_PATH_PATTERN = re.compile(
+    r"^/v2/development/evolution-jobs/([^/]+)$"
+)
 DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_APPLY_PATH_PATTERN = re.compile(
     r"^/v2/development/evolution-runs/([^/]+)/apply$"
 )
@@ -163,6 +176,7 @@ MAX_DAEMON_V2_WORKSPACE_PAGE = 100
 MAX_DAEMON_V2_ARTIFACT_PAGE = 100
 MAX_DAEMON_V2_DEVELOPMENT_ARTIFACT_PAGE = 5
 MAX_DAEMON_V2_EVOLUTION_RUN_PAGE = 25
+MAX_DAEMON_V2_EVOLUTION_JOB_PAGE = 25
 MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
@@ -1332,6 +1346,7 @@ class DevelopmentStateStore:
                     ON development_evolution_jobs(session_id, created_at, job_id);
                 CREATE TABLE IF NOT EXISTS development_evolution_job_attempts (
                     attempt_id TEXT PRIMARY KEY,
+                    action_id TEXT,
                     job_id TEXT NOT NULL REFERENCES development_evolution_jobs(job_id),
                     ordinal INTEGER NOT NULL CHECK (ordinal > 0),
                     state TEXT NOT NULL CHECK (
@@ -1504,6 +1519,7 @@ class DevelopmentStateStore:
                     FROM development_evolution_jobs;
                     CREATE TABLE development_evolution_job_attempts_rebuilt (
                         attempt_id TEXT PRIMARY KEY,
+                        action_id TEXT,
                         job_id TEXT NOT NULL REFERENCES development_evolution_jobs_rebuilt(job_id),
                         ordinal INTEGER NOT NULL CHECK (ordinal > 0),
                         state TEXT NOT NULL CHECK (
@@ -1521,7 +1537,10 @@ class DevelopmentStateStore:
                         UNIQUE(job_id, ordinal)
                     );
                     INSERT INTO development_evolution_job_attempts_rebuilt
-                    SELECT * FROM development_evolution_job_attempts;
+                    SELECT attempt_id, NULL, job_id, ordinal, state, stage,
+                           artifact_ids_json, error_code, error_message, logs_json,
+                           created_at, started_at, completed_at, updated_at
+                    FROM development_evolution_job_attempts;
                     DROP TABLE development_evolution_job_attempts;
                     DROP TABLE development_evolution_jobs;
                     ALTER TABLE development_evolution_jobs_rebuilt
@@ -1534,6 +1553,22 @@ class DevelopmentStateStore:
                         ON development_evolution_job_attempts(job_id, ordinal);
                     """
                 )
+            attempt_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(development_evolution_job_attempts)"
+                )
+            }
+            if "action_id" not in attempt_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_job_attempts ADD COLUMN action_id TEXT"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "development_evolution_attempts_action_id "
+                "ON development_evolution_job_attempts(action_id) "
+                "WHERE action_id IS NOT NULL"
+            )
             for row in connection.execute(
                 "SELECT session_id, selected_evolution_json FROM development_sessions"
             ).fetchall():
@@ -3030,9 +3065,63 @@ class DevelopmentStateStore:
             ).fetchone()
         return self._attempt_record(row)
 
-    def start_evolution_retry(self, job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def evolution_retry_for_action(
+        self,
+        job_id: str,
+        action_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            bound = connection.execute(
+                "SELECT job_id FROM development_evolution_job_attempts WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        if bound is None:
+            return None
+        if bound["job_id"] != job_id:
+            raise StateConflictError(
+                "Evolution retry action_id is already bound to another Job"
+            )
+        return self.get_evolution_job(job_id)
+
+    def start_evolution_retry(
+        self,
+        job_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        job, attempt, _created = self.start_evolution_retry_v2(
+            job_id,
+            f"legacy-retry-{secrets.token_hex(16)}",
+        )
+        return job, attempt
+
+    def start_evolution_retry_v2(
+        self,
+        job_id: str,
+        action_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
         now = utc_now()
         with self._lock, self._connection() as connection:
+            bound = connection.execute(
+                "SELECT * FROM development_evolution_job_attempts WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if bound is not None:
+                if bound["job_id"] != job_id:
+                    raise StateConflictError(
+                        "Evolution retry action_id is already bound to another Job"
+                    )
+                job = connection.execute(
+                    "SELECT * FROM development_evolution_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                attempts = [
+                    self._attempt_record(attempt)
+                    for attempt in connection.execute(
+                        "SELECT * FROM development_evolution_job_attempts "
+                        "WHERE job_id = ? ORDER BY ordinal",
+                        (job_id,),
+                    )
+                ]
+                return self._job_record(job, attempts), self._attempt_record(bound), False
             job_row = connection.execute(
                 """
                 SELECT job.*, session.state AS session_state, session.project_id
@@ -3070,14 +3159,15 @@ class DevelopmentStateStore:
             connection.execute(
                 """
                 INSERT INTO development_evolution_job_attempts(
-                    attempt_id, job_id, ordinal, state, stage, artifact_ids_json,
+                    attempt_id, action_id, job_id, ordinal, state, stage, artifact_ids_json,
                     error_code, error_message, logs_json, created_at, started_at,
                     completed_at, updated_at
-                ) VALUES (?, ?, ?, 'running', 'input_resolution', '[]', NULL, NULL,
+                ) VALUES (?, ?, ?, ?, 'running', 'input_resolution', '[]', NULL, NULL,
                           ?, ?, ?, NULL, ?)
                 """,
                 (
                     attempt_id,
+                    action_id,
                     job_id,
                     ordinal,
                     canonical_json(["Retry admitted with the original fixed inputs."]),
@@ -3106,7 +3196,11 @@ class DevelopmentStateStore:
                 "SELECT * FROM development_evolution_job_attempts WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()
-        return self._job_record(job, [self._attempt_record(attempt)]), self._attempt_record(attempt)
+        return (
+            self._job_record(job, [self._attempt_record(attempt)]),
+            self._attempt_record(attempt),
+            True,
+        )
 
     def reconcile_evolution_run(self, run_id: str) -> dict[str, Any]:
         now = utc_now()
@@ -3250,6 +3344,101 @@ class DevelopmentStateStore:
                 )
             ]
         return self._job_record(row, attempts)
+
+    def evolution_job_v2(self, job_id: str) -> DevelopmentEvolutionJobV2:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT job.*, session.project_id "
+                "FROM development_evolution_jobs AS job "
+                "JOIN development_sessions AS session "
+                "ON session.session_id = job.session_id "
+                "WHERE job.job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            attempts = [
+                self._attempt_record(attempt, include_action_id=True)
+                for attempt in connection.execute(
+                    "SELECT * FROM development_evolution_job_attempts "
+                    "WHERE job_id = ? ORDER BY ordinal",
+                    (job_id,),
+                )
+            ]
+        return self._development_evolution_job_v2(
+            self._job_record(row, attempts),
+            project_id=row["project_id"],
+        )
+
+    def evolution_job_page_v2(
+        self,
+        *,
+        project_id: str,
+        after_job_id: str | None,
+        limit: int,
+    ) -> DevelopmentEvolutionJobPageV2:
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone() is None:
+                raise KeyError(project_id)
+            parameters: list[object] = [project_id]
+            cursor_clause = ""
+            if after_job_id is not None:
+                cursor = connection.execute(
+                    "SELECT job.created_at, job.job_id "
+                    "FROM development_evolution_jobs AS job "
+                    "JOIN development_sessions AS session "
+                    "ON session.session_id = job.session_id "
+                    "WHERE session.project_id = ? AND job.job_id = ?",
+                    (project_id, after_job_id),
+                ).fetchone()
+                if cursor is None:
+                    raise RequestError("Evolution Job cursor is not part of this Project")
+                cursor_clause = (
+                    "AND (job.created_at > ? OR "
+                    "(job.created_at = ? AND job.job_id > ?)) "
+                )
+                parameters.extend(
+                    [cursor["created_at"], cursor["created_at"], cursor["job_id"]]
+                )
+            rows = connection.execute(
+                "SELECT job.*, session.project_id "
+                "FROM development_evolution_jobs AS job "
+                "JOIN development_sessions AS session "
+                "ON session.session_id = job.session_id "
+                "WHERE session.project_id = ? "
+                + cursor_clause
+                + "ORDER BY job.created_at, job.job_id LIMIT ?",
+                (*parameters, limit + 1),
+            ).fetchall()
+            selected = rows[:limit]
+            attempts_by_job: dict[str, list[dict[str, Any]]] = {}
+            if selected:
+                job_ids = [row["job_id"] for row in selected]
+                for attempt in connection.execute(
+                    "SELECT * FROM development_evolution_job_attempts "
+                    f"WHERE job_id IN ({','.join('?' for _ in job_ids)}) "
+                    "ORDER BY job_id, ordinal",
+                    tuple(job_ids),
+                ):
+                    attempts_by_job.setdefault(attempt["job_id"], []).append(
+                        self._attempt_record(attempt, include_action_id=True)
+                    )
+        has_more = len(rows) > limit
+        items = [
+            self._development_evolution_job_v2(
+                self._job_record(row, attempts_by_job.get(row["job_id"], [])),
+                project_id=row["project_id"],
+            )
+            for row in selected
+        ]
+        return DevelopmentEvolutionJobPageV2(
+            items=items,
+            next_cursor=items[-1].job_id if has_more and items else None,
+            has_more=has_more,
+        )
 
     def dataset_artifact(self, artifact_id: str) -> dict[str, str]:
         with self._lock, self._connection() as connection:
@@ -3625,8 +3814,41 @@ class DevelopmentStateStore:
         })
 
     @staticmethod
-    def _attempt_record(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+    def _development_evolution_job_v2(
+        record: dict[str, Any],
+        *,
+        project_id: str,
+    ) -> DevelopmentEvolutionJobV2:
+        return DevelopmentEvolutionJobV2.model_validate({
+            "schema_version": "2",
+            "job_id": record["job_id"],
+            "project_id": project_id,
+            "task_id": record["session_id"],
+            "run_id": record["run_id"],
+            "target_id": record["target_id"],
+            "method_id": record["method_id"],
+            "requested_method_id": record["requested_method_id"],
+            "resolver_input_artifact_ids": record["resolver_input_artifact_ids"],
+            "previous_artifact_id": record["previous_artifact_id"],
+            "config": record["config"],
+            "state": record["state"],
+            "artifact_ids": record["artifact_ids"],
+            "error": record["error"],
+            "attempts": [
+                {"schema_version": "2", **attempt}
+                for attempt in record["attempts"]
+            ],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        })
+
+    @staticmethod
+    def _attempt_record(
+        row: sqlite3.Row,
+        *,
+        include_action_id: bool = False,
+    ) -> dict[str, Any]:
+        record = {
             "attempt_id": row["attempt_id"],
             "job_id": row["job_id"],
             "ordinal": row["ordinal"],
@@ -3641,6 +3863,9 @@ class DevelopmentStateStore:
             "completed_at": row["completed_at"],
             "updated_at": row["updated_at"],
         }
+        if include_action_id:
+            record["action_id"] = row["action_id"]
+        return record
 
 
 def validate_request(payload: object) -> dict[str, str]:
@@ -4717,13 +4942,28 @@ class DevelopmentSessionCoordinator:
             cancellation.cancel()
         return session
 
-    def retry_evolution(self, job_id: str) -> dict[str, Any]:
+    def retry_evolution(self, job_id: str, *, action_id: str | None = None) -> dict[str, Any]:
         if self._evolution_runner is None:
             raise StateConflictError("the Evolution runner is unavailable")
+        if action_id is not None:
+            existing = self._store.evolution_retry_for_action(job_id, action_id)
+            if existing is not None:
+                return existing
         if not self._turn_lock.acquire(blocking=False):
+            if action_id is not None:
+                existing = self._store.evolution_retry_for_action(job_id, action_id)
+                if existing is not None:
+                    return existing
             raise StateConflictError("another development session or Evolution retry is running")
         try:
-            job, attempt = self._store.start_evolution_retry(job_id)
+            effective_action_id = action_id or f"legacy-retry-{secrets.token_hex(16)}"
+            job, attempt, created = self._store.start_evolution_retry_v2(
+                job_id,
+                effective_action_id,
+            )
+            if not created:
+                self._turn_lock.release()
+                return job
             self._store.set_evolution_error(
                 job["session_id"],
                 target_id=job["target_id"],
@@ -5269,6 +5509,65 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, page.model_dump(mode="json"))
             return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_EVOLUTION_JOBS_PATH:
+            try:
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"project_id", "after", "limit"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError(
+                        "Evolution Job query contains unsupported parameters"
+                    )
+                project_id = parameters.get("project_id", [None])[0]
+                if project_id is None or not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                after_job_id = parameters.get("after", [None])[0]
+                if after_job_id is not None and not ID_PATTERN.fullmatch(after_job_id):
+                    raise RequestError("Evolution Job cursor is invalid")
+                limit_raw = parameters.get(
+                    "limit", [str(MAX_DAEMON_V2_EVOLUTION_JOB_PAGE)]
+                )[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("Evolution Job limit must be an integer")
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_EVOLUTION_JOB_PAGE:
+                    raise RequestError(
+                        "Evolution Job limit is outside the supported bound"
+                    )
+                page = self.server.store.evolution_job_page_v2(
+                    project_id=project_id,
+                    after_job_id=after_job_id,
+                    limit=limit,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        evolution_job_match = (
+            DAEMON_V2_DEVELOPMENT_EVOLUTION_JOB_PATH_PATTERN.fullmatch(
+                parsed_path.path
+            )
+        )
+        if evolution_job_match:
+            job_id = evolution_job_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(job_id):
+                    raise RequestError("job_id is invalid")
+                job = self.server.store.evolution_job_v2(job_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "Evolution Job not found"
+                )
+            else:
+                self._json(HTTPStatus.OK, job.model_dump(mode="json"))
+            return
         evolution_run_match = (
             DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_PATH_PATTERN.fullmatch(parsed_path.path)
         )
@@ -5504,6 +5803,43 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json_error_v2(
                     HTTPStatus.NOT_FOUND, "not_found", "project not found"
+                )
+            except StateConflictError as exc:
+                self._json_error_v2(
+                    HTTPStatus.CONFLICT, "state_conflict", str(exc)
+                )
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
+            return
+        retry_job_v2_match = (
+            DAEMON_V2_DEVELOPMENT_EVOLUTION_JOB_RETRY_PATH_PATTERN.fullmatch(
+                self.path
+            )
+        )
+        if retry_job_v2_match:
+            job_id = retry_job_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(job_id):
+                    raise RequestError("job_id is invalid")
+                request = DevelopmentEvolutionJobRetryV2.model_validate(
+                    self._read_json()
+                )
+                self.server.sessions.retry_evolution(
+                    job_id,
+                    action_id=request.action_id,
+                )
+                response = self.server.store.evolution_job_v2(job_id)
+            except ValidationError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except RequestError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "Evolution Job not found"
                 )
             except StateConflictError as exc:
                 self._json_error_v2(

@@ -47,6 +47,9 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionJobPageV2,
+        DevelopmentEvolutionJobRetryV2,
+        DevelopmentEvolutionJobV2,
         DevelopmentEvolutionRunApplyV2,
         DevelopmentEvolutionRunCreateV2,
         DevelopmentEvolutionRunPageV2,
@@ -62,6 +65,9 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionJobPageV2,
+        DevelopmentEvolutionJobRetryV2,
+        DevelopmentEvolutionJobV2,
         DevelopmentEvolutionRunApplyV2,
         DevelopmentEvolutionRunCreateV2,
         DevelopmentEvolutionRunPageV2,
@@ -1157,6 +1163,120 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
                     status_code=503,
                     detail="development daemon returned an invalid Evolution Run payload",
                 ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/evolution-jobs",
+        include_in_schema=False,
+    )
+    async def development_evolution_jobs(request: Request) -> Response:
+        project_id = request.query_params.get("project_id")
+        if project_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Evolution Job inventory requires project_id",
+            )
+        provider._find_project(project_id)
+        status, payload, headers = provider._client.proxy_v2(
+            "development/evolution-jobs",
+            query=request.url.query,
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentEvolutionJobPageV2.model_validate_json(payload)
+                if any(item.project_id != project_id for item in validated.items):
+                    raise ValueError("Evolution Job inventory crossed project authority")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid Evolution Job inventory",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/evolution-jobs/{job_id}",
+        include_in_schema=False,
+    )
+    async def development_evolution_job_detail(job_id: str) -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/evolution-jobs/{quote(job_id, safe='')}",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentEvolutionJobV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid Evolution Job detail",
+                ) from exc
+            provider._find_project(validated.project_id)
+            if validated.job_id != job_id:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned inconsistent Evolution Job authority",
+                )
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.post(
+        "/desktop/v2/development/evolution-jobs/{job_id}/retry",
+        include_in_schema=False,
+    )
+    async def development_evolution_job_retry(job_id: str, request: Request) -> Response:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(chunk) > MAX_DEVELOPMENT_EVOLUTION_REQUEST_BYTES - len(body):
+                return _desktop_error_response(
+                    status=413,
+                    code="desktop_request_too_large",
+                    summary="The Evolution retry request exceeds the development limit.",
+                    retryable=False,
+                    action="none",
+                )
+            body.extend(chunk)
+        try:
+            retry_request = DevelopmentEvolutionJobRetryV2.model_validate_json(body)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Evolution retry request did not match the closed v2 contract",
+            ) from exc
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/evolution-jobs/{quote(job_id, safe='')}/retry",
+            query="",
+            method="POST",
+            body=retry_request.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status in {HTTPStatus.OK, HTTPStatus.ACCEPTED}:
+            try:
+                validated = DevelopmentEvolutionJobV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid retried Evolution Job",
+                ) from exc
+            provider._find_project(validated.project_id)
+            if (
+                validated.job_id != job_id
+                or not any(
+                    attempt.action_id == retry_request.action_id
+                    for attempt in validated.attempts
+                )
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned inconsistent Evolution retry authority",
+                )
             payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
 

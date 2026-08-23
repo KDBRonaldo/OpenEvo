@@ -202,6 +202,51 @@ const evolutionRunPageV2Schema = z.object({
   has_more: z.boolean(),
 }).strict();
 
+const evolutionAttemptV2Schema = z.object({
+  schema_version: z.literal("2"),
+  attempt_id: z.string().min(1),
+  action_id: z.string().min(1).nullable(),
+  job_id: z.string().min(1),
+  ordinal: z.number().int().positive().max(100),
+  state: z.enum(["queued", "running", "completed", "failed", "cancelled"]),
+  stage: z.string().min(1),
+  artifact_ids: z.array(z.string().min(1)).max(256),
+  error_code: z.string().min(1).nullable(),
+  error_message: z.string().min(1).nullable(),
+  logs: z.array(z.string().min(1)).max(512),
+  created_at: z.string().min(1),
+  started_at: z.string().min(1).nullable(),
+  completed_at: z.string().min(1).nullable(),
+  updated_at: z.string().min(1),
+}).strict();
+
+const evolutionJobV2Schema = z.object({
+  schema_version: z.literal("2"),
+  job_id: z.string().min(1),
+  project_id: z.string().min(1),
+  task_id: z.string().min(1),
+  run_id: z.string().min(1).nullable(),
+  target_id: z.string().min(1),
+  method_id: z.string().min(1),
+  requested_method_id: z.string().min(1),
+  resolver_input_artifact_ids: z.array(z.string().min(1)).max(256),
+  previous_artifact_id: z.string().min(1).nullable(),
+  config: z.record(z.string(), z.unknown()),
+  state: z.enum(["queued", "running", "completed", "failed"]),
+  artifact_ids: z.array(z.string().min(1)).max(256),
+  error: z.string().nullable(),
+  attempts: z.array(evolutionAttemptV2Schema).max(100),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const evolutionJobPageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  items: z.array(evolutionJobV2Schema).max(25),
+  next_cursor: z.string().min(1).nullable(),
+  has_more: z.boolean(),
+}).strict();
+
 const stateSchema = z.object({
   schema_version: z.literal("1"),
   active_project_id: z.string().min(1).nullable(),
@@ -255,6 +300,7 @@ export interface DevelopmentAgentProviderOptions {
   readonly workspaceV2BaseUrl?: string;
   readonly artifactV2BaseUrl?: string;
   readonly evolutionV2BaseUrl?: string;
+  readonly evolutionJobV2BaseUrl?: string;
   readonly desktopSessionToken?: string;
 }
 
@@ -270,6 +316,7 @@ export function createDevelopmentAgentProvider(
   const workspaceV2BaseUrl = options.workspaceV2BaseUrl?.replace(/\/$/, "");
   const artifactV2BaseUrl = options.artifactV2BaseUrl?.replace(/\/$/, "");
   const evolutionV2BaseUrl = options.evolutionV2BaseUrl?.replace(/\/$/, "");
+  const evolutionJobV2BaseUrl = options.evolutionJobV2BaseUrl?.replace(/\/$/, "");
 
   const digestHex = async (payload: ArrayBuffer): Promise<string> => Array.from(
     new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
@@ -471,6 +518,68 @@ export function createDevelopmentAgentProvider(
     throw new Error("Evolution Run v2 exceeded the bounded pagination limit.");
   };
 
+  const requestEvolutionJobV2 = async (
+    suffix: string,
+    init: RequestInit = {},
+    timeoutMs = 60_000,
+  ): Promise<unknown> => {
+    if (evolutionJobV2BaseUrl === undefined) throw new Error("Evolution Job v2 is not configured.");
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const headers = new Headers(init.headers);
+      if (options.desktopSessionToken !== undefined) {
+        headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+      }
+      const response = await fetchImpl(`${evolutionJobV2BaseUrl}${suffix}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The Evolution Job request timed out. Check the SSH development tunnel.");
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  };
+
+  const loadEvolutionJobsV2 = async (projectId: string) => {
+    const jobs: z.infer<typeof evolutionJobV2Schema>[] = [];
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < 40; pageNumber += 1) {
+      const parameters = new URLSearchParams({ project_id: projectId, limit: "25" });
+      if (cursor !== null) parameters.set("after", cursor);
+      const page = evolutionJobPageV2Schema.parse(
+        await requestEvolutionJobV2(`?${parameters.toString()}`),
+      );
+      for (const item of page.items) {
+        if (item.project_id !== projectId) {
+          throw new Error("Evolution Job v2 crossed project authority.");
+        }
+        jobs.push(item);
+      }
+      if (!page.has_more) {
+        if (page.next_cursor !== null) {
+          throw new Error("Evolution Job v2 returned an invalid terminal cursor.");
+        }
+        return jobs;
+      }
+      if (page.next_cursor === null || page.next_cursor === cursor) {
+        throw new Error("Evolution Job v2 returned an invalid continuation cursor.");
+      }
+      cursor = page.next_cursor;
+    }
+    throw new Error("Evolution Job v2 exceeded the bounded pagination limit.");
+  };
+
   const requestJson = async (
     path: string,
     init?: RequestInit,
@@ -529,7 +638,7 @@ export function createDevelopmentAgentProvider(
         requestJson("/state").then((value) => stateSchema.parse(value)),
         requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
       ]);
-      const [workspaces, artifacts, evolutionRuns] = await Promise.all([
+      const [workspaces, artifacts, evolutionRuns, evolutionJobs] = await Promise.all([
         workspaceV2BaseUrl === undefined
           ? payload.workspaces
           : Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id))),
@@ -540,6 +649,10 @@ export function createDevelopmentAgentProvider(
         evolutionV2BaseUrl === undefined
           ? payload.evolution_runs
           : Promise.all(payload.projects.map((project) => loadEvolutionRunsV2(project.project_id)))
+            .then((pages) => pages.flat()),
+        evolutionJobV2BaseUrl === undefined
+          ? payload.evolution_jobs
+          : Promise.all(payload.projects.map((project) => loadEvolutionJobsV2(project.project_id)))
             .then((pages) => pages.flat()),
       ]);
       return {
@@ -579,9 +692,9 @@ export function createDevelopmentAgentProvider(
           updatedAt: session.updated_at,
         })),
         artifacts: artifacts.map(toPersistedArtifact),
-        evolutionJobs: payload.evolution_jobs.map((job) => ({
+        evolutionJobs: evolutionJobs.map((job) => ({
           jobId: job.job_id,
-          sessionId: job.session_id,
+          sessionId: "task_id" in job ? job.task_id : job.session_id,
           runId: job.run_id,
           targetId: job.target_id,
           methodId: job.method_id,
@@ -666,6 +779,20 @@ export function createDevelopmentAgentProvider(
       );
     },
     retryEvolutionJob: async (jobId) => {
+      if (evolutionJobV2BaseUrl !== undefined) {
+        const actionId = globalThis.crypto.randomUUID();
+        const job = evolutionJobV2Schema.parse(await requestEvolutionJobV2(
+          `/${encodeURIComponent(jobId)}/retry`,
+          jsonRequest("POST", { schema_version: "2", action_id: actionId }),
+        ));
+        if (
+          job.job_id !== jobId
+          || !job.attempts.some((attempt) => attempt.action_id === actionId)
+        ) {
+          throw new Error("Evolution Job v2 returned inconsistent retry authority.");
+        }
+        return;
+      }
       await requestJson(
         `/evolution-jobs/${encodeURIComponent(jobId)}/retry`,
         jsonRequest("POST", { schema_version: "1" }),

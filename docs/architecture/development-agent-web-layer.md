@@ -33,7 +33,11 @@ contracts, while bounded rich document presentation uses the development-only
 Evolution create, inventory, detail, and apply now use the development-only
 `/desktop/v2/development/evolution-runs*` bridge to daemon
 `/v2/development/evolution-runs*`. Creation is action-ID idempotent; run state and candidate
-artifact identities are durable across daemon/Web Layer restarts.
+artifact identities are durable across daemon/Web Layer restarts. Individual Evolution Job
+inventory, detail, ordered Attempts, bounded logs, and retry likewise use
+`/desktop/v2/development/evolution-jobs*` to daemon
+`/v2/development/evolution-jobs*`. Retry binds its action ID to exactly one Attempt, so an
+ambiguous browser retry returns that Attempt instead of executing the method twice.
 
 ## Start command
 
@@ -71,7 +75,7 @@ Edge installation. `OPENEVO_E2E_BROWSER_CHANNEL` remains available for an explic
 
 This Playwright test does not mock `fetch`, the Web Layer, SSH, the daemon, the agent, or evolution.
 It opens the real product page, creates a uniquely named remote project, uploads and reloads a
-workspace file through daemon v2, starts a Session, waits for the remote agent and evolution worker,
+valid binary PDF through daemon v2, starts a Session, waits for the remote agent and evolution worker,
 refreshes task logs, applies a text-memory candidate, and saves a success screenshot. It also proves
 that the rendered Artifact result was reloaded through the authenticated daemon v2 Artifact routes.
 The test then starts another Session, verifies in the rendered Session inspector that the applied
@@ -100,6 +104,9 @@ content metadata, and rich bounded documents are likewise read from daemon-owned
 Web Layer no longer reconstructs Artifact authority from the v1 state response. Evolution Run
 create/list/detail/apply and the frontend's polling authority now use closed daemon-owned v2
 payloads; the self-hosted provider ignores Evolution Runs embedded in v1 state.
+Evolution Job list/detail/Attempt history/logs and retry also use closed daemon-owned v2 payloads;
+the self-hosted provider ignores Evolution Jobs embedded in v1 state. The direct development
+provider keeps v1 only as an explicit compatibility fallback.
 
 The web layer converts remote development state to closed Desktop/Core v2 response models.
 It maps the development-only `report` artifact type to renderer-safe `diagnostic`; it does

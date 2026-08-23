@@ -86,6 +86,7 @@ export async function createSelfHostedFormalProvider(
     workspaceV2BaseUrl: "/desktop/v2/development/projects",
     artifactV2BaseUrl: "/desktop/v2/development/artifacts",
     evolutionV2BaseUrl: "/desktop/v2/development/evolution-runs",
+    evolutionJobV2BaseUrl: "/desktop/v2/development/evolution-jobs",
     desktopSessionToken: bootstrap.session_token,
   });
   return combineSelfHostedProviders(formal, presentation);

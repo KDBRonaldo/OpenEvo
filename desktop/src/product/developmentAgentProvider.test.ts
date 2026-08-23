@@ -720,6 +720,181 @@ describe("development agent provider", () => {
     expect(fetchImpl.mock.calls.some(([input]) => String(input).includes("/openevo-dev-agent/v1/evolution-runs")))
       .toBe(false);
   });
+
+  it("loads attempts and retries Evolution Jobs through the authenticated daemon v2 bridge", async () => {
+    const projectId = "project-job-v2";
+    const taskId = "task-job-v2";
+    const jobId = "job-text-memory-v2";
+    const jobs: Record<string, unknown>[] = [{
+      schema_version: "2",
+      job_id: jobId,
+      project_id: projectId,
+      task_id: taskId,
+      run_id: null,
+      target_id: "text_memory",
+      method_id: "text_memory_reflector",
+      requested_method_id: "text_memory_reflector",
+      resolver_input_artifact_ids: [],
+      previous_artifact_id: null,
+      config: {},
+      state: "failed",
+      artifact_ids: [],
+      error: "temporary failure",
+      attempts: [{
+        schema_version: "2",
+        attempt_id: `${jobId}-attempt-1`,
+        action_id: null,
+        job_id: jobId,
+        ordinal: 1,
+        state: "failed",
+        stage: "method_execution",
+        artifact_ids: [],
+        error_code: "method_execution_failed",
+        error_message: "temporary failure",
+        logs: ["Evolution attempt failed."],
+        created_at: "2026-08-23T00:00:00Z",
+        started_at: "2026-08-23T00:00:00Z",
+        completed_at: "2026-08-23T00:00:01Z",
+        updated_at: "2026-08-23T00:00:01Z",
+      }],
+      created_at: "2026-08-23T00:00:00Z",
+      updated_at: "2026-08-23T00:00:01Z",
+    }];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/state")) {
+        return jsonResponse({
+          schema_version: "1",
+          active_project_id: projectId,
+          projects: [{
+            project_id: projectId,
+            display_name: "Evolution Job v2",
+            config,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:00Z",
+          }],
+          sessions: [{
+            session_id: taskId,
+            project_id: projectId,
+            task_title: "Retry a method",
+            instruction: "Produce reusable context.",
+            response: "Captured evidence.",
+            model: "test",
+            state: "completed",
+            duration_ms: 1,
+            logs: [],
+            selected_evolution: [],
+            evolution_errors: [],
+            workspace_changes: [],
+            context_artifact_ids: [],
+            runtime_activation: null,
+            evolution_evidence_ready: true,
+            error: null,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:01Z",
+          }],
+          artifacts: [],
+          evolution_jobs: [{
+            job_id: "legacy-job-that-must-be-ignored",
+            session_id: taskId,
+            run_id: null,
+            target_id: "text_memory",
+            method_id: "text_memory_reflector",
+            requested_method_id: "text_memory_reflector",
+            resolver_input_artifact_ids: [],
+            previous_artifact_id: null,
+            config: {},
+            state: "failed",
+            artifact_ids: [],
+            error: "legacy",
+            attempts: [],
+            created_at: "2026-08-22T00:00:00Z",
+            updated_at: "2026-08-22T00:00:00Z",
+          }],
+          evolution_runs: [],
+          workspaces: [],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "1",
+          authority: "development_catalog_unverified",
+          capabilities: {
+            schema_version: "1",
+            core_version: "development",
+            registry_digest: "a".repeat(64),
+            evaluated_profile: {
+              execution_mode: "subscription",
+              capture_mode: "transcript",
+              harness_id: "codex",
+              harness_capabilities: [],
+              runtime_capabilities: [],
+            },
+            targets: [],
+          },
+        });
+      }
+      if (url.includes("/desktop/v2/development/evolution-jobs?") && init?.method === undefined) {
+        expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+        return jsonResponse({ schema_version: "2", items: jobs, next_cursor: null, has_more: false });
+      }
+      if (url.endsWith(`/desktop/v2/development/evolution-jobs/${jobId}/retry`)) {
+        const request = JSON.parse(String(init?.body)) as { action_id: string };
+        const current = jobs[0]!;
+        current.state = "running";
+        current.error = null;
+        current.attempts = [
+          ...(current.attempts as Record<string, unknown>[]),
+          {
+            schema_version: "2",
+            attempt_id: `${jobId}-attempt-2`,
+            action_id: request.action_id,
+            job_id: jobId,
+            ordinal: 2,
+            state: "running",
+            stage: "input_resolution",
+            artifact_ids: [],
+            error_code: null,
+            error_message: null,
+            logs: ["Retry admitted with the original fixed inputs."],
+            created_at: "2026-08-23T00:00:02Z",
+            started_at: "2026-08-23T00:00:02Z",
+            completed_at: null,
+            updated_at: "2026-08-23T00:00:02Z",
+          },
+        ];
+        return jsonResponse(current, 202);
+      }
+      throw new Error(`Unexpected Evolution Job v2 request: ${init?.method ?? "GET"} ${url}`);
+    });
+    const provider = createDevelopmentAgentProvider({
+      fetchImpl,
+      evolutionJobV2BaseUrl: "/desktop/v2/development/evolution-jobs",
+      desktopSessionToken: "session-secret",
+    });
+
+    let refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Evolution Job v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.tasks[taskId]?.evolutionJobs?.[0]).toMatchObject({
+      jobId,
+      state: "failed",
+      attempts: [{ ordinal: 1, errorCode: "method_execution_failed" }],
+    });
+
+    await provider.retryEvolutionJob?.(jobId, {
+      actionId: "retry-job-v2",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    });
+    refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Retried Evolution Job v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.tasks[taskId]?.evolutionJobs?.[0]).toMatchObject({
+      jobId,
+      state: "running",
+      attempts: [{ ordinal: 1 }, { ordinal: 2, state: "running" }],
+    });
+    expect(fetchImpl.mock.calls.some(([input]) => String(input).includes("/openevo-dev-agent/v1/evolution-jobs")))
+      .toBe(false);
+  });
 });
 
 function jsonResponse(body: object, status = 200): Response {

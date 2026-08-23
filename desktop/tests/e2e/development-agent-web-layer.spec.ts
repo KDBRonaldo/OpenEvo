@@ -6,6 +6,28 @@ const TASK_TITLE = `Browser acceptance ${RUN_ID}`;
 const RESULT_MARKER = `OPENEVO_BROWSER_E2E_OK_${RUN_ID}`;
 const PRODUCT_URL = process.env.OPENEVO_E2E_BASE_URL ?? "";
 
+function createPdfEvidence(text: string): Buffer {
+  const stream = `BT /F1 12 Tf 72 720 Td (${text.replace(/[()\\]/g, "\\$&")}) Tj ET`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    `<< /Length ${Buffer.byteLength(stream, "latin1")} >>\nstream\n${stream}\nendstream`,
+  ];
+  let document = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const [index, object] of objects.entries()) {
+    offsets.push(Buffer.byteLength(document, "latin1"));
+    document += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(document, "latin1");
+  document += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  document += offsets.slice(1).map((offset) => `${offset.toString().padStart(10, "0")} 00000 n \n`).join("");
+  document += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return Buffer.from(document, "latin1");
+}
+
 async function assertNoProductErrors(page: Page): Promise<void> {
   await expect(page.getByText("Refresh failed", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Action could not be completed", { exact: true })).toHaveCount(0);
@@ -71,21 +93,21 @@ test("real browser can create a project, run an agent session, and produce evolu
     await assertNoProductErrors(page);
   });
 
-  await test.step("upload and reload a real workspace file through daemon v2", async () => {
+  await test.step("upload and reload a real PDF through daemon v2", async () => {
     await page.getByLabel("Choose files to upload").setInputFiles({
-      name: "browser-v2-evidence.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from(`workspace-v2-${RUN_ID}\n`, "utf8"),
+      name: "browser-v2-evidence.pdf",
+      mimeType: "application/pdf",
+      buffer: createPdfEvidence(`workspace-v2-${RUN_ID}`),
     });
     await expect(
-      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.txt" }),
+      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.pdf" }),
     ).toBeVisible({ timeout: 120_000 });
     expect(observedRequests.some((request) => (
       request.startsWith("PUT /desktop/v2/development/projects/")
     ))).toBe(true);
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
     await expect(
-      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.txt" }),
+      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.pdf" }),
     ).toBeVisible({ timeout: 120_000 });
     await assertNoProductErrors(page);
   });
@@ -153,6 +175,9 @@ test("real browser can create a project, run an agent session, and produce evolu
       && request.endsWith("/apply")
     ))).toBe(true);
     expect(observedRequests).toContain("GET /desktop/v2/development/artifacts");
+    expect(observedRequests).toContain("GET /desktop/v2/development/evolution-jobs");
+    expect(observedRequests.some((request) => request.includes("/openevo-dev-agent/v1/evolution-jobs")))
+      .toBe(false);
     expect(observedRequests.some((request) => (
       request.startsWith("GET /desktop/v2/tasks/") && request.endsWith("/artifacts")
     ))).toBe(true);
