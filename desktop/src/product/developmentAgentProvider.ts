@@ -47,6 +47,27 @@ const workspaceSnapshotSchema = z.object({
   truncated: z.boolean(),
 }).strict();
 
+const workspaceEntryV2Schema = workspaceEntrySchema.extend({
+  schema_version: z.literal("2"),
+}).strict();
+
+const workspacePageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  project_id: z.string().min(1),
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  items: z.array(workspaceEntryV2Schema).max(100),
+  next_cursor: z.string().min(1).max(512).nullable(),
+  has_more: z.boolean(),
+  truncated: z.boolean(),
+}).strict();
+
+const workspaceMutationV2Schema = z.object({
+  schema_version: z.literal("2"),
+  project_id: z.string().min(1),
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  entry: workspaceEntryV2Schema,
+}).strict();
+
 const workspaceChangeSchema = z.object({
   path: z.string().min(1),
   change_type: z.enum(["created", "modified", "deleted"]),
@@ -184,6 +205,8 @@ const capabilityResponseSchema = z.object({
 export interface DevelopmentAgentProviderOptions {
   readonly baseUrl?: string;
   readonly fetchImpl?: typeof fetch;
+  readonly workspaceV2BaseUrl?: string;
+  readonly desktopSessionToken?: string;
 }
 
 /**
@@ -195,6 +218,78 @@ export function createDevelopmentAgentProvider(
 ): DesktopProductProviderV2 {
   const baseUrl = (options.baseUrl ?? "/openevo-dev-agent/v1").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
+  const workspaceV2BaseUrl = options.workspaceV2BaseUrl?.replace(/\/$/, "");
+
+  const digestHex = async (payload: ArrayBuffer): Promise<string> => Array.from(
+    new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
+    (value) => value.toString(16).padStart(2, "0"),
+  ).join("");
+
+  const workspaceV2Fetch = async (
+    projectId: string,
+    suffix: string,
+    init: RequestInit = {},
+    timeoutMs = 60_000,
+  ): Promise<Response> => {
+    if (workspaceV2BaseUrl === undefined) throw new Error("Workspace v2 is not configured.");
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const headers = new Headers(init.headers);
+      if (options.desktopSessionToken !== undefined) {
+        headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+      }
+      const response = await fetchImpl(
+        `${workspaceV2BaseUrl}/${encodeURIComponent(projectId)}/workspace${suffix}`,
+        {
+          ...init,
+          headers,
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return response;
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The workspace request timed out. Check the SSH development tunnel.");
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  };
+
+  const loadWorkspaceV2 = async (projectId: string) => {
+    const entries: z.infer<typeof workspaceEntrySchema>[] = [];
+    let cursor: string | null = null;
+    let manifest: string | null = null;
+    let truncated = false;
+    for (let pageNumber = 0; pageNumber < 10; pageNumber += 1) {
+      const parameters = new URLSearchParams({ limit: "100" });
+      if (cursor !== null) parameters.set("after", cursor);
+      if (manifest !== null) parameters.set("manifest_sha256", manifest);
+      const response = await workspaceV2Fetch(projectId, `?${parameters.toString()}`);
+      const page = workspacePageV2Schema.parse(await response.json());
+      if (page.project_id !== projectId || (manifest !== null && page.manifest_sha256 !== manifest)) {
+        throw new Error("The workspace authority changed across one refresh.");
+      }
+      manifest = page.manifest_sha256;
+      truncated = page.truncated;
+      entries.push(...page.items.map(({ schema_version: _schemaVersion, ...entry }) => entry));
+      if (!page.has_more) {
+        if (page.next_cursor !== null) throw new Error("Workspace v2 returned an invalid terminal cursor.");
+        return { project_id: projectId, entries, truncated };
+      }
+      if (page.next_cursor === null || page.next_cursor === cursor) {
+        throw new Error("Workspace v2 returned a non-advancing cursor.");
+      }
+      cursor = page.next_cursor;
+    }
+    throw new Error("Workspace v2 exceeded the bounded 1000-entry inventory.");
+  };
 
   const requestJson = async (
     path: string,
@@ -254,6 +349,9 @@ export function createDevelopmentAgentProvider(
         requestJson("/state").then((value) => stateSchema.parse(value)),
         requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
       ]);
+      const workspaces = workspaceV2BaseUrl === undefined
+        ? payload.workspaces
+        : await Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id)));
       return {
         activeProjectId: payload.active_project_id,
         projects: payload.projects.map((project) => ({
@@ -337,7 +435,7 @@ export function createDevelopmentAgentProvider(
           createdAt: run.created_at,
           updatedAt: run.updated_at,
         })),
-        workspaces: payload.workspaces.map(toWorkspaceSnapshot),
+        workspaces: workspaces.map(toWorkspaceSnapshot),
         capabilities: capabilityPayload.capabilities,
       };
     },
@@ -405,6 +503,31 @@ export function createDevelopmentAgentProvider(
       );
     },
     uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite) => {
+      if (workspaceV2BaseUrl !== undefined) {
+        const bytes = await data.arrayBuffer();
+        const contentSha256 = await digestHex(bytes);
+        const response = await workspaceV2Fetch(
+          projectId,
+          `/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
+          {
+            method: "PUT",
+            headers: {
+              "Content-Type": mediaType || "application/octet-stream",
+              "X-OpenEvo-Content-SHA256": contentSha256,
+            },
+            body: bytes,
+          },
+        );
+        const mutation = workspaceMutationV2Schema.parse(await response.json());
+        if (
+          mutation.project_id !== projectId
+          || mutation.entry.path !== path
+          || mutation.entry.content_sha256 !== contentSha256
+        ) {
+          throw new Error("Workspace v2 upload receipt did not match the submitted file.");
+        }
+        return;
+      }
       await requestJson(
         `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
         {
@@ -416,9 +539,30 @@ export function createDevelopmentAgentProvider(
       );
     },
     downloadWorkspaceFile: async (projectId, path) => {
-      const result = await requestBlob(
-        `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}`,
-      );
+      const result = workspaceV2BaseUrl === undefined
+        ? await requestBlob(
+          `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}`,
+        )
+        : await (async () => {
+          const response = await workspaceV2Fetch(
+            projectId,
+            `/files?path=${encodeURIComponent(path)}`,
+          );
+          const expectedDigest = response.headers.get("X-OpenEvo-Content-SHA256");
+          if (expectedDigest === null || !/^[0-9a-f]{64}$/.test(expectedDigest)) {
+            throw new Error("Workspace v2 download omitted its content digest.");
+          }
+          const bytes = await response.arrayBuffer();
+          if (await digestHex(bytes) !== expectedDigest) {
+            throw new Error("Workspace v2 download failed content verification.");
+          }
+          return {
+            data: new Blob([bytes], {
+              type: response.headers.get("Content-Type") ?? "application/octet-stream",
+            }),
+            mediaType: response.headers.get("Content-Type") ?? "application/octet-stream",
+          };
+        })();
       return {
         ...result,
         fileName: path.split("/").at(-1) ?? "download",

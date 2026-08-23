@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
 from urllib.parse import urlencode, urlparse
 import zipfile
@@ -888,6 +890,121 @@ def test_http_workspace_file_upload_and_download_round_trip(tmp_path: Path) -> N
     assert created["entry"]["path"] == "data/实验.csv"
     assert downloaded == payload
     assert content_type == "text/csv"
+
+
+def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    token = "v" * 32
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": "development-project-v2-files",
+        "display_name": "V2 files",
+        "config": {},
+    })
+    server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/v2/projects/development-project-v2-files/workspace"
+    payloads = {
+        "notes/a.txt": b"alpha\n",
+        "notes/b.txt": b"beta\n",
+    }
+    try:
+        for path, payload in payloads.items():
+            request = urllib.request.Request(
+                f"{base}/files?{urlencode({'path': path, 'overwrite': 'false'})}",
+                data=payload,
+                method="PUT",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "text/plain",
+                    "X-OpenEvo-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+                },
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                receipt = json.loads(response.read())
+            assert receipt["schema_version"] == "2"
+            assert receipt["entry"]["path"] == path
+            assert receipt["entry"]["content_sha256"] == hashlib.sha256(payload).hexdigest()
+
+        first_request = urllib.request.Request(
+            f"{base}?limit=1", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(first_request, timeout=5) as response:
+            first = json.loads(response.read())
+        assert first["has_more"] is True
+        assert first["next_cursor"] == first["items"][0]["path"]
+        second_query = urlencode({
+            "limit": "100",
+            "after": first["next_cursor"],
+            "manifest_sha256": first["manifest_sha256"],
+        })
+        second_request = urllib.request.Request(
+            f"{base}?{second_query}", headers={"Authorization": f"Bearer {token}"}
+        )
+        with urllib.request.urlopen(second_request, timeout=5) as response:
+            second = json.loads(response.read())
+        assert second["manifest_sha256"] == first["manifest_sha256"]
+        assert {entry["path"] for entry in first["items"] + second["items"]} == {
+            "notes", "notes/a.txt", "notes/b.txt"
+        }
+
+        download = urllib.request.Request(
+            f"{base}/files?{urlencode({'path': 'notes/a.txt'})}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(download, timeout=5) as response:
+            assert response.read() == payloads["notes/a.txt"]
+            assert response.headers["X-OpenEvo-Content-SHA256"] == hashlib.sha256(
+                payloads["notes/a.txt"]
+            ).hexdigest()
+
+        bad_upload = urllib.request.Request(
+            f"{base}/files?{urlencode({'path': 'bad.txt', 'overwrite': 'false'})}",
+            data=b"bad",
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-OpenEvo-Content-SHA256": "0" * 64,
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as bad_error:
+            urllib.request.urlopen(bad_upload, timeout=5)
+        assert bad_error.value.code == 400
+        assert not (store.workspace_path("development-project-v2-files") / "bad.txt").exists()
+
+        unsafe = urllib.request.Request(
+            f"{base}/files?{urlencode({'path': '../escape.txt'})}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with pytest.raises(urllib.error.HTTPError) as unsafe_error:
+            urllib.request.urlopen(unsafe, timeout=5)
+        assert unsafe_error.value.code == 400
+
+        delete = urllib.request.Request(
+            f"{base}/files?{urlencode({'path': 'notes/a.txt'})}",
+            method="DELETE",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(delete, timeout=5) as response:
+            deleted = json.loads(response.read())
+        assert deleted["deleted_path"] == "notes/a.txt"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    restored = MODULE.DevelopmentStateStore(database)
+    page = restored.workspace_page_v2(
+        "development-project-v2-files",
+        after_path=None,
+        expected_manifest_sha256=None,
+        limit=100,
+    )
+    assert [entry.path for entry in page.items] == ["notes", "notes/b.txt"]
+    assert page.items[1].content_sha256 == hashlib.sha256(payloads["notes/b.txt"]).hexdigest()
 
 
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:

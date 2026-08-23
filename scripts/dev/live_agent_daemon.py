@@ -20,6 +20,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -54,12 +55,18 @@ try:  # package import in tests; direct import when launched as a script
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
+        DevelopmentWorkspaceDeleteV2,
+        DevelopmentWorkspaceMutationV2,
+        DevelopmentWorkspacePageV2,
     )
 except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
+        DevelopmentWorkspaceDeleteV2,
+        DevelopmentWorkspaceMutationV2,
+        DevelopmentWorkspacePageV2,
     )
 
 
@@ -115,8 +122,15 @@ DAEMON_V2_TASKS_PATH = "/v2/tasks"
 DAEMON_V2_TASK_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)$")
 DAEMON_V2_TASK_LOGS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/logs$")
 DAEMON_V2_TASK_TIMELINE_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/timeline$")
+DAEMON_V2_WORKSPACE_PATH_PATTERN = re.compile(
+    r"^/v2/projects/([^/]+)/workspace$"
+)
+DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN = re.compile(
+    r"^/v2/projects/([^/]+)/workspace/files$"
+)
 MAX_DAEMON_V2_LOG_PAGE = 100
 MAX_DAEMON_V2_TASK_PAGE = 100
+MAX_DAEMON_V2_WORKSPACE_PAGE = 100
 MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
@@ -433,6 +447,86 @@ class ProjectWorkspaceStore:
             "entries": entries,
             "truncated": truncated,
         }
+
+    def authoritative_snapshot_v2(self, project_id: str) -> dict[str, Any]:
+        """Return a digest-complete snapshot for the development daemon v2 boundary."""
+
+        snapshot = self.snapshot(project_id)
+        project_root = self.project_path(project_id)
+        entries: list[dict[str, Any]] = []
+        for raw in snapshot["entries"]:
+            entry = dict(raw)
+            if entry["kind"] == "file":
+                original_digest = entry["content_sha256"]
+                digest, modified_at = self._file_sha256_v2(
+                    project_root,
+                    entry["path"],
+                    expected_size=entry["byte_size"],
+                )
+                if original_digest is not None and original_digest != digest:
+                    raise RequestError("workspace file changed while it was inventoried")
+                entry["content_sha256"] = digest
+                entry["modified_at"] = modified_at
+            entries.append(entry)
+        authority = {
+            "project_id": project_id,
+            "entries": entries,
+            "truncated": snapshot["truncated"],
+        }
+        return {
+            **authority,
+            "manifest_sha256": hashlib.sha256(
+                canonical_json(authority).encode("utf-8")
+            ).hexdigest(),
+        }
+
+    @classmethod
+    def _file_sha256_v2(
+        cls,
+        project_root: Path,
+        relative_path: str,
+        *,
+        expected_size: int,
+    ) -> tuple[str, str]:
+        path = cls._workspace_path(project_root, relative_path, actor="inventory")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise RequestError("workspace file changed while it was inventoried") from exc
+        digest = hashlib.sha256()
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size != expected_size
+            ):
+                raise RequestError("workspace inventory only accepts single-link regular files")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            after = os.fstat(descriptor)
+            try:
+                bound = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RequestError("workspace file changed while it was inventoried") from exc
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or after.st_dev != bound.st_dev
+                or after.st_ino != bound.st_ino
+                or not stat.S_ISREG(bound.st_mode)
+            ):
+                raise RequestError("workspace file changed while it was inventoried")
+        finally:
+            os.close(descriptor)
+        modified_at = datetime.fromtimestamp(
+            after.st_mtime, timezone.utc
+        ).isoformat().replace("+00:00", "Z")
+        return digest.hexdigest(), modified_at
 
     @staticmethod
     def _extract_pdf_text(path: Path, byte_limit: int) -> str | None:
@@ -836,21 +930,69 @@ class ProjectWorkspaceStore:
             raise KeyError(relative_path) from exc
         if resolved_parent != project_root and project_root not in resolved_parent.parents:
             raise RequestError("download path escaped the managed project workspace")
-        if path.is_symlink() or not path.is_file():
-            raise KeyError(relative_path)
-        size = path.stat().st_size
-        if size > MAX_WORKSPACE_DOWNLOAD_FILE_BYTES:
-            raise RequestError(
-                f"workspace file exceeds the {MAX_WORKSPACE_DOWNLOAD_FILE_BYTES // (1024 * 1024)} MiB download limit"
-            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            payload = path.read_bytes()
+            descriptor = os.open(path, flags)
         except OSError as exc:
-            raise RequestError(f"could not read the workspace file: {exc}") from exc
-        if len(payload) != size or path.is_symlink() or not path.is_file():
-            raise RequestError("workspace file changed while it was being read")
+            raise KeyError(relative_path) from exc
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise RequestError("workspace downloads require a single-link regular file")
+            if before.st_size > MAX_WORKSPACE_DOWNLOAD_FILE_BYTES:
+                raise RequestError(
+                    f"workspace file exceeds the {MAX_WORKSPACE_DOWNLOAD_FILE_BYTES // (1024 * 1024)} MiB download limit"
+                )
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                payload = stream.read(MAX_WORKSPACE_DOWNLOAD_FILE_BYTES + 1)
+            after = os.fstat(descriptor)
+            try:
+                bound = path.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise RequestError("workspace file changed while it was being read") from exc
+            if (
+                len(payload) != before.st_size
+                or len(payload) > MAX_WORKSPACE_DOWNLOAD_FILE_BYTES
+                or before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or after.st_dev != bound.st_dev
+                or after.st_ino != bound.st_ino
+                or not stat.S_ISREG(bound.st_mode)
+            ):
+                raise RequestError("workspace file changed while it was being read")
+        finally:
+            os.close(descriptor)
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return payload, media_type, path.name
+
+    def delete_file(self, project_id: str, relative_path: object) -> str:
+        """Delete one regular file without following links or removing directories."""
+
+        project_root = self.project_path(project_id)
+        path = self._workspace_path(project_root, relative_path, actor="delete")
+        try:
+            resolved_parent = path.parent.resolve(strict=True)
+        except OSError as exc:
+            raise KeyError(relative_path) from exc
+        if resolved_parent != project_root and project_root not in resolved_parent.parents:
+            raise RequestError("delete path escaped the managed project workspace")
+        if path.is_symlink() or not path.is_file():
+            raise KeyError(relative_path)
+        identity = path.relative_to(project_root).as_posix()
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise RequestError(f"could not delete the workspace file: {exc}") from exc
+        parent = path.parent
+        while parent != project_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return identity
 
     @staticmethod
     def _workspace_size(project_root: Path) -> int:
@@ -1685,6 +1827,69 @@ class DevelopmentStateStore:
         self.workspace_path(project_id)
         return self.workspaces.snapshot(project_id)
 
+    def workspace_page_v2(
+        self,
+        project_id: str,
+        *,
+        after_path: str | None,
+        expected_manifest_sha256: str | None,
+        limit: int,
+    ) -> DevelopmentWorkspacePageV2:
+        self.workspace_path(project_id)
+        authority = self.workspaces.authoritative_snapshot_v2(project_id)
+        manifest_sha256 = authority["manifest_sha256"]
+        if (
+            expected_manifest_sha256 is not None
+            and expected_manifest_sha256 != manifest_sha256
+        ):
+            raise StateConflictError("workspace changed while its inventory was paged")
+        entries = authority["entries"]
+        start = 0
+        if after_path is not None:
+            positions = [
+                index for index, entry in enumerate(entries)
+                if entry["path"] == after_path
+            ]
+            if len(positions) != 1:
+                raise RequestError("workspace cursor is not part of this inventory")
+            start = positions[0] + 1
+        selected = entries[start:start + limit]
+        has_more = start + len(selected) < len(entries)
+        return DevelopmentWorkspacePageV2.model_validate({
+            "schema_version": "2",
+            "project_id": project_id,
+            "manifest_sha256": manifest_sha256,
+            "items": [
+                {"schema_version": "2", **entry}
+                for entry in selected
+            ],
+            "next_cursor": selected[-1]["path"] if selected and has_more else None,
+            "has_more": has_more,
+            "truncated": authority["truncated"],
+        })
+
+    def workspace_mutation_v2(
+        self,
+        project_id: str,
+        relative_path: str,
+    ) -> DevelopmentWorkspaceMutationV2:
+        authority = self.workspaces.authoritative_snapshot_v2(project_id)
+        entry = next(
+            (
+                candidate for candidate in authority["entries"]
+                if candidate["kind"] == "file" and candidate["path"] == relative_path
+            ),
+            None,
+        )
+        if entry is None:
+            raise KeyError(relative_path)
+        return DevelopmentWorkspaceMutationV2.model_validate({
+            "schema_version": "2",
+            "project_id": project_id,
+            "manifest_sha256": authority["manifest_sha256"],
+            "entry": {"schema_version": "2", **entry},
+        })
+
     def apply_workspace_mutations(self, project_id: str, mutations: object) -> None:
         self.workspace_path(project_id)
         self.workspaces.apply_mutations(project_id, mutations)
@@ -1715,6 +1920,25 @@ class DevelopmentStateStore:
     ) -> tuple[bytes, str, str]:
         self.workspace_path(project_id)
         return self.workspaces.read_file(project_id, relative_path)
+
+    def delete_workspace_file(self, project_id: str, relative_path: object) -> str:
+        self.workspace_path(project_id)
+        deleted_path = self.workspaces.delete_file(project_id, relative_path)
+        self._emit_project_event(project_id)
+        return deleted_path
+
+    def workspace_delete_v2(
+        self,
+        project_id: str,
+        deleted_path: str,
+    ) -> DevelopmentWorkspaceDeleteV2:
+        authority = self.workspaces.authoritative_snapshot_v2(project_id)
+        return DevelopmentWorkspaceDeleteV2.model_validate({
+            "schema_version": "2",
+            "project_id": project_id,
+            "manifest_sha256": authority["manifest_sha256"],
+            "deleted_path": deleted_path,
+        })
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -4251,6 +4475,51 @@ class DevelopmentSessionCoordinator:
         finally:
             self._turn_lock.release()
 
+    def upload_workspace_file_v2(
+        self,
+        project_id: str,
+        relative_path: object,
+        payload: bytes,
+        *,
+        overwrite: bool,
+    ) -> DevelopmentWorkspaceMutationV2:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "workspace uploads are unavailable while a Session or Evolution retry is running"
+            )
+        try:
+            entry = self._store.upload_workspace_file(
+                project_id, relative_path, payload, overwrite=overwrite
+            )
+            return self._store.workspace_mutation_v2(project_id, entry["path"])
+        finally:
+            self._turn_lock.release()
+
+    def delete_workspace_file(self, project_id: str, relative_path: object) -> str:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "workspace deletes are unavailable while a Session or Evolution retry is running"
+            )
+        try:
+            return self._store.delete_workspace_file(project_id, relative_path)
+        finally:
+            self._turn_lock.release()
+
+    def delete_workspace_file_v2(
+        self,
+        project_id: str,
+        relative_path: object,
+    ) -> DevelopmentWorkspaceDeleteV2:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "workspace deletes are unavailable while a Session or Evolution retry is running"
+            )
+        try:
+            deleted_path = self._store.delete_workspace_file(project_id, relative_path)
+            return self._store.workspace_delete_v2(project_id, deleted_path)
+        finally:
+            self._turn_lock.release()
+
     def upload_workspace_file(
         self,
         project_id: str,
@@ -4579,6 +4848,80 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, task.model_dump(mode="json"))
             return
+        workspace_page_match = DAEMON_V2_WORKSPACE_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if workspace_page_match:
+            project_id = workspace_page_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"after", "limit", "manifest_sha256"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError("workspace query contains unsupported parameters")
+                after_path = parameters.get("after", [None])[0]
+                if after_path == "":
+                    raise RequestError("workspace cursor cannot be empty")
+                manifest_sha256 = parameters.get("manifest_sha256", [None])[0]
+                if manifest_sha256 is not None and not re.fullmatch(
+                    r"[0-9a-f]{64}", manifest_sha256
+                ):
+                    raise RequestError("workspace manifest digest is invalid")
+                limit_raw = parameters.get(
+                    "limit", [str(MAX_DAEMON_V2_WORKSPACE_PAGE)]
+                )[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("workspace limit must be an integer")
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_WORKSPACE_PAGE:
+                    raise RequestError("workspace limit is outside the supported bound")
+                page = self.server.store.workspace_page_v2(
+                    project_id,
+                    after_path=after_path,
+                    expected_manifest_sha256=manifest_sha256,
+                    limit=limit,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        workspace_file_v2_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if workspace_file_v2_match:
+            project_id = workspace_file_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                relative_path, _ = self._workspace_query(
+                    parsed_path.query, allow_overwrite=False
+                )
+                payload, media_type, file_name = self.server.store.download_workspace_file(
+                    project_id, relative_path
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "workspace file not found"
+                )
+            else:
+                self._binary(
+                    payload,
+                    media_type,
+                    file_name,
+                    content_sha256=hashlib.sha256(payload).hexdigest(),
+                )
+            return
         workspace_match = WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
         if workspace_match:
             project_id = workspace_match.group(1)
@@ -4790,6 +5133,37 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed_path = urlsplit(self.path)
+        workspace_v2_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if workspace_v2_match:
+            project_id = workspace_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                relative_path, overwrite = self._workspace_query(
+                    parsed_path.query, allow_overwrite=True
+                )
+                expected_digest = self.headers.get("X-OpenEvo-Content-SHA256", "")
+                if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                    raise RequestError("X-OpenEvo-Content-SHA256 is required")
+                payload = self._read_bytes(MAX_WORKSPACE_UPLOAD_FILE_BYTES)
+                if not hmac.compare_digest(
+                    hashlib.sha256(payload).hexdigest(), expected_digest
+                ):
+                    raise RequestError("uploaded workspace file digest does not match")
+                mutation = self.server.sessions.upload_workspace_file_v2(
+                    project_id, relative_path, payload, overwrite=overwrite
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.CREATED, mutation.model_dump(mode="json"))
+            return
         workspace_match = WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
         if workspace_match:
             project_id = workspace_match.group(1)
@@ -4838,6 +5212,37 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
         else:
             self._json(HTTPStatus.OK, {"schema_version": "1", **project})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        if not self._authorized():
+            return
+        parsed_path = urlsplit(self.path)
+        workspace_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if not workspace_match:
+            self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
+            return
+        project_id = workspace_match.group(1)
+        try:
+            if not ID_PATTERN.fullmatch(project_id):
+                raise RequestError("project_id is invalid")
+            relative_path, _ = self._workspace_query(
+                parsed_path.query, allow_overwrite=False
+            )
+            result = self.server.sessions.delete_workspace_file_v2(
+                project_id, relative_path
+            )
+        except RequestError as exc:
+            self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+        except KeyError:
+            self._json_error_v2(
+                HTTPStatus.NOT_FOUND, "not_found", "workspace file not found"
+            )
+        except StateConflictError as exc:
+            self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+        else:
+            self._json(HTTPStatus.OK, result.model_dump(mode="json"))
 
     def _run_session(self) -> None:
         try:
@@ -4943,7 +5348,14 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _binary(self, payload: bytes, media_type: str, file_name: str) -> None:
+    def _binary(
+        self,
+        payload: bytes,
+        media_type: str,
+        file_name: str,
+        *,
+        content_sha256: str | None = None,
+    ) -> None:
         self.send_response(HTTPStatus.OK.value)
         self.send_header("Content-Type", media_type)
         self.send_header("Content-Length", str(len(payload)))
@@ -4953,6 +5365,8 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         )
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if content_sha256 is not None:
+            self.send_header("X-OpenEvo-Content-SHA256", content_sha256)
         self.end_headers()
         self.wfile.write(payload)
 

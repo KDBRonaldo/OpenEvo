@@ -71,6 +71,25 @@ test("real browser can create a project, run an agent session, and produce evolu
     await assertNoProductErrors(page);
   });
 
+  await test.step("upload and reload a real workspace file through daemon v2", async () => {
+    await page.getByLabel("Choose files to upload").setInputFiles({
+      name: "browser-v2-evidence.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from(`workspace-v2-${RUN_ID}\n`, "utf8"),
+    });
+    await expect(
+      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.txt" }),
+    ).toBeVisible({ timeout: 120_000 });
+    expect(observedRequests.some((request) => (
+      request.startsWith("PUT /desktop/v2/development/projects/")
+    ))).toBe(true);
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+    await expect(
+      page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.txt" }),
+    ).toBeVisible({ timeout: 120_000 });
+    await assertNoProductErrors(page);
+  });
+
   await test.step("start the real remote agent session", async () => {
     await expect(page.getByText("Run separately", { exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Start session" }).click();

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 import sys
 import json
@@ -38,6 +39,7 @@ class FakeDaemonClient:
         }
         self.events: list[dict[str, object]] = []
         self.expire_next_event_cursor = False
+        self.workspace_files: dict[str, bytes] = {}
 
     def emit_event(self, project_id: str) -> None:
         sequence = len(self.events) + 1
@@ -185,6 +187,85 @@ class FakeDaemonClient:
                 "has_more": has_more,
             }
         raise AssertionError(path)
+
+    def proxy_v2(
+        self,
+        path: str,
+        *,
+        query: str,
+        method: str,
+        body: bytes,
+        content_type: str | None,
+        content_sha256: str | None = None,
+    ) -> tuple[int, bytes, dict[str, str]]:
+        del content_type
+        parameters = parse_qs(query)
+        if path.endswith("/workspace") and method == "GET":
+            entries = [
+                {
+                    "schema_version": "2",
+                    "path": name,
+                    "kind": "file",
+                    "byte_size": len(payload),
+                    "content_sha256": hashlib.sha256(payload).hexdigest(),
+                    "media_type": "text/plain",
+                    "content": payload.decode(),
+                    "modified_at": "2026-08-23T00:00:00Z",
+                }
+                for name, payload in sorted(self.workspace_files.items())
+            ]
+            authority = hashlib.sha256(
+                json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            payload = {
+                "schema_version": "2",
+                "project_id": path.split("/")[1],
+                "manifest_sha256": authority,
+                "items": entries,
+                "next_cursor": None,
+                "has_more": False,
+                "truncated": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        if path.endswith("/workspace/files"):
+            relative_path = parameters["path"][0]
+            project_id = path.split("/")[1]
+            if method == "PUT":
+                assert content_sha256 == hashlib.sha256(body).hexdigest()
+                self.workspace_files[relative_path] = body
+                entry = {
+                    "schema_version": "2",
+                    "path": relative_path,
+                    "kind": "file",
+                    "byte_size": len(body),
+                    "content_sha256": content_sha256,
+                    "media_type": "text/plain",
+                    "content": body.decode(),
+                    "modified_at": "2026-08-23T00:00:00Z",
+                }
+                result = {
+                    "schema_version": "2",
+                    "project_id": project_id,
+                    "manifest_sha256": "a" * 64,
+                    "entry": entry,
+                }
+                return 201, json.dumps(result).encode(), {"Content-Type": "application/json"}
+            if method == "GET":
+                payload = self.workspace_files[relative_path]
+                return 200, payload, {
+                    "Content-Type": "text/plain",
+                    "X-OpenEvo-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+                }
+            if method == "DELETE":
+                del self.workspace_files[relative_path]
+                result = {
+                    "schema_version": "2",
+                    "project_id": project_id,
+                    "manifest_sha256": "b" * 64,
+                    "deleted_path": relative_path,
+                }
+                return 200, json.dumps(result).encode(), {"Content-Type": "application/json"}
+        raise AssertionError((method, path, query))
 
 
 def _config() -> dict[str, object]:
@@ -403,6 +484,71 @@ def test_http_layer_requires_exact_session_and_projects_empty_state() -> None:
             "action": "none",
             "affected_resource_id": None,
         }
+
+
+def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> None:
+    import scripts.dev.development_agent_web_layer as web
+
+    fake = FakeDaemonClient()
+    fake.state.update({
+        "active_project_id": "project-workspace-v2",
+        "projects": [{
+            "project_id": "project-workspace-v2",
+            "display_name": "Workspace v2",
+            "config": _config(),
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+    })
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    root = "/desktop/v2/development/projects/project-workspace-v2/workspace"
+    with TestClient(app) as client:
+        assert client.get(root).status_code == 401
+        initial = client.get(f"{root}?limit=100", headers=headers)
+        assert initial.status_code == 200
+        assert initial.json()["items"] == []
+
+        created = client.put(
+            f"{root}/files?path=notes%2Fanswer.txt&overwrite=false",
+            headers={**headers, "Content-Type": "text/plain"},
+            content=b"OpenEvo v2\n",
+        )
+        assert created.status_code == 201
+        assert created.json()["entry"]["content_sha256"] == hashlib.sha256(
+            b"OpenEvo v2\n"
+        ).hexdigest()
+
+        inventory = client.get(f"{root}?limit=100", headers=headers)
+        assert [entry["path"] for entry in inventory.json()["items"]] == [
+            "notes/answer.txt"
+        ]
+        downloaded = client.get(
+            f"{root}/files?path=notes%2Fanswer.txt", headers=headers
+        )
+        assert downloaded.content == b"OpenEvo v2\n"
+        assert downloaded.headers["X-OpenEvo-Content-SHA256"] == hashlib.sha256(
+            downloaded.content
+        ).hexdigest()
+
+        deleted = client.delete(
+            f"{root}/files?path=notes%2Fanswer.txt", headers=headers
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["deleted_path"] == "notes/answer.txt"
 
 
 def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:

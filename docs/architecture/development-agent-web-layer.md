@@ -6,12 +6,11 @@ weaken the release Desktop/Core v2 contract.
 ## Data flow
 
 ```text
-React renderer
-  -> complete development product provider
-  -> Vite same-origin proxy (/openevo-dev-agent/v1/*)
-  -> local development web layer
-  -> authenticated loopback SSH tunnel
-  -> scripts/dev/live_agent_daemon.py (/openevo-dev-agent/v1/*)
+React renderer (unchanged product UI)
+  -> Desktop session-authenticated /desktop/v2/*
+  -> remote loopback development Web Layer
+  -> bearer-authenticated daemon /v2/*
+  -> scripts/dev/live_agent_daemon.py
   -> Codex and the remote machine workspace
 ```
 
@@ -24,9 +23,12 @@ authority and mutations now use this provider. Task status, timeline, persistent
 terminal agent responses are read from the daemon's bounded `/v2/tasks*` observation routes;
 the renderer consumes them through the existing Desktop v2 Task contracts. The daemon assigns
 monotonic per-Task sequences and persists the journals in SQLite, so pagination, refresh, and
-daemon restart do not reconstruct or renumber earlier entries. Workspace/artifact presentation
-and standalone Evolution run actions remain on the compatibility surface until their own
-route-by-route replacement preserves the full development acceptance path.
+daemon restart do not reconstruct or renumber earlier entries. Workspace inventory and binary
+file transfer now use the development-only `/desktop/v2/development/projects/{id}/workspace*`
+bridge to daemon `/v2/projects/{id}/workspace*`. Inventories are bounded and manifest-pinned;
+uploads and downloads are SHA-256 verified. Artifact presentation and standalone Evolution run
+actions remain on the compatibility surface until their own route-by-route replacement preserves
+the full development acceptance path.
 
 ## Start command
 
@@ -63,9 +65,10 @@ afterward. It therefore behaves the same from WSL/Linux and Windows and does not
 Edge installation. `OPENEVO_E2E_BROWSER_CHANNEL` remains available for an explicit browser override.
 
 This Playwright test does not mock `fetch`, the Web Layer, SSH, the daemon, the agent, or evolution.
-It opens the real Vite page, creates a uniquely named remote project, enables text-memory evolution,
-starts a Session, waits for the remote agent and evolution worker, refreshes task logs, and saves a
-success screenshot. A failed run retains its browser trace and screenshot under
+It opens the real product page, creates a uniquely named remote project, uploads and reloads a
+workspace file through daemon v2, starts a Session, waits for the remote agent and evolution worker,
+refreshes task logs, applies a text-memory candidate, and saves a success screenshot. A failed run
+retains its browser trace and screenshot under
 `desktop/test-results/`. Because project deletion is not currently part of the development daemon
 contract, each full test leaves its timestamped acceptance project in remote development state.
 

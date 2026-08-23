@@ -2,6 +2,7 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
+import { configDefaults } from "vitest/config";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
@@ -105,6 +106,11 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: "dist",
       emptyOutDir: true,
+    },
+    test: {
+      // Playwright owns the real-browser suite; Vitest must not try to execute
+      // Playwright's test() declarations as unit tests.
+      exclude: [...configDefaults.exclude, "tests/e2e/**"],
     },
   };
 });

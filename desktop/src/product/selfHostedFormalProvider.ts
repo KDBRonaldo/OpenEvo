@@ -58,8 +58,9 @@ const browserNativeBridge: LocalApiNativeBridgeV2 = {
  * Build the first formal walking-skeleton provider.
  *
  * Project/Task authority and mutations use the strict Desktop v2 provider.  The readable
- * transcript/workspace projections and standalone Evolution actions stay on the proven
- * development provider until those product contracts exist in Desktop v2.  This keeps the
+ * transcript projections and standalone Evolution actions stay on the proven development
+ * provider until those product contracts exist in Desktop v2. Workspace inventory and file
+ * transfer use the authenticated development-only Desktop v2 bridge. This keeps the
  * browser product usable while making the migration boundary explicit and testable.
  */
 export async function createSelfHostedFormalProvider(
@@ -81,7 +82,10 @@ export async function createSelfHostedFormalProvider(
     providerStreamInstance: version.build_id,
     fetch: globalThis.fetch.bind(globalThis),
   });
-  const presentation = createDevelopmentAgentProvider();
+  const presentation = createDevelopmentAgentProvider({
+    workspaceV2BaseUrl: "/desktop/v2/development/projects",
+    desktopSessionToken: bootstrap.session_token,
+  });
   return combineSelfHostedProviders(formal, presentation);
 }
 

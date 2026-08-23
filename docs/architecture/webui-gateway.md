@@ -21,7 +21,8 @@ OpenEvo development Web Layer (remote loopback service)
   |- bundled copy of the existing Desktop renderer
   |- existing browser bootstrap -> Desktop session
   |- /desktop/v2/events -> authenticated SSE projection and browser cursor replay
-  `- /openevo-dev-agent/v1 compatibility proxy and daemon credential isolation
+  |- /desktop/v2/development/projects/{id}/workspace* -> daemon /v2 workspace API
+  `- remaining /openevo-dev-agent/v1 compatibility and daemon credential isolation
   |
   v
 development agent daemon
@@ -36,9 +37,11 @@ use the same `/v2/*` routes with the Daemon bearer.
 The first migration step deliberately leaves the formal release Daemon composition unchanged.
 `dev:agent:webui:remote` starts the Web Layer beside the development daemon and opens one SSH
 tunnel to it. The first walking skeleton now uses the strict `/desktop/v2` provider for Project
-and Task authority and mutations. Readable transcript/workspace presentation and standalone
-Evolution actions remain explicit development-bridge calls until their typed product contracts
-exist. Promotion to the release Daemon remains gated on removing that remaining compatibility
+and Task authority and mutations. Workspace inventory/upload/download now cross an authenticated,
+typed development-only Desktop v2 route and a daemon-owned `/v2` route; the old v1 workspace
+payload is ignored by the self-hosted provider. Readable transcript presentation and standalone
+Evolution actions remain explicit compatibility calls until their typed product contracts exist.
+Promotion to the release Daemon remains gated on removing that remaining compatibility
 surface and completing the full browser acceptance path.
 
 The repeatable acceptance entry point is:
@@ -102,18 +105,25 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `/desktop/v2/*`: primary Project/Task control plane used by the unchanged renderer through a
   formal provider adapter. `/desktop/v2/events` reports daemon snapshot changes, accepts the
   renderer's `Last-Event-ID`, and wakes the renderer to reload authoritative state.
+- `/desktop/v2/development/projects/{project_id}/workspace*`: development-only, Desktop-session
+  authenticated Workspace inventory and file transfer. The Web Layer validates closed v2 models,
+  enforces the upload bound, computes upload digests, and forwards to the daemon without exposing
+  its bearer. The renderer verifies download digests before constructing a browser `Blob`.
 - `/openevo-dev-agent/v1/events`: authenticated development-daemon long poll used only by the
   Web Layer. An omitted cursor establishes the current daemon sequence; `after=<sequence>` returns
   contiguous committed events and `410 event_cursor_expired` forces snapshot resynchronization.
-- `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/workspace/artifact
-  compatibility surface; it no longer owns Project or Task browser mutations or the terminal
-  Session response.
+- `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/artifact/transcript
+  compatibility surface; it no longer owns Project, Task, Workspace browser mutations, Workspace
+  reads, or the terminal Session response.
 - Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, `/v2/tasks/{task_id}/timeline`, and
   `/v2/tasks/{task_id}/logs`: bounded, bearer-authenticated Task status, durable timeline,
   and persistent log/result observations consumed only by the Web Layer. Timeline and log
   cursors are stable monotonic per-Task sequences retained across daemon restarts.
   The browser never receives the daemon bearer token and continues to call only
   `/desktop/v2/*` for this data.
+- Remote daemon `/v2/projects/{project_id}/workspace` and `/workspace/files`: bounded stable
+  pagination, manifest drift detection, safe relative paths, digest-verified PUT/GET, and durable
+  DELETE over daemon-owned project workspaces. Workspace bytes survive daemon/Web Layer restarts.
 
 ## Deliberate boundaries
 

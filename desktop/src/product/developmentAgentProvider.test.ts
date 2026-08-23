@@ -392,6 +392,114 @@ describe("development agent provider", () => {
       { speaker: "agent", text: "Two plus two is four." },
     ]);
   });
+
+  it("uses authenticated daemon v2 workspace inventory and verified file transfer", async () => {
+    const projectId = "project-workspace-v2";
+    const workspaceConfig: ScienceProjectConfigV2 = {
+      ...config,
+      evolution: { targets: {} },
+    };
+    const sha256 = async (bytes: ArrayBuffer) => Array.from(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+      (value) => value.toString(16).padStart(2, "0"),
+    ).join("");
+    const downloadedBytes = new TextEncoder().encode("verified download\n");
+    const downloadedDigest = await sha256(downloadedBytes.buffer);
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/state")) {
+        return jsonResponse({
+          schema_version: "1",
+          active_project_id: projectId,
+          projects: [{
+            project_id: projectId,
+            display_name: "Workspace v2",
+            config: workspaceConfig,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:00Z",
+          }],
+          sessions: [], artifacts: [], evolution_jobs: [], evolution_runs: [],
+          workspaces: [{ project_id: projectId, entries: [], truncated: false }],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "1",
+          authority: "development_catalog_unverified",
+          capabilities: {
+            schema_version: "1",
+            core_version: "development",
+            registry_digest: "a".repeat(64),
+            evaluated_profile: {
+              execution_mode: "subscription", capture_mode: "transcript", harness_id: "codex",
+              harness_capabilities: [], runtime_capabilities: [],
+            },
+            targets: [],
+          },
+        });
+      }
+      if (url.includes(`/desktop/v2/development/projects/${projectId}/workspace?`)) {
+        expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+        return jsonResponse({
+          schema_version: "2",
+          project_id: projectId,
+          manifest_sha256: "b".repeat(64),
+          items: [{
+            schema_version: "2",
+            path: "existing.txt",
+            kind: "file",
+            byte_size: 9,
+            content_sha256: "c".repeat(64),
+            media_type: "text/plain",
+            content: "existing\n",
+            modified_at: "2026-08-23T00:00:00Z",
+          }],
+          next_cursor: null,
+          has_more: false,
+          truncated: false,
+        });
+      }
+      if (url.includes("/workspace/files?") && init?.method === "PUT") {
+        const bytes = init.body as ArrayBuffer;
+        const digest = await sha256(bytes);
+        expect(new Headers(init.headers).get("X-OpenEvo-Content-SHA256")).toBe(digest);
+        return jsonResponse({
+          schema_version: "2", project_id: projectId, manifest_sha256: "d".repeat(64),
+          entry: {
+            schema_version: "2", path: "upload.txt", kind: "file",
+            byte_size: bytes.byteLength, content_sha256: digest, media_type: "text/plain",
+            content: "upload\n", modified_at: "2026-08-23T00:00:01Z",
+          },
+        }, 201);
+      }
+      if (url.includes("/workspace/files?") && init?.method === undefined) {
+        return new Response(downloadedBytes, {
+          headers: {
+            "Content-Type": "text/plain",
+            "X-OpenEvo-Content-SHA256": downloadedDigest,
+          },
+        });
+      }
+      throw new Error(`Unexpected workspace v2 request: ${init?.method ?? "GET"} ${url}`);
+    });
+    const provider = createDevelopmentAgentProvider({
+      fetchImpl,
+      workspaceV2BaseUrl: "/desktop/v2/development/projects",
+      desktopSessionToken: "session-secret",
+    });
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("workspace v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.workspaces?.[projectId]?.entries[0]?.path)
+      .toBe("existing.txt");
+    await provider.uploadWorkspaceFile?.(
+      projectId,
+      { path: "upload.txt", data: new Blob(["upload\n"]), mediaType: "text/plain", overwrite: false },
+      { actionId: "upload-v2", streamEpoch: refreshed.snapshot.stream.epoch },
+    );
+    const downloaded = await provider.downloadWorkspaceFile?.(projectId, "download.txt");
+    expect(await downloaded?.data.text()).toBe("verified download\n");
+  });
 });
 
 function jsonResponse(body: object, status = 200): Response {

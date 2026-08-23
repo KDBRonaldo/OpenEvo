@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from http import HTTPStatus
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import quote
@@ -47,12 +48,18 @@ try:  # package import in tests; direct import when launched as a script
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
+        DevelopmentWorkspaceDeleteV2,
+        DevelopmentWorkspaceMutationV2,
+        DevelopmentWorkspacePageV2,
     )
 except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
+        DevelopmentWorkspaceDeleteV2,
+        DevelopmentWorkspaceMutationV2,
+        DevelopmentWorkspacePageV2,
     )
 
 
@@ -70,6 +77,7 @@ DIGEST = "a" * 64
 MAX_DEVELOPMENT_DAEMON_STATE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_DEVELOPMENT_WORKSPACE_UPLOAD_BYTES = 32 * 1024 * 1024
 STATE_CACHE_SECONDS = 1.0
 DAEMON_EVENT_WAIT_MILLISECONDS = 5_000
 LOGGER = logging.getLogger("openevo.development_agent_web_layer")
@@ -138,15 +146,57 @@ class DevelopmentDaemonClient:
         body: bytes,
         content_type: str | None,
     ) -> tuple[int, bytes, Mapping[str, str]]:
+        return self._proxy_at(
+            self._endpoint,
+            path,
+            query=query,
+            method=method,
+            body=body,
+            content_type=content_type,
+        )
+
+    def proxy_v2(
+        self,
+        path: str,
+        *,
+        query: str,
+        method: str,
+        body: bytes,
+        content_type: str | None,
+        content_sha256: str | None = None,
+    ) -> tuple[int, bytes, Mapping[str, str]]:
+        return self._proxy_at(
+            self._v2_endpoint,
+            path,
+            query=query,
+            method=method,
+            body=body,
+            content_type=content_type,
+            content_sha256=content_sha256,
+        )
+
+    def _proxy_at(
+        self,
+        endpoint: str,
+        path: str,
+        *,
+        query: str,
+        method: str,
+        body: bytes,
+        content_type: str | None,
+        content_sha256: str | None = None,
+    ) -> tuple[int, bytes, Mapping[str, str]]:
         segments = path.split("/")
         if not path or any(segment in {"", ".", ".."} for segment in segments):
             raise HTTPException(status_code=404, detail="development daemon route not found")
-        url = self._endpoint + "/" + quote(path, safe="/-._~")
+        url = endpoint + "/" + quote(path, safe="/-._~")
         if query:
             url += "?" + query
         headers = {"Authorization": f"Bearer {self._token}"}
         if content_type:
             headers["Content-Type"] = content_type
+        if content_sha256:
+            headers["X-OpenEvo-Content-SHA256"] = content_sha256
         upstream = urllib.request.Request(
             url,
             data=body if method in {"POST", "PUT", "PATCH"} else None,
@@ -165,7 +215,11 @@ class DevelopmentDaemonClient:
                 raise HTTPException(status_code=503, detail="development daemon response exceeds the proxy limit")
             forwarded_headers = {
                 name: value
-                for name in ("Content-Type", "Content-Disposition")
+                for name in (
+                    "Content-Type",
+                    "Content-Disposition",
+                    "X-OpenEvo-Content-SHA256",
+                )
                 if (value := response.headers.get(name)) is not None
             }
             return response.status, payload, forwarded_headers
@@ -871,6 +925,79 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
     @app.on_event("shutdown")
     async def stop_development_event_relay() -> None:
         event_relay.stop()
+
+    @app.get(
+        "/desktop/v2/development/projects/{project_id}/workspace",
+        include_in_schema=False,
+    )
+    async def development_workspace_inventory(project_id: str, request: Request) -> Response:
+        provider._find_project(project_id)
+        status, payload, headers = provider._client.proxy_v2(
+            f"projects/{quote(project_id, safe='')}/workspace",
+            query=request.url.query,
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentWorkspacePageV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid workspace inventory",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.api_route(
+        "/desktop/v2/development/projects/{project_id}/workspace/files",
+        methods=["GET", "PUT", "DELETE"],
+        include_in_schema=False,
+    )
+    async def development_workspace_file(project_id: str, request: Request) -> Response:
+        provider._find_project(project_id)
+        body = bytearray()
+        if request.method == "PUT":
+            async for chunk in request.stream():
+                if len(chunk) > MAX_DEVELOPMENT_WORKSPACE_UPLOAD_BYTES - len(body):
+                    return _desktop_error_response(
+                        status=413,
+                        code="desktop_request_too_large",
+                        summary="The workspace upload exceeds the 32 MiB development limit.",
+                        retryable=False,
+                        action="none",
+                    )
+                body.extend(chunk)
+        content_sha256 = (
+            hashlib.sha256(body).hexdigest() if request.method == "PUT" else None
+        )
+        status, payload, headers = provider._client.proxy_v2(
+            f"projects/{quote(project_id, safe='')}/workspace/files",
+            query=request.url.query,
+            method=request.method,
+            body=bytes(body),
+            content_type=request.headers.get("Content-Type"),
+            content_sha256=content_sha256,
+        )
+        if status in {HTTPStatus.OK, HTTPStatus.CREATED} and request.method in {
+            "PUT",
+            "DELETE",
+        }:
+            model = (
+                DevelopmentWorkspaceMutationV2
+                if request.method == "PUT"
+                else DevelopmentWorkspaceDeleteV2
+            )
+            try:
+                validated = model.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid workspace mutation",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
 
     @app.api_route(
         "/openevo-dev-agent/v1/{path:path}",
