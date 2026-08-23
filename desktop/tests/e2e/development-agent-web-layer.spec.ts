@@ -148,6 +148,10 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(currentRun.locator(".state-pill")).toHaveText("applied", { timeout: 120_000 });
     await expect(currentRun.getByText("Active context", { exact: true })).toBeVisible();
     expect(observedRequests).toContain("POST /openevo-dev-agent/v1/evolution-runs");
+    expect(observedRequests).toContain("GET /desktop/v2/development/artifacts");
+    expect(observedRequests.some((request) => (
+      request.startsWith("GET /desktop/v2/tasks/") && request.endsWith("/artifacts")
+    ))).toBe(true);
     await assertNoProductErrors(page);
   });
 

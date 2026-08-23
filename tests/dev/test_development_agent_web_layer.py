@@ -186,7 +186,52 @@ class FakeDaemonClient:
                 "next_cursor": str(items[-1]["sequence"]) if has_more else None,
                 "has_more": has_more,
             }
+        task_artifacts = re.fullmatch(r"/tasks/([^/]+)/artifacts", parsed.path)
+        if task_artifacts:
+            items = [
+                self._core_artifact(artifact)
+                for artifact in self.state["artifacts"]
+                if artifact["session_id"] == task_artifacts.group(1)
+            ]
+            return {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": None,
+                "has_more": False,
+            }
+        artifact_content = re.fullmatch(r"/artifacts/([^/]+)/content", parsed.path)
+        if artifact_content:
+            raw = next(
+                artifact for artifact in self.state["artifacts"]
+                if artifact["artifact_id"] == artifact_content.group(1)
+            )
+            return {
+                "schema_version": "2",
+                "artifact": self._core_artifact(raw),
+                "media_type": raw["documents"][0]["media_type"] if raw["documents"] else "application/octet-stream",
+                "content_sha256": raw["content_sha256"],
+                "byte_size": raw["byte_size"],
+            }
+        artifact_detail = re.fullmatch(r"/artifacts/([^/]+)", parsed.path)
+        if artifact_detail:
+            raw = next(
+                artifact for artifact in self.state["artifacts"]
+                if artifact["artifact_id"] == artifact_detail.group(1)
+            )
+            return self._core_artifact(raw)
         raise AssertionError(path)
+
+    @staticmethod
+    def _core_artifact(raw: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": "2",
+            "artifact_id": raw["artifact_id"],
+            "project_id": raw["project_id"],
+            "artifact_type": "diagnostic" if raw["artifact_type"] == "report" else raw["artifact_type"],
+            "manifest_sha256": raw["content_sha256"],
+            "byte_size": raw["byte_size"],
+            "created_at": raw["created_at"],
+        }
 
     def proxy_v2(
         self,
@@ -200,6 +245,42 @@ class FakeDaemonClient:
     ) -> tuple[int, bytes, dict[str, str]]:
         del content_type
         parameters = parse_qs(query)
+        if path == "development/artifacts" and method == "GET":
+            project_id = parameters["project_id"][0]
+            items = [
+                {
+                    "schema_version": "2",
+                    **artifact,
+                    "documents": [
+                        {"schema_version": "2", **document}
+                        for document in artifact["documents"]
+                    ],
+                }
+                for artifact in self.state["artifacts"]
+                if artifact["project_id"] == project_id
+            ]
+            payload = {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": None,
+                "has_more": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        artifact_detail = re.fullmatch(r"development/artifacts/([^/]+)", path)
+        if artifact_detail and method == "GET":
+            artifact = next(
+                item for item in self.state["artifacts"]
+                if item["artifact_id"] == artifact_detail.group(1)
+            )
+            payload = {
+                "schema_version": "2",
+                **artifact,
+                "documents": [
+                    {"schema_version": "2", **document}
+                    for document in artifact["documents"]
+                ],
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
         if path.endswith("/workspace") and method == "GET":
             entries = [
                 {
@@ -549,6 +630,96 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
         )
         assert deleted.status_code == 200
         assert deleted.json()["deleted_path"] == "notes/answer.txt"
+
+
+def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:
+    import scripts.dev.development_agent_web_layer as web
+
+    fake = FakeDaemonClient()
+    project_id = "project-artifact-v2"
+    task_id = "task-artifact-v2"
+    content = "# Evolved skill\n"
+    fake.state.update({
+        "active_project_id": project_id,
+        "projects": [{
+            "project_id": project_id,
+            "display_name": "Artifact v2",
+            "config": _config(),
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+        "artifacts": [{
+            "artifact_id": "artifact-skill-v2",
+            "project_id": project_id,
+            "session_id": task_id,
+            "run_id": None,
+            "target_id": "skill_bundle",
+            "artifact_type": "skill_bundle",
+            "method": "skill_bundle_reflector",
+            "renderer_kind": "file_bundle",
+            "documents": [{
+                "path": "SKILL.md",
+                "media_type": "text/markdown",
+                "content": content,
+            }],
+            "manifest": {"content_path": "SKILL.md"},
+            "content_path": "SKILL.md",
+            "content": content,
+            "content_sha256": hashlib.sha256(
+                json.dumps(
+                    [{"path": "SKILL.md", "media_type": "text/markdown", "content": content}],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            "byte_size": len(content.encode()),
+            "previous_artifact_id": None,
+            "promoted": False,
+            "created_at": "2026-08-23T00:00:01Z",
+        }],
+    })
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    inventory_path = f"/desktop/v2/development/artifacts?project_id={project_id}&limit=5"
+    with TestClient(app) as client:
+        assert client.get(inventory_path).status_code == 401
+        inventory = client.get(inventory_path, headers=headers)
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["documents"][0]["content"] == content
+
+        detail = client.get(
+            "/desktop/v2/development/artifacts/artifact-skill-v2",
+            headers=headers,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["content_path"] == "SKILL.md"
+
+        standard = client.get(
+            "/desktop/v2/artifacts/artifact-skill-v2",
+            headers=headers,
+        )
+        assert standard.status_code == 200
+        assert standard.json()["artifact_type"] == "skill_bundle"
+        content_metadata = client.get(
+            "/desktop/v2/artifacts/artifact-skill-v2/content",
+            headers=headers,
+        )
+        assert content_metadata.status_code == 200
+        assert content_metadata.json()["media_type"] == "text/markdown"
 
 
 def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:

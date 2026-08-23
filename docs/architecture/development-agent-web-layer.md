@@ -27,8 +27,11 @@ daemon restart do not reconstruct or renumber earlier entries. Workspace invento
 file transfer now use the development-only `/desktop/v2/development/projects/{id}/workspace*`
 bridge to daemon `/v2/projects/{id}/workspace*`. Inventories are bounded and manifest-pinned;
 uploads and downloads are SHA-256 verified. Artifact presentation and standalone Evolution run
-actions remain on the compatibility surface until their own route-by-route replacement preserves
-the full development acceptance path.
+are still separate product actions. Artifact metadata now uses the standard Desktop/Core v2
+contracts, while bounded rich document presentation uses the development-only
+`/desktop/v2/development/artifacts*` bridge to daemon `/v2/development/artifacts*`. Standalone
+Evolution run/apply remains on the compatibility surface until its own route-by-route replacement
+preserves the full development acceptance path.
 
 ## Start command
 
@@ -67,8 +70,9 @@ Edge installation. `OPENEVO_E2E_BROWSER_CHANNEL` remains available for an explic
 This Playwright test does not mock `fetch`, the Web Layer, SSH, the daemon, the agent, or evolution.
 It opens the real product page, creates a uniquely named remote project, uploads and reloads a
 workspace file through daemon v2, starts a Session, waits for the remote agent and evolution worker,
-refreshes task logs, applies a text-memory candidate, and saves a success screenshot. A failed run
-retains its browser trace and screenshot under
+refreshes task logs, applies a text-memory candidate, and saves a success screenshot. It also proves
+that the rendered Artifact result was reloaded through the authenticated daemon v2 Artifact routes.
+A failed run retains its browser trace and screenshot under
 `desktop/test-results/`. Because project deletion is not currently part of the development daemon
 contract, each full test leaves its timestamped acceptance project in remote development state.
 
@@ -87,7 +91,9 @@ state polling, logs, artifacts, evolution job retry, and standalone evolution ru
 It also implements discovery/health, Desktop state, the connected development profile,
 project/task/artifact projections, service status, and an SSE heartbeat on `/desktop/v2`.
 Task admission, attempt, dataset-sealed timeline events and Task logs are now daemon-owned
-durable v2 journals rather than responses reconstructed by the Web Layer.
+durable v2 journals rather than responses reconstructed by the Web Layer. Artifact list, metadata,
+content metadata, and rich bounded documents are likewise read from daemon-owned v2 routes; the
+Web Layer no longer reconstructs Artifact authority from the v1 state response.
 
 The web layer converts remote development state to closed Desktop/Core v2 response models.
 It maps the development-only `report` artifact type to renderer-safe `diagnostic`; it does

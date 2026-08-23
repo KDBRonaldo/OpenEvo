@@ -31,6 +31,23 @@ const artifactSchema = z.object({
   created_at: z.string().min(1),
 }).strict();
 
+const artifactV2Schema = artifactSchema.extend({
+  schema_version: z.literal("2"),
+  documents: z.array(z.object({
+    schema_version: z.literal("2"),
+    path: z.string().min(1),
+    media_type: z.string().min(1),
+    content: z.string(),
+  }).strict()).max(128),
+}).strict();
+
+const artifactPageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  items: z.array(artifactV2Schema).max(5),
+  next_cursor: z.string().min(1).nullable(),
+  has_more: z.boolean(),
+}).strict();
+
 const workspaceEntrySchema = z.object({
   path: z.string().min(1),
   kind: z.enum(["file", "directory", "symlink", "unreadable"]),
@@ -206,6 +223,7 @@ export interface DevelopmentAgentProviderOptions {
   readonly baseUrl?: string;
   readonly fetchImpl?: typeof fetch;
   readonly workspaceV2BaseUrl?: string;
+  readonly artifactV2BaseUrl?: string;
   readonly desktopSessionToken?: string;
 }
 
@@ -219,6 +237,7 @@ export function createDevelopmentAgentProvider(
   const baseUrl = (options.baseUrl ?? "/openevo-dev-agent/v1").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
   const workspaceV2BaseUrl = options.workspaceV2BaseUrl?.replace(/\/$/, "");
+  const artifactV2BaseUrl = options.artifactV2BaseUrl?.replace(/\/$/, "");
 
   const digestHex = async (payload: ArrayBuffer): Promise<string> => Array.from(
     new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
@@ -291,6 +310,59 @@ export function createDevelopmentAgentProvider(
     throw new Error("Workspace v2 exceeded the bounded 1000-entry inventory.");
   };
 
+  const loadArtifactsV2 = async (projectId: string) => {
+    if (artifactV2BaseUrl === undefined) throw new Error("Artifact v2 is not configured.");
+    const artifacts: z.infer<typeof artifactSchema>[] = [];
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < 200; pageNumber += 1) {
+      const parameters = new URLSearchParams({ project_id: projectId, limit: "5" });
+      if (cursor !== null) parameters.set("after", cursor);
+      const controller = new AbortController();
+      const timeout = globalThis.setTimeout(() => controller.abort(), 60_000);
+      try {
+        const headers = new Headers();
+        if (options.desktopSessionToken !== undefined) {
+          headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+        }
+        const response = await fetchImpl(`${artifactV2BaseUrl}?${parameters.toString()}`, {
+          headers,
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+        }
+        const page = artifactPageV2Schema.parse(await response.json());
+        for (const item of page.items) {
+          if (item.project_id !== projectId) {
+            throw new Error("Artifact v2 crossed project authority.");
+          }
+          const { schema_version: _schemaVersion, documents, ...artifact } = item;
+          artifacts.push({
+            ...artifact,
+            documents: documents.map(({ schema_version: _documentSchemaVersion, ...document }) => document),
+          });
+        }
+        if (!page.has_more) {
+          if (page.next_cursor !== null) throw new Error("Artifact v2 returned an invalid terminal cursor.");
+          return artifacts;
+        }
+        if (page.next_cursor === null || page.next_cursor === cursor) {
+          throw new Error("Artifact v2 returned an invalid continuation cursor.");
+        }
+        cursor = page.next_cursor;
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error("The artifact request timed out. Check the SSH development tunnel.");
+        }
+        throw error;
+      } finally {
+        globalThis.clearTimeout(timeout);
+      }
+    }
+    throw new Error("Artifact v2 exceeded the bounded pagination limit.");
+  };
+
   const requestJson = async (
     path: string,
     init?: RequestInit,
@@ -349,9 +421,15 @@ export function createDevelopmentAgentProvider(
         requestJson("/state").then((value) => stateSchema.parse(value)),
         requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
       ]);
-      const workspaces = workspaceV2BaseUrl === undefined
-        ? payload.workspaces
-        : await Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id)));
+      const [workspaces, artifacts] = await Promise.all([
+        workspaceV2BaseUrl === undefined
+          ? payload.workspaces
+          : Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id))),
+        artifactV2BaseUrl === undefined
+          ? payload.artifacts
+          : Promise.all(payload.projects.map((project) => loadArtifactsV2(project.project_id)))
+            .then((pages) => pages.flat()),
+      ]);
       return {
         activeProjectId: payload.active_project_id,
         projects: payload.projects.map((project) => ({
@@ -388,7 +466,7 @@ export function createDevelopmentAgentProvider(
           createdAt: session.created_at,
           updatedAt: session.updated_at,
         })),
-        artifacts: payload.artifacts.map(toPersistedArtifact),
+        artifacts: artifacts.map(toPersistedArtifact),
         evolutionJobs: payload.evolution_jobs.map((job) => ({
           jobId: job.job_id,
           sessionId: job.session_id,

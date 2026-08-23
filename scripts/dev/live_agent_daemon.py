@@ -52,6 +52,8 @@ from openevo.backend.harness_adapter import (  # noqa: E402
 from openevo.backend.contracts.v2 import models as core_v2  # noqa: E402
 try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
+        DevelopmentArtifactPageV2,
+        DevelopmentArtifactV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -61,6 +63,8 @@ try:  # package import in tests; direct import when launched as a script
     )
 except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
+        DevelopmentArtifactPageV2,
+        DevelopmentArtifactV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -122,6 +126,15 @@ DAEMON_V2_TASKS_PATH = "/v2/tasks"
 DAEMON_V2_TASK_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)$")
 DAEMON_V2_TASK_LOGS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/logs$")
 DAEMON_V2_TASK_TIMELINE_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/timeline$")
+DAEMON_V2_TASK_ARTIFACTS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/artifacts$")
+DAEMON_V2_ARTIFACT_CONTENT_PATH_PATTERN = re.compile(
+    r"^/v2/artifacts/([^/]+)/content$"
+)
+DAEMON_V2_ARTIFACT_PATH_PATTERN = re.compile(r"^/v2/artifacts/([^/]+)$")
+DAEMON_V2_DEVELOPMENT_ARTIFACTS_PATH = "/v2/development/artifacts"
+DAEMON_V2_DEVELOPMENT_ARTIFACT_PATH_PATTERN = re.compile(
+    r"^/v2/development/artifacts/([^/]+)$"
+)
 DAEMON_V2_WORKSPACE_PATH_PATTERN = re.compile(
     r"^/v2/projects/([^/]+)/workspace$"
 )
@@ -131,6 +144,8 @@ DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN = re.compile(
 MAX_DAEMON_V2_LOG_PAGE = 100
 MAX_DAEMON_V2_TASK_PAGE = 100
 MAX_DAEMON_V2_WORKSPACE_PAGE = 100
+MAX_DAEMON_V2_ARTIFACT_PAGE = 100
+MAX_DAEMON_V2_DEVELOPMENT_ARTIFACT_PAGE = 5
 MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
@@ -3117,6 +3132,92 @@ class DevelopmentStateStore:
             raise KeyError(artifact_id)
         return self._artifact_record(row)
 
+    def artifact_observation_v2(self, artifact_id: str) -> core_v2.ArtifactV2:
+        return self._core_artifact_v2(self.artifact(artifact_id))
+
+    def artifact_content_observation_v2(
+        self, artifact_id: str
+    ) -> core_v2.ArtifactContentV2:
+        record = self.artifact(artifact_id)
+        documents = record["documents"]
+        media_type = (
+            documents[0]["media_type"] if documents else "application/octet-stream"
+        )
+        artifact = self._core_artifact_v2(record)
+        return core_v2.ArtifactContentV2(
+            artifact=artifact,
+            media_type=media_type,
+            content_sha256=record["content_sha256"],
+            byte_size=record["byte_size"],
+        )
+
+    def artifact_page_v2(
+        self,
+        *,
+        project_id: str | None,
+        task_id: str | None,
+        after_artifact_id: str | None,
+        limit: int,
+        development_detail: bool,
+    ) -> core_v2.ArtifactPageV2 | DevelopmentArtifactPageV2:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            parameters.append(project_id)
+        if task_id is not None:
+            clauses.append("session_id = ?")
+            parameters.append(task_id)
+        where = " AND ".join(clauses) if clauses else "1 = 1"
+        with self._lock, self._connection() as connection:
+            if project_id is not None and connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
+            ).fetchone() is None:
+                raise KeyError(project_id)
+            if task_id is not None and connection.execute(
+                "SELECT 1 FROM development_sessions WHERE session_id = ?", (task_id,)
+            ).fetchone() is None:
+                raise KeyError(task_id)
+            if after_artifact_id is not None:
+                cursor = connection.execute(
+                    f"SELECT created_at, artifact_id FROM development_evolution_artifacts_v2 "
+                    f"WHERE {where} AND artifact_id = ?",
+                    (*parameters, after_artifact_id),
+                ).fetchone()
+                if cursor is None:
+                    raise RequestError("artifact cursor is not part of this collection")
+                clauses.append("(created_at > ? OR (created_at = ? AND artifact_id > ?))")
+                parameters.extend(
+                    [cursor["created_at"], cursor["created_at"], cursor["artifact_id"]]
+                )
+                where = " AND ".join(clauses)
+            rows = connection.execute(
+                f"SELECT * FROM development_evolution_artifacts_v2 WHERE {where} "
+                "ORDER BY created_at, artifact_id LIMIT ?",
+                (*parameters, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        records = [self._artifact_record(row) for row in selected]
+        next_cursor = records[-1]["artifact_id"] if has_more and records else None
+        if development_detail:
+            return DevelopmentArtifactPageV2.model_validate({
+                "schema_version": "2",
+                "items": [self._development_artifact_v2(record) for record in records],
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+            })
+        return core_v2.ArtifactPageV2(
+            items=[self._core_artifact_v2(record) for record in records],
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    def development_artifact_v2(self, artifact_id: str) -> DevelopmentArtifactV2:
+        return DevelopmentArtifactV2.model_validate(
+            self._development_artifact_v2(self.artifact(artifact_id))
+        )
+
     def record_evolution_artifact(
         self,
         *,
@@ -3277,6 +3378,32 @@ class DevelopmentStateStore:
             "previous_artifact_id": row["previous_artifact_id"],
             "promoted": bool(row["promoted"]),
             "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _core_artifact_v2(record: dict[str, Any]) -> core_v2.ArtifactV2:
+        artifact_type = (
+            "diagnostic" if record["artifact_type"] == "report"
+            else record["artifact_type"]
+        )
+        return core_v2.ArtifactV2(
+            artifact_id=record["artifact_id"],
+            project_id=record["project_id"],
+            artifact_type=artifact_type,
+            manifest_sha256=record["content_sha256"],
+            byte_size=record["byte_size"],
+            created_at=record["created_at"],
+        )
+
+    @staticmethod
+    def _development_artifact_v2(record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema_version": "2",
+            **record,
+            "documents": [
+                {"schema_version": "2", **document}
+                for document in record["documents"]
+            ],
         }
 
     @staticmethod
@@ -4833,6 +4960,102 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, page.model_dump(mode="json"))
             return
+        task_artifacts_match = DAEMON_V2_TASK_ARTIFACTS_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if task_artifacts_match:
+            task_id = task_artifacts_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(task_id):
+                    raise RequestError("task_id is invalid")
+                _, _, after_artifact_id, limit = self._artifact_page_query(
+                    parsed_path.query,
+                    allow_filters=False,
+                    maximum_limit=MAX_DAEMON_V2_ARTIFACT_PAGE,
+                )
+                page = self.server.store.artifact_page_v2(
+                    project_id=None,
+                    task_id=task_id,
+                    after_artifact_id=after_artifact_id,
+                    limit=limit,
+                    development_detail=False,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "task not found")
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        artifact_content_match = DAEMON_V2_ARTIFACT_CONTENT_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if artifact_content_match:
+            artifact_id = artifact_content_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(artifact_id):
+                    raise RequestError("artifact_id is invalid")
+                artifact = self.server.store.artifact_content_observation_v2(artifact_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "artifact not found")
+            else:
+                self._json(HTTPStatus.OK, artifact.model_dump(mode="json"))
+            return
+        artifact_match = DAEMON_V2_ARTIFACT_PATH_PATTERN.fullmatch(parsed_path.path)
+        if artifact_match:
+            artifact_id = artifact_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(artifact_id):
+                    raise RequestError("artifact_id is invalid")
+                artifact = self.server.store.artifact_observation_v2(artifact_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "artifact not found")
+            else:
+                self._json(HTTPStatus.OK, artifact.model_dump(mode="json"))
+            return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_ARTIFACTS_PATH:
+            try:
+                project_id, task_id, after_artifact_id, limit = self._artifact_page_query(
+                    parsed_path.query,
+                    allow_filters=True,
+                    maximum_limit=MAX_DAEMON_V2_DEVELOPMENT_ARTIFACT_PAGE,
+                )
+                if project_id is None:
+                    raise RequestError("development artifact query requires project_id")
+                page = self.server.store.artifact_page_v2(
+                    project_id=project_id,
+                    task_id=task_id,
+                    after_artifact_id=after_artifact_id,
+                    limit=limit,
+                    development_detail=True,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project or task not found")
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        development_artifact_match = (
+            DAEMON_V2_DEVELOPMENT_ARTIFACT_PATH_PATTERN.fullmatch(parsed_path.path)
+        )
+        if development_artifact_match:
+            artifact_id = development_artifact_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(artifact_id):
+                    raise RequestError("artifact_id is invalid")
+                artifact = self.server.store.development_artifact_v2(artifact_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "artifact not found")
+            else:
+                self._json(HTTPStatus.OK, artifact.model_dump(mode="json"))
+            return
         task_match = DAEMON_V2_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
         if task_match:
             task_id = task_match.group(1)
@@ -5318,6 +5541,44 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         ):
             raise RequestError("overwrite must be true or false")
         return paths[0], overwrite_values == ["true"]
+
+    @staticmethod
+    def _artifact_page_query(
+        query: str,
+        *,
+        allow_filters: bool,
+        maximum_limit: int,
+    ) -> tuple[str | None, str | None, str | None, int]:
+        try:
+            parameters = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise RequestError("artifact query is invalid") from exc
+        allowed = {"after", "limit"}
+        if allow_filters:
+            allowed.update({"project_id", "task_id"})
+        if set(parameters) - allowed:
+            raise RequestError("artifact query contains unsupported parameters")
+        if any(len(values) != 1 for values in parameters.values()):
+            raise RequestError("artifact query parameters must be singular")
+
+        project_id = parameters.get("project_id", [None])[0]
+        task_id = parameters.get("task_id", [None])[0]
+        after_artifact_id = parameters.get("after", [None])[0]
+        for field_name, value in (
+            ("project_id", project_id),
+            ("task_id", task_id),
+            ("artifact cursor", after_artifact_id),
+        ):
+            if value is not None and not ID_PATTERN.fullmatch(value):
+                raise RequestError(f"{field_name} is invalid")
+
+        limit_raw = parameters.get("limit", [str(maximum_limit)])[0]
+        if not limit_raw.isascii() or not limit_raw.isdigit():
+            raise RequestError("artifact limit must be an integer")
+        limit = int(limit_raw)
+        if not 1 <= limit <= maximum_limit:
+            raise RequestError("artifact limit is outside the supported bound")
+        return project_id, task_id, after_artifact_id, limit
 
     def _authorized(self) -> bool:
         expected = f"Bearer {self.server.token}"

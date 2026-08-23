@@ -109,12 +109,15 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
   authenticated Workspace inventory and file transfer. The Web Layer validates closed v2 models,
   enforces the upload bound, computes upload digests, and forwards to the daemon without exposing
   its bearer. The renderer verifies download digests before constructing a browser `Blob`.
+- `/desktop/v2/development/artifacts*`: development-only, Desktop-session authenticated rich
+  Artifact document projection. The Web Layer validates closed, bounded v2 payloads and project
+  authority before the unchanged renderer receives them.
 - `/openevo-dev-agent/v1/events`: authenticated development-daemon long poll used only by the
   Web Layer. An omitted cursor establishes the current daemon sequence; `after=<sequence>` returns
   contiguous committed events and `410 event_cursor_expired` forces snapshot resynchronization.
-- `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/artifact/transcript
+- `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/transcript
   compatibility surface; it no longer owns Project, Task, Workspace browser mutations, Workspace
-  reads, or the terminal Session response.
+  reads, Artifact reads, or the terminal Session response.
 - Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, `/v2/tasks/{task_id}/timeline`, and
   `/v2/tasks/{task_id}/logs`: bounded, bearer-authenticated Task status, durable timeline,
   and persistent log/result observations consumed only by the Web Layer. Timeline and log
@@ -124,6 +127,9 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - Remote daemon `/v2/projects/{project_id}/workspace` and `/workspace/files`: bounded stable
   pagination, manifest drift detection, safe relative paths, digest-verified PUT/GET, and durable
   DELETE over daemon-owned project workspaces. Workspace bytes survive daemon/Web Layer restarts.
+- Remote daemon `/v2/tasks/{task_id}/artifacts`, `/v2/artifacts/{artifact_id}*`, and
+  `/v2/development/artifacts*`: stable Artifact metadata pagination plus bounded rich documents.
+  Artifact rows and contents remain daemon-owned and survive daemon/Web Layer restarts.
 
 ## Deliberate boundaries
 

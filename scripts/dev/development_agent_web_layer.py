@@ -45,6 +45,8 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from openevo.backend.contracts.v2 import models as core
 try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (
+        DevelopmentArtifactPageV2,
+        DevelopmentArtifactV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -54,6 +56,8 @@ try:  # package import in tests; direct import when launched as a script
     )
 except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
+        DevelopmentArtifactPageV2,
+        DevelopmentArtifactV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -669,26 +673,46 @@ class DevelopmentAgentDesktopV2Provider:
         return core.TaskContextV2(task_id=task.task_id, task_admission_id=task.admission.task_admission_id,
                                   project_head=task.admission.predecessor_project_head, workspace_snapshot=task.admission.workspace_snapshot)
 
-    def _artifacts_for(self, task_id: object | None = None) -> list[core.ArtifactV2]:
-        items = []
-        for raw in self._remote_state().get("artifacts", []):
-            if task_id is not None and raw["session_id"] != task_id: continue
-            artifact_type = "diagnostic" if raw["artifact_type"] == "report" else raw["artifact_type"]
-            items.append(core.ArtifactV2(artifact_id=raw["artifact_id"], project_id=raw["project_id"], artifact_type=artifact_type,
-                                         manifest_sha256=raw["content_sha256"], byte_size=raw["byte_size"], created_at=raw["created_at"]))
-        return items
-
     def _task_artifacts(self, arguments: Mapping[str, object]) -> core.ArtifactPageV2:
-        return core.ArtifactPageV2(items=self._artifacts_for(arguments.get("task_id")), next_cursor=None, has_more=False)
+        task_id = str(arguments.get("task_id"))
+        query = f"?limit={arguments.get('limit', 100)}"
+        if arguments.get("after") is not None:
+            query += f"&after={quote(str(arguments['after']), safe='')}"
+        try:
+            return core.ArtifactPageV2.model_validate(
+                self._client.request_v2(
+                    f"/tasks/{quote(task_id, safe='')}/artifacts{query}"
+                )
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid v2 Task artifacts",
+            ) from exc
 
     def _artifact(self, arguments: Mapping[str, object]) -> core.ArtifactV2:
-        for artifact in self._artifacts_for():
-            if artifact.artifact_id == arguments.get("artifact_id"): return artifact
-        raise HTTPException(status_code=404, detail="artifact not found")
+        artifact_id = quote(str(arguments.get("artifact_id")), safe="")
+        try:
+            return core.ArtifactV2.model_validate(
+                self._client.request_v2(f"/artifacts/{artifact_id}")
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid v2 Artifact metadata",
+            ) from exc
 
     def _artifact_content(self, arguments: Mapping[str, object]) -> core.ArtifactContentV2:
-        artifact = self._artifact(arguments)
-        return core.ArtifactContentV2(artifact=artifact, media_type="text/markdown", content_sha256=artifact.manifest_sha256, byte_size=artifact.byte_size)
+        artifact_id = quote(str(arguments.get("artifact_id")), safe="")
+        try:
+            return core.ArtifactContentV2.model_validate(
+                self._client.request_v2(f"/artifacts/{artifact_id}/content")
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid v2 Artifact content metadata",
+            ) from exc
 
     def _services(self, _: Mapping[str, object]) -> core.ServicePageV2:
         return core.ServicePageV2(items=[{"schema_version": "2", "service_id": "development-daemon", "kind": "daemon",
@@ -996,6 +1020,65 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
                     status_code=503,
                     detail="development daemon returned an invalid workspace mutation",
                 ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/artifacts",
+        include_in_schema=False,
+    )
+    async def development_artifact_inventory(request: Request) -> Response:
+        project_id = request.query_params.get("project_id")
+        if project_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="development artifact inventory requires project_id",
+            )
+        provider._find_project(project_id)
+        status, payload, headers = provider._client.proxy_v2(
+            "development/artifacts",
+            query=request.url.query,
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentArtifactPageV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid artifact inventory",
+                ) from exc
+            if any(item.project_id != project_id for item in validated.items):
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon artifact inventory crossed project authority",
+                )
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/artifacts/{artifact_id}",
+        include_in_schema=False,
+    )
+    async def development_artifact_detail(artifact_id: str) -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/artifacts/{quote(artifact_id, safe='')}",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentArtifactV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid artifact detail",
+                ) from exc
+            provider._find_project(validated.project_id)
             payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
 

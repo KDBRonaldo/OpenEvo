@@ -500,6 +500,96 @@ describe("development agent provider", () => {
     const downloaded = await provider.downloadWorkspaceFile?.(projectId, "download.txt");
     expect(await downloaded?.data.text()).toBe("verified download\n");
   });
+
+  it("loads rich artifact presentation through the authenticated daemon v2 bridge", async () => {
+    const projectId = "project-artifact-v2";
+    const artifactId = "artifact-skill-v2";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/state")) {
+        return jsonResponse({
+          schema_version: "1",
+          active_project_id: projectId,
+          projects: [{
+            project_id: projectId,
+            display_name: "Artifact v2",
+            config,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:00Z",
+          }],
+          sessions: [],
+          artifacts: [],
+          evolution_jobs: [],
+          evolution_runs: [],
+          workspaces: [],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "1",
+          authority: "development_catalog_unverified",
+          capabilities: {
+            schema_version: "1",
+            core_version: "development",
+            registry_digest: "a".repeat(64),
+            evaluated_profile: {
+              execution_mode: "subscription",
+              capture_mode: "transcript",
+              harness_id: "codex",
+              harness_capabilities: [],
+              runtime_capabilities: [],
+            },
+            targets: [],
+          },
+        });
+      }
+      if (url.includes("/desktop/v2/development/artifacts?")) {
+        expect(url).toContain(`project_id=${projectId}`);
+        expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+        return jsonResponse({
+          schema_version: "2",
+          items: [{
+            schema_version: "2",
+            artifact_id: artifactId,
+            project_id: projectId,
+            session_id: "task-artifact-v2",
+            run_id: null,
+            target_id: "skill_bundle",
+            artifact_type: "skill_bundle",
+            method: "skill_bundle_reflector",
+            renderer_kind: "file_bundle",
+            documents: [{
+              schema_version: "2",
+              path: "SKILL.md",
+              media_type: "text/markdown",
+              content: "# Real daemon v2 skill\n",
+            }],
+            manifest: { content_path: "SKILL.md" },
+            content_path: "SKILL.md",
+            content: "# Real daemon v2 skill\n",
+            content_sha256: "d".repeat(64),
+            byte_size: 23,
+            previous_artifact_id: null,
+            promoted: false,
+            created_at: "2026-08-23T00:00:01Z",
+          }],
+          next_cursor: null,
+          has_more: false,
+        });
+      }
+      throw new Error(`Unexpected Artifact v2 request: ${init?.method ?? "GET"} ${url}`);
+    });
+    const provider = createDevelopmentAgentProvider({
+      fetchImpl,
+      artifactV2BaseUrl: "/desktop/v2/development/artifacts",
+      desktopSessionToken: "session-secret",
+    });
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("artifact v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.artifacts[artifactId]?.documents[0]?.content)
+      .toBe("# Real daemon v2 skill\n");
+  });
 });
 
 function jsonResponse(body: object, status = 200): Response {

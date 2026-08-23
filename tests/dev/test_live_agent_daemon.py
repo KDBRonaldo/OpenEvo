@@ -1007,6 +1007,119 @@ def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
     assert page.items[1].content_sha256 == hashlib.sha256(payloads["notes/b.txt"]).hexdigest()
 
 
+def test_daemon_v2_artifacts_are_paginated_bounded_and_restart_safe(tmp_path: Path) -> None:
+    token = "a" * 32
+    database = tmp_path / "state.sqlite3"
+    project_id = "development-project-v2-artifacts"
+    task_id = "development-task-v2-artifacts"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": project_id,
+        "display_name": "V2 artifacts",
+        "config": {},
+    })
+    store.start_session(task_id, {
+        "project_id": project_id,
+        "project_name": "V2 artifacts",
+        "task_title": "Produce artifacts",
+        "instruction": "Produce two bounded artifacts",
+    })
+    for index, artifact_type in enumerate(("skill_bundle", "report"), start=1):
+        content = f"# Artifact {index}\n"
+        store.record_evolution_artifact(
+            artifact_id=f"artifact-v2-{index}",
+            project_id=project_id,
+            session_id=task_id,
+            target_id="skill_bundle" if artifact_type == "skill_bundle" else "agent_system",
+            artifact_type=artifact_type,
+            method_id="artifact_reflector",
+            renderer_kind="file_bundle" if artifact_type == "skill_bundle" else "structured_summary",
+            documents=[{
+                "path": "SKILL.md" if artifact_type == "skill_bundle" else "report.md",
+                "media_type": "text/markdown",
+                "content": content,
+            }],
+            manifest={"ordinal": index},
+            previous_artifact_id=None,
+            promoted=False,
+        )
+
+    server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = f"http://127.0.0.1:{server.server_address[1]}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        first_request = urllib.request.Request(
+            f"{root}/v2/tasks/{task_id}/artifacts?limit=1", headers=headers
+        )
+        with urllib.request.urlopen(first_request, timeout=5) as response:
+            first = json.loads(response.read())
+        assert first["schema_version"] == "2"
+        assert first["has_more"] is True
+        assert first["next_cursor"] == first["items"][0]["artifact_id"]
+
+        second_request = urllib.request.Request(
+            f"{root}/v2/tasks/{task_id}/artifacts?{urlencode({'limit': 100, 'after': first['next_cursor']})}",
+            headers=headers,
+        )
+        with urllib.request.urlopen(second_request, timeout=5) as response:
+            second = json.loads(response.read())
+        assert second["has_more"] is False
+        assert {item["artifact_type"] for item in first["items"] + second["items"]} == {
+            "skill_bundle",
+            "diagnostic",
+        }
+
+        inventory_request = urllib.request.Request(
+            f"{root}/v2/development/artifacts?{urlencode({'project_id': project_id, 'limit': 5})}",
+            headers=headers,
+        )
+        with urllib.request.urlopen(inventory_request, timeout=5) as response:
+            inventory = json.loads(response.read())
+        assert len(inventory["items"]) == 2
+        assert inventory["items"][0]["documents"][0]["content"].startswith("# Artifact")
+
+        artifact_id = inventory["items"][0]["artifact_id"]
+        detail_request = urllib.request.Request(
+            f"{root}/v2/development/artifacts/{artifact_id}", headers=headers
+        )
+        with urllib.request.urlopen(detail_request, timeout=5) as response:
+            detail = json.loads(response.read())
+        assert detail["content"] == detail["documents"][0]["content"]
+
+        metadata_request = urllib.request.Request(
+            f"{root}/v2/artifacts/{artifact_id}", headers=headers
+        )
+        with urllib.request.urlopen(metadata_request, timeout=5) as response:
+            metadata = json.loads(response.read())
+        content_request = urllib.request.Request(
+            f"{root}/v2/artifacts/{artifact_id}/content", headers=headers
+        )
+        with urllib.request.urlopen(content_request, timeout=5) as response:
+            content_metadata = json.loads(response.read())
+        assert content_metadata["artifact"] == metadata
+        assert content_metadata["media_type"] == "text/markdown"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    restored = MODULE.DevelopmentStateStore(database)
+    restored_page = restored.artifact_page_v2(
+        project_id=project_id,
+        task_id=None,
+        after_artifact_id=None,
+        limit=5,
+        development_detail=True,
+    )
+    assert [item.artifact_id for item in restored_page.items] == [
+        "artifact-v2-1",
+        "artifact-v2-2",
+    ]
+    assert restored_page.items[0].documents[0].path == "SKILL.md"
+
+
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
