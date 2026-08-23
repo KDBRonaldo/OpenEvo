@@ -46,11 +46,13 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskTimelinePageV2,
     )
 except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskTimelinePageV2,
     )
 
 
@@ -525,8 +527,71 @@ class DevelopmentAgentDesktopV2Provider:
             if raw["session_id"] == task_id: return raw
         raise HTTPException(status_code=404, detail="task not found")
 
-    def _timeline(self, _: Mapping[str, object]) -> core.TimelinePageV2:
-        return core.TimelinePageV2(items=[], next_cursor=None, has_more=False)
+    def _timeline(self, arguments: Mapping[str, object]) -> core.TimelinePageV2:
+        task_id = str(arguments.get("task_id"))
+        after = arguments.get("after")
+        limit = arguments.get("limit", 100)
+        query = f"?limit={limit}"
+        if after is not None:
+            query += f"&after={quote(str(after), safe='')}"
+        try:
+            page = DevelopmentTaskTimelinePageV2.model_validate(
+                self._client.request_v2(
+                    f"/tasks/{quote(task_id, safe='')}/timeline{query}"
+                )
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned an invalid v2 Task timeline",
+            ) from exc
+
+        task = self._task({"task_id": task_id})
+        attempt = task.attempts[0]
+        events: list[core.EventEnvelopeV2] = []
+        for observation in page.items:
+            if (
+                observation.task_id != task.task_id
+                or observation.project_id != task.project_id
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon Task timeline authority drifted",
+                )
+            common = {
+                "schema_version": "2",
+                "event_id": observation.event_id,
+                "sequence": observation.sequence,
+                "occurred_at": observation.occurred_at,
+                "project_id": observation.project_id,
+            }
+            if observation.event_type == "task_admitted":
+                events.append(core.TaskAdmittedEventV2(
+                    **common,
+                    event_type="task_admitted",
+                    admission=task.admission,
+                ))
+            elif observation.event_type == "attempt_appended":
+                events.append(core.AttemptAppendedEventV2(
+                    **common,
+                    event_type="attempt_appended",
+                    attempt=attempt,
+                ))
+            else:
+                events.append(core.DatasetSealedEventV2(
+                    **common,
+                    event_type="dataset_sealed",
+                    task_id=task.task_id,
+                    task_admission_id=task.admission.task_admission_id,
+                    attempt_id=attempt.attempt_id,
+                    dataset_id=observation.dataset_id,
+                    dataset_sha256=observation.dataset_sha256,
+                ))
+        return core.TimelinePageV2(
+            items=events,
+            next_cursor=page.next_cursor,
+            has_more=page.has_more,
+        )
 
     def _logs(self, arguments: Mapping[str, object]) -> core.LogPageV2:
         task_id = str(arguments.get("task_id"))

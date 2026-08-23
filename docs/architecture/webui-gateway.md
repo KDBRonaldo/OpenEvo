@@ -108,8 +108,10 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/workspace/artifact
   compatibility surface; it no longer owns Project or Task browser mutations or the terminal
   Session response.
-- Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, and `/v2/tasks/{task_id}/logs`: bounded,
-  bearer-authenticated Task status and result observations consumed only by the Web Layer.
+- Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, `/v2/tasks/{task_id}/timeline`, and
+  `/v2/tasks/{task_id}/logs`: bounded, bearer-authenticated Task status, durable timeline,
+  and persistent log/result observations consumed only by the Web Layer. Timeline and log
+  cursors are stable monotonic per-Task sequences retained across daemon restarts.
   The browser never receives the daemon bearer token and continues to call only
   `/desktop/v2/*` for this data.
 

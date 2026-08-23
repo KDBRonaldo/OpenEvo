@@ -20,9 +20,11 @@ bearer token remains only in the launcher/Web Layer process and is never compile
 returned to browser code.
 
 The Web Layer also exposes the strict `/desktop/v2/*` projection in parallel. Project/Task
-authority and mutations now use this provider. Task status and terminal agent responses are
-read from the daemon's bounded `/v2/tasks*` observation routes; the renderer consumes the
-response through the existing Desktop v2 Task log contract. Workspace/artifact presentation
+authority and mutations now use this provider. Task status, timeline, persistent logs, and
+terminal agent responses are read from the daemon's bounded `/v2/tasks*` observation routes;
+the renderer consumes them through the existing Desktop v2 Task contracts. The daemon assigns
+monotonic per-Task sequences and persists the journals in SQLite, so pagination, refresh, and
+daemon restart do not reconstruct or renumber earlier entries. Workspace/artifact presentation
 and standalone Evolution run actions remain on the compatibility surface until their own
 route-by-route replacement preserves the full development acceptance path.
 
@@ -81,6 +83,8 @@ the previously working renderer: project and workspace mutations, Session submit
 state polling, logs, artifacts, evolution job retry, and standalone evolution run/apply.
 It also implements discovery/health, Desktop state, the connected development profile,
 project/task/artifact projections, service status, and an SSE heartbeat on `/desktop/v2`.
+Task admission, attempt, dataset-sealed timeline events and Task logs are now daemon-owned
+durable v2 journals rather than responses reconstructed by the Web Layer.
 
 The web layer converts remote development state to closed Desktop/Core v2 response models.
 It maps the development-only `report` artifact type to renderer-safe `diagnostic`; it does

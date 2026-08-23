@@ -1540,6 +1540,11 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
             f"/v2/tasks/{turn['session_id']}/logs?limit=100",
             token,
         )
+        timeline_v2 = _request_json(
+            base_url,
+            f"/v2/tasks/{turn['session_id']}/timeline?limit=100",
+            token,
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -1556,6 +1561,97 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
     assert task_v2["state"] == "closed"
     assert logs_v2["items"][-1]["stream"] == "transcript"
     assert logs_v2["items"][-1]["message"] == "Answer to: Hello"
+    assert [item["event_type"] for item in timeline_v2["items"]] == [
+        "task_admitted",
+        "attempt_appended",
+    ]
+
+
+def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": "development-project-1",
+        "display_name": "Persistent project",
+        "config": {},
+    })
+    request = {
+        "project_id": "development-project-1",
+        "project_name": "Persistent project",
+        "task_title": "Question",
+        "instruction": "Hello",
+    }
+    store.start_session("development-session-1", request)
+    store.append_session_log("development-session-1", "Harness started.")
+    store.complete_session("development-session-1", {
+        "response": "Persistent answer.",
+        "model": "codex",
+        "duration_ms": 10,
+        "logs": ["Harness started.", "Harness completed."],
+        "workspace_changes": [],
+        "runtime_activation": None,
+    })
+    store.record_dataset_artifact(
+        artifact_id="dataset-development-session-1",
+        project_id="development-project-1",
+        session_id="development-session-1",
+        uri="file:///tmp/manifest.json",
+        name="Question transcript",
+        manifest_sha256="1" * 64,
+    )
+
+    first_logs = store.task_logs_v2(
+        "development-session-1", after_sequence=0, limit=2
+    )
+    assert first_logs.has_more is True
+    assert first_logs.next_cursor == "2"
+    second_logs = store.task_logs_v2(
+        "development-session-1",
+        after_sequence=int(first_logs.next_cursor),
+        limit=100,
+    )
+    all_logs = [*first_logs.items, *second_logs.items]
+    assert [item.sequence for item in all_logs] == list(range(1, len(all_logs) + 1))
+    assert all_logs[-1].stream == "transcript"
+    assert all_logs[-1].message == "Persistent answer."
+
+    first_timeline = store.task_timeline_v2(
+        "development-session-1", after_sequence=0, limit=1
+    )
+    assert first_timeline.has_more is True
+    assert first_timeline.next_cursor == "1"
+    later_timeline = store.task_timeline_v2(
+        "development-session-1", after_sequence=1, limit=100
+    )
+    timeline = [*first_timeline.items, *later_timeline.items]
+    assert [item.event_type for item in timeline] == [
+        "task_admitted",
+        "attempt_appended",
+        "dataset_sealed",
+    ]
+
+    restored = MODULE.DevelopmentStateStore(database)
+    restored_logs = restored.task_logs_v2(
+        "development-session-1", after_sequence=0, limit=100
+    )
+    restored_timeline = restored.task_timeline_v2(
+        "development-session-1", after_sequence=0, limit=100
+    )
+    assert restored_logs.model_dump(mode="json") == MODULE.core_v2.LogPageV2(
+        items=all_logs, next_cursor=None, has_more=False
+    ).model_dump(mode="json")
+    assert restored_timeline.items == timeline
+
+    with pytest.raises(MODULE.RequestError, match="beyond"):
+        restored.task_logs_v2(
+            "development-session-1", after_sequence=999, limit=100
+        )
+    with pytest.raises(MODULE.RequestError, match="beyond"):
+        restored.task_timeline_v2(
+            "development-session-1", after_sequence=999, limit=100
+        )
 
 
 def test_session_coordinator_cancels_a_running_harness(tmp_path: Path) -> None:

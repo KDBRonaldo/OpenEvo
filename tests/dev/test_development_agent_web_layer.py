@@ -131,16 +131,58 @@ class FakeDaemonClient:
                 *([("transcript", session["response"])] if session.get("response") else []),
                 *([("system", session["error"])] if session.get("error") else []),
             ]
+            query = parse_qs(parsed.query)
+            after = int(query.get("after", ["0"])[0])
+            limit = int(query.get("limit", ["100"])[0])
+            all_items = [{
+                "sequence": index + 1,
+                "occurred_at": session["updated_at"],
+                "stream": stream,
+                "message": message,
+            } for index, (stream, message) in enumerate(messages)]
+            remaining = [item for item in all_items if item["sequence"] > after]
+            items = remaining[:limit]
+            has_more = len(remaining) > limit
             return {
                 "schema_version": "2",
-                "items": [{
-                    "sequence": index + 1,
-                    "occurred_at": session["updated_at"],
-                    "stream": stream,
-                    "message": message,
-                } for index, (stream, message) in enumerate(messages)],
-                "next_cursor": None,
-                "has_more": False,
+                "items": items,
+                "next_cursor": str(items[-1]["sequence"]) if has_more else None,
+                "has_more": has_more,
+            }
+        task_timeline = re.fullmatch(r"/tasks/([^/]+)/timeline", parsed.path)
+        if task_timeline:
+            session = next(
+                item for item in self.state["sessions"]
+                if item["session_id"] == task_timeline.group(1)
+            )
+            events = [{
+                "schema_version": "2",
+                "event_id": f"{session['session_id']}-event-admitted",
+                "sequence": 1,
+                "occurred_at": session["created_at"],
+                "project_id": session["project_id"],
+                "task_id": session["session_id"],
+                "event_type": "task_admitted",
+            }, {
+                "schema_version": "2",
+                "event_id": f"{session['session_id']}-event-attempt",
+                "sequence": 2,
+                "occurred_at": session["created_at"],
+                "project_id": session["project_id"],
+                "task_id": session["session_id"],
+                "event_type": "attempt_appended",
+            }]
+            query = parse_qs(parsed.query)
+            after = int(query.get("after", ["0"])[0])
+            limit = int(query.get("limit", ["100"])[0])
+            remaining = [event for event in events if event["sequence"] > after]
+            items = remaining[:limit]
+            has_more = len(remaining) > limit
+            return {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": str(items[-1]["sequence"]) if has_more else None,
+                "has_more": has_more,
             }
         raise AssertionError(path)
 
@@ -476,6 +518,48 @@ def test_provider_reads_terminal_agent_result_from_daemon_v2_logs() -> None:
 
     assert logs.items[-1].stream == "transcript"
     assert logs.items[-1].message == "Authoritative v2 answer."
+
+
+def test_provider_projects_daemon_v2_timeline_into_bound_desktop_events() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [{
+                "project_id": "project-1",
+                "display_name": "Development project",
+                "config": _config(),
+                "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }],
+            "sessions": [{
+                "session_id": "session-1",
+                "project_id": "project-1",
+                "state": "running",
+                "logs": ["started"],
+                "created_at": "2026-08-22T00:01:00Z",
+                "updated_at": "2026-08-22T00:01:00Z",
+            }],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+    task = provider.invoke("getDesktopTaskV2", {"task_id": "session-1"})
+
+    first = provider.invoke(
+        "getDesktopTaskTimelineV2",
+        {"task_id": "session-1", "limit": 1, "after": None},
+    )
+    second = provider.invoke(
+        "getDesktopTaskTimelineV2",
+        {"task_id": "session-1", "limit": 100, "after": first.next_cursor},
+    )
+
+    assert first.has_more is True
+    assert first.next_cursor == "1"
+    assert first.items[0].event_type == "task_admitted"
+    assert first.items[0].admission == task.admission
+    assert second.items[0].event_type == "attempt_appended"
+    assert second.items[0].attempt == task.attempts[0]
 
 
 def test_active_project_tunnel_exposes_only_its_bound_project() -> None:
