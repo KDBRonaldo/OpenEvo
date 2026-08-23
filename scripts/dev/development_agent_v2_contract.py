@@ -30,6 +30,132 @@ class DevelopmentTaskObservationPageV2(StrictDevelopmentModelV2):
     has_more: bool = False
 
 
+class DevelopmentTaskCreateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    project_id: core.OpaqueId
+    project_name: str = Field(min_length=1, max_length=512)
+    task_title: str = Field(min_length=1, max_length=4_096)
+    instruction: str = Field(min_length=1, max_length=256 * 1024)
+
+
+class DevelopmentTaskCancelV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+
+
+class DevelopmentEvolutionSelectionPresentationV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    target_id: core.OpaqueId
+    method: core.OpaqueId
+    config: dict[str, Any]
+
+
+class DevelopmentEvolutionErrorPresentationV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    target_id: core.OpaqueId
+    method: core.OpaqueId
+    message: str = Field(min_length=1, max_length=32_000)
+
+
+class DevelopmentWorkspaceDiffLineV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    kind: Literal["added", "removed", "context"]
+    text: str = Field(max_length=16_384)
+
+
+class DevelopmentWorkspaceChangeV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    path: str = Field(min_length=1, max_length=512)
+    change_type: Literal["created", "modified", "deleted"]
+    byte_size: int = Field(ge=0, le=core.MAX_SNAPSHOT_BYTES)
+    media_type: str | None = Field(default=None, min_length=1, max_length=255)
+    content: str | None = Field(default=None, max_length=2 * 1024 * 1024)
+    previous_path: str | None = Field(default=None, min_length=1, max_length=512)
+    diff_lines: list[DevelopmentWorkspaceDiffLineV2] = Field(max_length=2_000)
+
+
+class DevelopmentTaskPresentationV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    task_id: core.OpaqueId
+    project_id: core.OpaqueId
+    task_title: str = Field(min_length=1, max_length=4_096)
+    instruction: str = Field(min_length=1, max_length=256 * 1024)
+    response: str | None = Field(default=None, max_length=4 * 1024 * 1024)
+    model: str | None = Field(default=None, min_length=1, max_length=512)
+    state: Literal["running", "cancelling", "completed", "failed", "cancelled"]
+    duration_ms: int | None = Field(default=None, ge=0, le=core.MAX_JAVASCRIPT_SAFE_INTEGER)
+    selected_evolution: list[DevelopmentEvolutionSelectionPresentationV2] = Field(max_length=64)
+    evolution_errors: list[DevelopmentEvolutionErrorPresentationV2] = Field(max_length=64)
+    workspace_changes: list[DevelopmentWorkspaceChangeV2] = Field(max_length=2_000)
+    context_artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    evolution_evidence_ready: bool
+    error: str | None = Field(default=None, max_length=32_000)
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+
+class DevelopmentTaskPresentationPageV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    items: list[DevelopmentTaskPresentationV2] = Field(max_length=25)
+    next_cursor: core.Cursor | None = None
+    has_more: bool = False
+
+
+class DevelopmentProjectAuthorityV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    project_id: core.OpaqueId
+    display_name: str = Field(min_length=1, max_length=512)
+    config: core.ScienceProjectConfigV2
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+
+class DevelopmentStateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    active_project_id: core.OpaqueId | None = None
+    projects: list[DevelopmentProjectAuthorityV2] = Field(max_length=1_000)
+
+
+class DevelopmentProjectCreateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    project_id: core.OpaqueId
+    display_name: str = Field(min_length=1, max_length=512)
+    config: core.ScienceProjectConfigV2
+
+
+class DevelopmentProjectUpdateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    display_name: str = Field(min_length=1, max_length=512)
+    config: core.ScienceProjectConfigV2
+
+
+class DevelopmentProjectActivateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+
+
+class DevelopmentCapabilitiesV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    authority: Literal["development_catalog_unverified"]
+    capabilities: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _validate_capability_budget(self) -> "DevelopmentCapabilitiesV2":
+        encoded = json.dumps(
+            self.capabilities,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 1024 * 1024:
+            raise ValueError("development capabilities exceed the v2 byte budget")
+        return self
+
+
 class DevelopmentTaskTimelineEventBaseV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     event_id: core.OpaqueId
@@ -345,6 +471,7 @@ class DevelopmentEvolutionJobPageV2(StrictDevelopmentModelV2):
 
 __all__ = [
     "DevelopmentAttemptAppendedObservationV2",
+    "DevelopmentCapabilitiesV2",
     "DevelopmentArtifactDocumentV2",
     "DevelopmentArtifactPageV2",
     "DevelopmentArtifactV2",
@@ -359,8 +486,17 @@ __all__ = [
     "DevelopmentEvolutionJobV2",
     "DevelopmentDatasetSealedObservationV2",
     "DevelopmentTaskAdmittedObservationV2",
+    "DevelopmentProjectActivateV2",
+    "DevelopmentProjectAuthorityV2",
+    "DevelopmentProjectCreateV2",
+    "DevelopmentProjectUpdateV2",
+    "DevelopmentStateV2",
+    "DevelopmentTaskCancelV2",
+    "DevelopmentTaskCreateV2",
     "DevelopmentTaskObservationPageV2",
     "DevelopmentTaskObservationV2",
+    "DevelopmentTaskPresentationPageV2",
+    "DevelopmentTaskPresentationV2",
     "DevelopmentTaskTimelineObservationV2",
     "DevelopmentTaskTimelinePageV2",
     "DevelopmentWorkspaceDeleteV2",

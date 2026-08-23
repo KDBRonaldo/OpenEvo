@@ -158,6 +158,50 @@ const sessionSchema = z.object({
   updated_at: z.string().min(1),
 }).strict();
 
+const taskPresentationV2Schema = z.object({
+  schema_version: z.literal("2"),
+  task_id: z.string().min(1),
+  project_id: z.string().min(1),
+  task_title: z.string().min(1),
+  instruction: z.string().min(1),
+  response: z.string().nullable(),
+  model: z.string().min(1).nullable(),
+  state: z.enum(["running", "cancelling", "completed", "failed", "cancelled"]),
+  duration_ms: z.number().int().nonnegative().nullable(),
+  selected_evolution: z.array(z.object({
+    schema_version: z.literal("2"),
+    target_id: z.string().min(1),
+    method: z.string().min(1),
+    config: z.record(z.string(), z.unknown()),
+  }).strict()).max(64),
+  evolution_errors: z.array(z.object({
+    schema_version: z.literal("2"),
+    target_id: z.string().min(1),
+    method: z.string().min(1),
+    message: z.string().min(1),
+  }).strict()).max(64),
+  workspace_changes: z.array(workspaceChangeSchema.extend({
+    schema_version: z.literal("2"),
+    diff_lines: z.array(z.object({
+      schema_version: z.literal("2"),
+      kind: z.enum(["added", "removed", "context"]),
+      text: z.string(),
+    }).strict()),
+  }).strict()).max(2_000),
+  context_artifact_ids: z.array(z.string().min(1)).max(256),
+  evolution_evidence_ready: z.boolean(),
+  error: z.string().nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const taskPresentationPageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  items: z.array(taskPresentationV2Schema).max(25),
+  next_cursor: z.string().min(1).nullable(),
+  has_more: z.boolean(),
+}).strict();
+
 const evolutionRunSchema = z.object({
   run_id: z.string().min(1),
   project_id: z.string().min(1),
@@ -294,6 +338,18 @@ const capabilityResponseSchema = z.object({
   capabilities: evolutionCapabilitiesV2Schema,
 }).strict();
 
+const developmentStateV2Schema = z.object({
+  schema_version: z.literal("2"),
+  active_project_id: z.string().min(1).nullable(),
+  projects: z.array(projectSchema.extend({ schema_version: z.literal("2") }).strict()).max(1_000),
+}).strict();
+
+const capabilityResponseV2Schema = z.object({
+  schema_version: z.literal("2"),
+  authority: z.literal("development_catalog_unverified"),
+  capabilities: evolutionCapabilitiesV2Schema,
+}).strict();
+
 export interface DevelopmentAgentProviderOptions {
   readonly baseUrl?: string;
   readonly fetchImpl?: typeof fetch;
@@ -301,6 +357,8 @@ export interface DevelopmentAgentProviderOptions {
   readonly artifactV2BaseUrl?: string;
   readonly evolutionV2BaseUrl?: string;
   readonly evolutionJobV2BaseUrl?: string;
+  readonly taskPresentationV2BaseUrl?: string;
+  readonly presentationV2BaseUrl?: string;
   readonly desktopSessionToken?: string;
 }
 
@@ -317,6 +375,8 @@ export function createDevelopmentAgentProvider(
   const artifactV2BaseUrl = options.artifactV2BaseUrl?.replace(/\/$/, "");
   const evolutionV2BaseUrl = options.evolutionV2BaseUrl?.replace(/\/$/, "");
   const evolutionJobV2BaseUrl = options.evolutionJobV2BaseUrl?.replace(/\/$/, "");
+  const taskPresentationV2BaseUrl = options.taskPresentationV2BaseUrl?.replace(/\/$/, "");
+  const presentationV2BaseUrl = options.presentationV2BaseUrl?.replace(/\/$/, "");
 
   const digestHex = async (payload: ArrayBuffer): Promise<string> => Array.from(
     new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
@@ -580,6 +640,81 @@ export function createDevelopmentAgentProvider(
     throw new Error("Evolution Job v2 exceeded the bounded pagination limit.");
   };
 
+  const loadTaskPresentationsV2 = async (projectId: string) => {
+    if (taskPresentationV2BaseUrl === undefined) {
+      throw new Error("Task presentation v2 is not configured.");
+    }
+    const sessions: z.infer<typeof sessionSchema>[] = [];
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < 80; pageNumber += 1) {
+      const parameters = new URLSearchParams({ project_id: projectId, limit: "25" });
+      if (cursor !== null) parameters.set("after", cursor);
+      const controller = new AbortController();
+      const timeout = globalThis.setTimeout(() => controller.abort(), 60_000);
+      try {
+        const headers = new Headers();
+        if (options.desktopSessionToken !== undefined) {
+          headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+        }
+        const response = await fetchImpl(
+          `${taskPresentationV2BaseUrl}?${parameters.toString()}`,
+          { headers, signal: controller.signal },
+        );
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+        }
+        const page = taskPresentationPageV2Schema.parse(await response.json());
+        for (const item of page.items) {
+          if (item.project_id !== projectId) {
+            throw new Error("Task presentation v2 crossed project authority.");
+          }
+          sessions.push({
+            session_id: item.task_id,
+            project_id: item.project_id,
+            task_title: item.task_title,
+            instruction: item.instruction,
+            response: item.response,
+            model: item.model,
+            state: item.state,
+            duration_ms: item.duration_ms,
+            logs: [],
+            selected_evolution: item.selected_evolution.map(({ schema_version: _version, ...selection }) => selection),
+            evolution_errors: item.evolution_errors.map(({ schema_version: _version, ...error }) => error),
+            workspace_changes: item.workspace_changes.map(({ schema_version: _version, diff_lines, ...change }) => ({
+              ...change,
+              diff_lines: diff_lines.map(({ schema_version: _lineVersion, ...line }) => line),
+            })),
+            context_artifact_ids: item.context_artifact_ids,
+            runtime_activation: null,
+            evolution_evidence_ready: item.evolution_evidence_ready,
+            error: item.error,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+          });
+        }
+        if (!page.has_more) {
+          if (page.next_cursor !== null) {
+            throw new Error("Task presentation v2 returned an invalid terminal cursor.");
+          }
+          return sessions;
+        }
+        if (page.next_cursor === null || page.next_cursor === cursor) {
+          throw new Error("Task presentation v2 returned an invalid continuation cursor.");
+        }
+        cursor = page.next_cursor;
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new Error("The Task presentation request timed out. Check the SSH development tunnel.");
+        }
+        throw error;
+      } finally {
+        globalThis.clearTimeout(timeout);
+      }
+    }
+    throw new Error("Task presentation v2 exceeded the bounded pagination limit.");
+  };
+
   const requestJson = async (
     path: string,
     init?: RequestInit,
@@ -632,13 +767,42 @@ export function createDevelopmentAgentProvider(
     }
   };
 
+  const requestPresentationV2 = async (path: string): Promise<unknown> => {
+    if (presentationV2BaseUrl === undefined) {
+      throw new Error("Development presentation v2 is not configured.");
+    }
+    const headers = new Headers();
+    if (options.desktopSessionToken !== undefined) {
+      headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+    }
+    const response = await fetchImpl(`${presentationV2BaseUrl}${path}`, { headers });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+    }
+    return response.json();
+  };
+
   const backend: DevelopmentAgentBackend = {
     loadState: async () => {
-      const [payload, capabilityPayload] = await Promise.all([
-        requestJson("/state").then((value) => stateSchema.parse(value)),
-        requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
-      ]);
-      const [workspaces, artifacts, evolutionRuns, evolutionJobs] = await Promise.all([
+      const [payload, capabilityPayload] = presentationV2BaseUrl === undefined
+        ? await Promise.all([
+          requestJson("/state").then((value) => stateSchema.parse(value)),
+          requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
+        ])
+        : await Promise.all([
+          requestPresentationV2("/presentation-state").then((value) => {
+            const state = developmentStateV2Schema.parse(value);
+            return stateSchema.parse({
+              schema_version: "1",
+              active_project_id: state.active_project_id,
+              projects: state.projects.map(({ schema_version: _version, ...project }) => project),
+              sessions: [], artifacts: [], evolution_jobs: [], evolution_runs: [], workspaces: [],
+            });
+          }),
+          requestPresentationV2("/capabilities").then((value) => capabilityResponseV2Schema.parse(value)),
+        ]);
+      const [workspaces, artifacts, evolutionRuns, evolutionJobs, sessions] = await Promise.all([
         workspaceV2BaseUrl === undefined
           ? payload.workspaces
           : Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id))),
@@ -654,6 +818,10 @@ export function createDevelopmentAgentProvider(
           ? payload.evolution_jobs
           : Promise.all(payload.projects.map((project) => loadEvolutionJobsV2(project.project_id)))
             .then((pages) => pages.flat()),
+        taskPresentationV2BaseUrl === undefined
+          ? payload.sessions
+          : Promise.all(payload.projects.map((project) => loadTaskPresentationsV2(project.project_id)))
+            .then((pages) => pages.flat()),
       ]);
       return {
         activeProjectId: payload.active_project_id,
@@ -664,7 +832,7 @@ export function createDevelopmentAgentProvider(
           createdAt: project.created_at,
           updatedAt: project.updated_at,
         })),
-        sessions: payload.sessions.map((session) => ({
+        sessions: sessions.map((session) => ({
           sessionId: session.session_id,
           projectId: session.project_id,
           taskTitle: session.task_title,

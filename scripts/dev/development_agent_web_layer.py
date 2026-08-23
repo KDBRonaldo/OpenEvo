@@ -47,6 +47,7 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentCapabilitiesV2,
         DevelopmentEvolutionJobPageV2,
         DevelopmentEvolutionJobRetryV2,
         DevelopmentEvolutionJobV2,
@@ -56,6 +57,14 @@ try:  # package import in tests; direct import when launched as a script
         DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskCancelV2,
+        DevelopmentTaskCreateV2,
+        DevelopmentTaskPresentationPageV2,
+        DevelopmentTaskPresentationV2,
+        DevelopmentProjectActivateV2,
+        DevelopmentProjectCreateV2,
+        DevelopmentProjectUpdateV2,
+        DevelopmentStateV2,
         DevelopmentTaskTimelinePageV2,
         DevelopmentWorkspaceDeleteV2,
         DevelopmentWorkspaceMutationV2,
@@ -65,6 +74,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentCapabilitiesV2,
         DevelopmentEvolutionJobPageV2,
         DevelopmentEvolutionJobRetryV2,
         DevelopmentEvolutionJobV2,
@@ -74,6 +84,14 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
         DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskCancelV2,
+        DevelopmentTaskCreateV2,
+        DevelopmentTaskPresentationPageV2,
+        DevelopmentTaskPresentationV2,
+        DevelopmentProjectActivateV2,
+        DevelopmentProjectCreateV2,
+        DevelopmentProjectUpdateV2,
+        DevelopmentStateV2,
         DevelopmentTaskTimelinePageV2,
         DevelopmentWorkspaceDeleteV2,
         DevelopmentWorkspaceMutationV2,
@@ -144,7 +162,7 @@ class DevelopmentDaemonClient:
                     raise HTTPException(status_code=503, detail="development daemon response exceeds the bounded bridge limit")
                 payload = response.read(MAX_DEVELOPMENT_DAEMON_STATE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            if endpoint == self._endpoint and exc.code == 410 and path.startswith("/events?"):
+            if exc.code == 410 and path.startswith(("/events?", "/development/events?")):
                 raise DevelopmentDaemonEventCursorExpired from exc
             raise HTTPException(status_code=503, detail="development daemon is unavailable") from exc
         except OSError as exc:
@@ -284,6 +302,7 @@ class DevelopmentAgentDesktopV2Provider:
             "listDesktopTasksV2": self._tasks,
             "submitDesktopTaskV2": self._submit_task,
             "getDesktopTaskV2": self._task,
+            "cancelDesktopTaskV2": self._cancel_task,
             "getDesktopTaskTimelineV2": self._timeline,
             "getDesktopTaskLogsV2": self._logs,
             "getDesktopTaskContextV2": self._task_context,
@@ -306,9 +325,13 @@ class DevelopmentAgentDesktopV2Provider:
             now = time.monotonic()
             if not refresh and self._state_cache is not None and now < self._state_cache_deadline:
                 return self._state_cache
-        payload = self._client.request("/state")
-        if not isinstance(payload, dict) or payload.get("schema_version") != "1":
-            raise HTTPException(status_code=503, detail="development daemon returned an invalid state")
+        try:
+            validated = DevelopmentStateV2.model_validate(
+                self._client.request_v2("/development/state")
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=503, detail="development daemon returned an invalid v2 state") from exc
+        payload = validated.model_dump(mode="json")
         with self._state_lock:
             self._state_cache = payload
             self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
@@ -339,13 +362,15 @@ class DevelopmentAgentDesktopV2Provider:
         )
 
     def _health(self, _: Mapping[str, object]) -> m.DesktopHealthV2:
-        self._client.request("/state")
+        self._client.request_v2("/development/state")
         return m.DesktopHealthV2(status="ready", checked_at=_now())
 
     def _profile_model(self, state: Mapping[str, object]) -> m.RemoteWorkspaceProfileV2:
         active = state.get("active_project_id")
-        capabilities = self._client.request("/capabilities")
-        registry = capabilities.get("capabilities", {}).get("registry_digest", DIGEST) if isinstance(capabilities, dict) else DIGEST
+        capabilities = DevelopmentCapabilitiesV2.model_validate(
+            self._client.request_v2("/development/capabilities")
+        )
+        registry = capabilities.capabilities.get("registry_digest", DIGEST)
         updated_at = self._state_timestamp(state)
         profile_etag = f'"{_canonical_digest({"active_project_id": active, "registry": registry})}"'
         return m.RemoteWorkspaceProfileV2(
@@ -417,9 +442,10 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _project_models(self, state: Mapping[str, object]) -> list[core.ProjectV2]:
         result = []
+        observations = self._task_observations_v2()
         for raw in state.get("projects", []):
             config = core.ScienceProjectConfigV2.model_validate(raw["config"])
-            sessions = [item for item in state.get("sessions", []) if item["project_id"] == raw["project_id"] and item["state"] == "completed"]
+            sessions = [item for item in observations if item.project_id == raw["project_id"] and item.state == "closed"]
             result.append(core.ProjectV2(project_id=raw["project_id"], display_name=raw["display_name"], config=config,
                 project_config_sha256=core.project_config_sha256_for(config), active_project_head=self._head(raw["project_id"], config, len(sessions)),
                 admission_etag=ETAG, state="ready", created_at=raw["created_at"], updated_at=raw["updated_at"], etag=ETAG))
@@ -445,7 +471,16 @@ class DevelopmentAgentDesktopV2Provider:
     def _update_project(self, arguments: Mapping[str, object]) -> core.ProjectV2:
         project_id = str(arguments["project_id"])
         request = arguments["request"]
-        self._client.request(f"/projects/{project_id}", method="PUT", body={"schema_version": "1", "display_name": request.display_name, "config": request.config.model_dump(mode="json")})
+        mutation = DevelopmentProjectUpdateV2(
+            action_id=str(arguments["idempotency_key"]),
+            display_name=request.display_name,
+            config=request.config,
+        )
+        self._client.request_v2(
+            f"/development/projects/{quote(project_id, safe='')}",
+            method="PUT",
+            body=mutation.model_dump(mode="json"),
+        )
         self._invalidate_state()
         return self._find_project(project_id)
 
@@ -473,10 +508,17 @@ class DevelopmentAgentDesktopV2Provider:
         if action_id in self._actions:
             return self._operations[self._actions[action_id]]
         project_id = f"development-project-{_canonical_digest(action_id)[:12]}"
-        self._client.request("/projects", method="POST", body={
-            "schema_version": "1", "project_id": project_id,
-            "display_name": request.display_name, "config": request.config.model_dump(mode="json"),
-        })
+        creation = DevelopmentProjectCreateV2(
+            action_id=action_id,
+            project_id=project_id,
+            display_name=request.display_name,
+            config=request.config,
+        )
+        self._client.request_v2(
+            "/development/projects",
+            method="POST",
+            body=creation.model_dump(mode="json"),
+        )
         self._invalidate_state()
         return self._terminal_operation(kind="project_create", project_id=project_id, action_id=action_id)
 
@@ -486,21 +528,29 @@ class DevelopmentAgentDesktopV2Provider:
         action_id = str(arguments["idempotency_key"])
         if action_id in self._actions:
             return self._operations[self._actions[action_id]]
-        self._client.request(f"/projects/{project_id}/activate", method="POST", body={"schema_version": "1"})
+        activation = DevelopmentProjectActivateV2(action_id=action_id)
+        self._client.request_v2(
+            f"/development/projects/{quote(project_id, safe='')}/activate",
+            method="POST",
+            body=activation.model_dump(mode="json"),
+        )
         self._invalidate_state()
         return self._terminal_operation(kind="project_activate", project_id=project_id,
                                         action_id=action_id)
 
     def _operation(self, arguments: Mapping[str, object]) -> m.LifecycleOperationV2:
         operation = self._operations.get(str(arguments.get("operation_id")))
-        if operation is None: raise HTTPException(status_code=404, detail="operation not found")
+        if operation is None:
+            raise HTTPException(status_code=404, detail="operation not found")
         return operation
 
     def _operation_by_action(self, arguments: Mapping[str, object]) -> m.LifecycleOperationV2:
         operation_id = self._actions.get(str(arguments.get("action_id")))
-        if operation_id is None: raise HTTPException(status_code=404, detail="operation not found")
+        if operation_id is None:
+            raise HTTPException(status_code=404, detail="operation not found")
         operation = self._operations[operation_id]
-        if operation.kind != arguments.get("kind"): raise HTTPException(status_code=404, detail="operation not found")
+        if operation.kind != arguments.get("kind"):
+            raise HTTPException(status_code=404, detail="operation not found")
         return operation
 
     def _operation_logs(self, arguments: Mapping[str, object]) -> m.LifecycleLogPageV2:
@@ -512,25 +562,25 @@ class DevelopmentAgentDesktopV2Provider:
         self._operation(arguments)
         return Response(status_code=204)
 
-    def _task_model(self, raw: Mapping[str, object], project: core.ProjectV2, ordinal: int) -> core.TaskV2:
-        task_id = str(raw["session_id"])
+    def _task_model(self, observation: DevelopmentTaskObservationV2, project: core.ProjectV2, ordinal: int) -> core.TaskV2:
+        task_id = observation.task_id
         head = project.active_project_head
         assert head is not None
         admission_data = {"schema_version": "2", "task_admission_id": f"{project.project_id}-admission-{ordinal}",
             "task_id": task_id, "project_id": project.project_id, "predecessor_project_head": head.model_dump(mode="json"),
             "workspace_snapshot": head.workspace_snapshot.model_dump(mode="json"), "project_config_sha256": project.project_config_sha256,
             "task_envelope_sha256": _canonical_digest([task_id, "envelope"]), "normalized_evolution_intent_sha256": _canonical_digest([task_id, "evolution"]),
-            "registry_sha256": head.registry_sha256, "admitted_at": raw["created_at"]}
+            "registry_sha256": head.registry_sha256, "admitted_at": observation.created_at}
         admission_data["admission_sha256"] = _canonical_digest(admission_data)
         admission = core.TaskAdmissionRefV2.model_validate(admission_data)
         attempt_id = f"{task_id}-attempt-1"
-        state = "closed" if raw["state"] == "completed" else raw["state"]
+        state = observation.state
         return core.TaskV2(task_id=task_id, project_id=project.project_id, admission=admission,
             attempts=[{"schema_version": "2", "attempt_id": attempt_id, "ordinal": 1, "task_id": task_id,
                 "task_admission_id": admission.task_admission_id, "admission_sha256": admission.admission_sha256,
-                "project_id": project.project_id, "predecessor_project_head_id": head.project_head_id, "created_at": raw["created_at"]}],
+                "project_id": project.project_id, "predecessor_project_head_id": head.project_head_id, "created_at": observation.created_at}],
             authoritative_attempt_id=attempt_id, successor_transition=None, state=state,
-            created_at=raw["created_at"], updated_at=raw["updated_at"], etag=ETAG)
+            created_at=observation.created_at, updated_at=observation.updated_at, etag=ETAG)
 
     def _task_observations_v2(self) -> list[DevelopmentTaskObservationV2]:
         items: list[DevelopmentTaskObservationV2] = []
@@ -560,45 +610,103 @@ class DevelopmentAgentDesktopV2Provider:
             seen.add(page.next_cursor)
             after = page.next_cursor
 
-    def _all_tasks(self) -> tuple[dict[str, object], list[core.TaskV2]]:
-        state = self._remote_state(); projects = {p.project_id: p for p in self._project_models(state)}
+    def _all_tasks(self) -> list[core.TaskV2]:
+        state = self._remote_state()
+        projects = {p.project_id: p for p in self._project_models(state)}
         observations = self._task_observations_v2()
-        raw_by_id = {raw["session_id"]: raw for raw in state.get("sessions", [])}
         tasks = []
         for index, observation in enumerate(observations):
-            raw = raw_by_id.get(observation.task_id)
             project = projects.get(observation.project_id)
-            if raw is None or project is None:
-                raise HTTPException(status_code=503, detail="development daemon Task authority drifted across v1/v2 reads")
-            task = self._task_model(raw, project, index + 1)
-            tasks.append(task.model_copy(update={
-                "state": observation.state,
-                "created_at": observation.created_at,
-                "updated_at": observation.updated_at,
-            }))
-        return state, tasks
+            if project is None:
+                raise HTTPException(status_code=503, detail="development daemon Task references an unknown Project")
+            tasks.append(self._task_model(observation, project, index + 1))
+        return tasks
 
     def _tasks(self, arguments: Mapping[str, object]) -> core.TaskPageV2:
-        _, tasks = self._all_tasks(); project_id = arguments.get("project_id")
+        tasks = self._all_tasks()
+        project_id = arguments.get("project_id")
         return core.TaskPageV2(items=[t for t in tasks if project_id is None or t.project_id == project_id], next_cursor=None, has_more=False)
 
     def _task(self, arguments: Mapping[str, object]) -> core.TaskV2:
-        _, tasks = self._all_tasks()
+        tasks = self._all_tasks()
         for task in tasks:
-            if task.task_id == arguments.get("task_id"): return task
+            if task.task_id == arguments.get("task_id"):
+                return task
         raise HTTPException(status_code=404, detail="task not found")
 
     def _submit_task(self, arguments: Mapping[str, object]) -> core.TaskV2:
-        request = arguments["request"]; project = self._find_project(request.project_id)
-        payload = self._client.request("/sessions", method="POST", body={"schema_version": "1", "project_id": project.project_id,
-            "project_name": project.display_name, "task_title": project.config.task.title, "instruction": project.config.task.objective})
+        request = arguments["request"]
+        project = self._find_project(request.project_id)
+        creation = DevelopmentTaskCreateV2(
+            action_id=str(arguments["idempotency_key"]),
+            project_id=project.project_id,
+            project_name=project.display_name,
+            task_title=project.config.task.title,
+            instruction=project.config.task.objective,
+        )
+        try:
+            presentation = DevelopmentTaskPresentationV2.model_validate(
+                self._client.request_v2(
+                    "/development/tasks",
+                    method="POST",
+                    body=creation.model_dump(mode="json"),
+                )
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=503, detail="development daemon returned invalid v2 Task creation") from exc
+        if presentation.project_id != project.project_id:
+            raise HTTPException(status_code=503, detail="development daemon Task creation crossed Project authority")
         self._invalidate_state()
-        return self._task({"task_id": payload["session_id"]})
+        return self._task({"task_id": presentation.task_id})
 
-    def _raw_task(self, task_id: object) -> Mapping[str, object]:
-        for raw in self._remote_state().get("sessions", []):
-            if raw["session_id"] == task_id: return raw
-        raise HTTPException(status_code=404, detail="task not found")
+    def _cancel_task(self, arguments: Mapping[str, object]) -> core.OperationV2:
+        task_id = str(arguments["task_id"])
+        request = arguments["request"]
+        task = self._task({"task_id": task_id})
+        if (
+            request.task_admission_id != task.admission.task_admission_id
+            or request.admission_sha256 != task.admission.admission_sha256
+            or request.predecessor_project_head_id
+            != task.admission.predecessor_project_head.project_head_id
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Task cancellation authority no longer matches the daemon Task",
+            )
+        action_id = str(arguments["idempotency_key"])
+        try:
+            presentation = DevelopmentTaskPresentationV2.model_validate(
+                self._client.request_v2(
+                    f"/development/tasks/{quote(task_id, safe='')}/cancel",
+                    method="POST",
+                    body=DevelopmentTaskCancelV2(
+                        action_id=action_id,
+                    ).model_dump(mode="json"),
+                )
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid v2 Task cancellation",
+            ) from exc
+        if presentation.task_id != task_id or presentation.project_id != task.project_id:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon Task cancellation crossed Task authority",
+            )
+        self._invalidate_state()
+        timestamp = presentation.updated_at
+        return core.OperationV2(
+            operation_id=f"development-task-cancel-{_canonical_digest(action_id)[:16]}",
+            kind="attempt_cancel",
+            status="succeeded",
+            progress_completed=1,
+            progress_total=1,
+            error=None,
+            created_at=timestamp,
+            updated_at=timestamp,
+            etag=ETAG,
+        )
 
     def _timeline(self, arguments: Mapping[str, object]) -> core.TimelinePageV2:
         task_id = str(arguments.get("task_id"))
@@ -734,8 +842,11 @@ class DevelopmentAgentDesktopV2Provider:
                                          "status": "ready", "updated_at": _now(), "etag": ETAG}], next_cursor=None, has_more=False)
 
     def _capabilities(self, arguments: Mapping[str, object]) -> m.ProjectCapabilityProjectionV2:
-        project = self._find_project(arguments.get("project_id")); payload = self._client.request("/capabilities")
-        capabilities = payload["capabilities"]
+        project = self._find_project(arguments.get("project_id"))
+        payload = DevelopmentCapabilitiesV2.model_validate(
+            self._client.request_v2("/development/capabilities")
+        )
+        capabilities = payload.capabilities
         return m.ProjectCapabilityProjectionV2(project_id=project.project_id, execution_mode=project.config.execution.mode,
             registry_sha256=capabilities["registry_digest"], capabilities_sha256=m.evolution_capabilities_sha256_for(capabilities),
             capabilities=capabilities, fetched_at=_now())
@@ -790,14 +901,16 @@ class DevelopmentAgentStateEventRelay:
         if type(wait) is not int or not 0 <= wait <= 10_000:
             raise ValueError("development event wait is outside the supported bound")
         if self._daemon_sequence is None:
-            page = self._event_page(self._client.request("/events?limit=100"))
+            page = self._event_page(
+                self._client.request_v2("/development/events?limit=100")
+            )
             self._daemon_sequence = page["latest_sequence"]
             self._refresh_state()
             return False
         try:
             page = self._event_page(
-                self._client.request(
-                    f"/events?after={self._daemon_sequence}&limit=100&wait_ms={wait}"
+                self._client.request_v2(
+                    f"/development/events?after={self._daemon_sequence}&limit=100&wait_ms={wait}"
                 )
             )
         except DevelopmentDaemonEventCursorExpired:
@@ -829,16 +942,14 @@ class DevelopmentAgentStateEventRelay:
         return bool(events)
 
     def _refresh_state(self) -> dict[str, object]:
-        payload = self._client.request("/state")
-        if not isinstance(payload, dict) or payload.get("schema_version") != "1":
-            raise RuntimeError("development daemon returned an invalid state snapshot")
-        self._provider.observe_remote_state(payload)
-        return payload
+        return self._provider._remote_state(refresh=True)
 
     def _resynchronize_after_gap(self) -> bool:
         previous_sequence = self._daemon_sequence
         self._daemon_sequence = None
-        page = self._event_page(self._client.request("/events?limit=100"))
+        page = self._event_page(
+            self._client.request_v2("/development/events?limit=100")
+        )
         self._daemon_sequence = page["latest_sequence"]
         state = self._refresh_state()
         active_project_id = state.get("active_project_id")
@@ -867,7 +978,7 @@ class DevelopmentAgentStateEventRelay:
             "has_more",
         }:
             raise RuntimeError("development daemon returned an invalid event page")
-        if payload.get("schema_version") != "1":
+        if payload.get("schema_version") != "2":
             raise RuntimeError("development daemon returned an incompatible event page")
         events = payload.get("events")
         latest_sequence = payload.get("latest_sequence")
@@ -906,7 +1017,7 @@ class DevelopmentAgentStateEventRelay:
                 raise RuntimeError("development daemon event timestamp is invalid")
             normalized.append(event)
         return {
-            "schema_version": "1",
+            "schema_version": "2",
             "events": normalized,
             "latest_sequence": latest_sequence,
             "has_more": has_more,
@@ -964,6 +1075,109 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
     @app.on_event("shutdown")
     async def stop_development_event_relay() -> None:
         event_relay.stop()
+
+    @app.get(
+        "/desktop/v2/development/presentation-state",
+        include_in_schema=False,
+    )
+    async def development_presentation_state() -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            "development/state", query="", method="GET", body=b"", content_type=None
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentStateV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid v2 presentation state",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/capabilities",
+        include_in_schema=False,
+    )
+    async def development_capabilities() -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            "development/capabilities",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentCapabilitiesV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid v2 capabilities",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/task-presentations",
+        include_in_schema=False,
+    )
+    async def development_task_presentations(request: Request) -> Response:
+        project_id = request.query_params.get("project_id")
+        if project_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Task presentation inventory requires project_id",
+            )
+        provider._find_project(project_id)
+        status, payload, headers = provider._client.proxy_v2(
+            "development/tasks",
+            query=request.url.query,
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentTaskPresentationPageV2.model_validate_json(payload)
+                if any(item.project_id != project_id for item in validated.items):
+                    raise ValueError("Task presentation inventory crossed Project authority")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid Task presentations",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/task-presentations/{task_id}",
+        include_in_schema=False,
+    )
+    async def development_task_presentation(task_id: str) -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/tasks/{quote(task_id, safe='')}",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentTaskPresentationV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid Task presentation",
+                ) from exc
+            provider._find_project(validated.project_id)
+            if validated.task_id != task_id:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned inconsistent Task authority",
+                )
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
 
     @app.get(
         "/desktop/v2/development/projects/{project_id}/workspace",

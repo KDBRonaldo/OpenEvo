@@ -179,11 +179,13 @@ is discarded after the turn, while the authoritative artifacts and user workspac
 remain persisted on the remote server. Only method outputs marked promoted participate
 in the next Session; candidate/report outputs remain visible without being injected. This
 development materializer is still explicitly unverified and does not claim the sealed
-release artifact-store contract. The renderer
-reloads that authority from `GET /openevo-dev-agent/v1/state`, so a browser
-refresh preserves Project, conversation, selection, and evolution history. This bridge is
-reachable only in Vite mode `openevo-live-agent` and is not imported by the
-packaged release entrypoint.
+release artifact-store contract. The explicit `dev:agent` compatibility renderer reloads that
+authority from `GET /openevo-dev-agent/v1/state`. The self-hosted formal WebUI does not: it loads
+bounded Project, Task, presentation, Workspace, Artifact, Evolution, capability, and event
+authority through Desktop-session authenticated `/desktop/v2/*`, which the Web Layer forwards
+to daemon `/v2/*`. Both paths preserve remote history across refresh, but only the latter is the
+incremental formal communication chain. Neither bridge is imported by the packaged release
+entrypoint.
 
 Each development Project also owns a persistent scratch workspace at
 `~/.openevo/dev-agent/workspaces/<project-id>/`. A new Project starts with an
@@ -567,14 +569,14 @@ same ownership boundary as release responses.
 
 ## Real-agent development Session lifecycle
 
-The loopback development bridge admits `POST /openevo-dev-agent/v1/sessions`
-asynchronously. It returns HTTP 202 with a durable `session_id`; Codex runs on a
-daemon-owned background thread and completion seals its transcript dataset without
-running Evolution. The
-Desktop provider refreshes the persisted remote state while a Session is
-`running` or `cancelling`, so transcript, logs, workspace changes, failures and
-terminal status survive renderer refreshes. A running Session can be cancelled
-through `POST /openevo-dev-agent/v1/sessions/<id>/cancel`.
+The direct `dev:agent` compatibility bridge still admits
+`POST /openevo-dev-agent/v1/sessions`. In the self-hosted formal WebUI, the unchanged renderer
+submits and cancels through the canonical Desktop v2 API; the Web Layer validates the pinned Task
+authority and forwards action-ID-bound mutations to daemon `/v2/development/tasks*`. Codex runs
+on a daemon-owned background thread and completion seals its transcript dataset without running
+Evolution. Status, transcript presentation, durable logs, workspace changes, failures, and
+terminal state are reloaded from bounded daemon v2 authorities, so they survive renderer and
+Web Layer refreshes.
 
 `POST /openevo-dev-agent/v1/evolution-runs` admits a separate durable Evolution Run
 against an explicit set of completed Session IDs and method selections. Every selected

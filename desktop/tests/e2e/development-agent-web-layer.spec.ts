@@ -135,6 +135,9 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(detail).toBeVisible({ timeout: 120_000 });
     await expect(detail.locator(".session-inspector-heading .state-pill")).toHaveText("closed");
     await expect(detail.getByLabel("Agent")).toContainText(RESULT_MARKER);
+    expect(observedRequests).toContain("GET /desktop/v2/development/task-presentations");
+    expect(observedRequests.some((request) => request.includes("/openevo-dev-agent/v1/")))
+      .toBe(false);
     await assertNoProductErrors(page);
   });
 

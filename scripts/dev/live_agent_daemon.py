@@ -55,6 +55,7 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentCapabilitiesV2,
         DevelopmentEvolutionJobPageV2,
         DevelopmentEvolutionJobRetryV2,
         DevelopmentEvolutionJobV2,
@@ -64,6 +65,15 @@ try:  # package import in tests; direct import when launched as a script
         DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskCancelV2,
+        DevelopmentTaskCreateV2,
+        DevelopmentTaskPresentationPageV2,
+        DevelopmentTaskPresentationV2,
+        DevelopmentProjectActivateV2,
+        DevelopmentProjectAuthorityV2,
+        DevelopmentProjectCreateV2,
+        DevelopmentProjectUpdateV2,
+        DevelopmentStateV2,
         DevelopmentTaskTimelinePageV2,
         DevelopmentWorkspaceDeleteV2,
         DevelopmentWorkspaceMutationV2,
@@ -73,6 +83,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launch
     from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentCapabilitiesV2,
         DevelopmentEvolutionJobPageV2,
         DevelopmentEvolutionJobRetryV2,
         DevelopmentEvolutionJobV2,
@@ -82,6 +93,15 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launch
         DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
+        DevelopmentTaskCancelV2,
+        DevelopmentTaskCreateV2,
+        DevelopmentTaskPresentationPageV2,
+        DevelopmentTaskPresentationV2,
+        DevelopmentProjectActivateV2,
+        DevelopmentProjectAuthorityV2,
+        DevelopmentProjectCreateV2,
+        DevelopmentProjectUpdateV2,
+        DevelopmentStateV2,
         DevelopmentTaskTimelinePageV2,
         DevelopmentWorkspaceDeleteV2,
         DevelopmentWorkspaceMutationV2,
@@ -137,11 +157,28 @@ WORKSPACE_FILES_PATH_PATTERN = re.compile(
     r"^/openevo-dev-agent/v1/projects/([^/]+)/workspace/files$"
 )
 DEVELOPMENT_EVENTS_PATH = "/openevo-dev-agent/v1/events"
+DAEMON_V2_DEVELOPMENT_EVENTS_PATH = "/v2/development/events"
 DAEMON_V2_TASKS_PATH = "/v2/tasks"
 DAEMON_V2_TASK_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)$")
 DAEMON_V2_TASK_LOGS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/logs$")
 DAEMON_V2_TASK_TIMELINE_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/timeline$")
 DAEMON_V2_TASK_ARTIFACTS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/artifacts$")
+DAEMON_V2_DEVELOPMENT_TASKS_PATH = "/v2/development/tasks"
+DAEMON_V2_DEVELOPMENT_TASK_PATH_PATTERN = re.compile(
+    r"^/v2/development/tasks/([^/]+)$"
+)
+DAEMON_V2_DEVELOPMENT_TASK_CANCEL_PATH_PATTERN = re.compile(
+    r"^/v2/development/tasks/([^/]+)/cancel$"
+)
+DAEMON_V2_DEVELOPMENT_STATE_PATH = "/v2/development/state"
+DAEMON_V2_DEVELOPMENT_CAPABILITIES_PATH = "/v2/development/capabilities"
+DAEMON_V2_DEVELOPMENT_PROJECTS_PATH = "/v2/development/projects"
+DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN = re.compile(
+    r"^/v2/development/projects/([^/]+)$"
+)
+DAEMON_V2_DEVELOPMENT_PROJECT_ACTIVATE_PATH_PATTERN = re.compile(
+    r"^/v2/development/projects/([^/]+)/activate$"
+)
 DAEMON_V2_ARTIFACT_CONTENT_PATH_PATTERN = re.compile(
     r"^/v2/artifacts/([^/]+)/content$"
 )
@@ -177,6 +214,7 @@ MAX_DAEMON_V2_ARTIFACT_PAGE = 100
 MAX_DAEMON_V2_DEVELOPMENT_ARTIFACT_PAGE = 5
 MAX_DAEMON_V2_EVOLUTION_RUN_PAGE = 25
 MAX_DAEMON_V2_EVOLUTION_JOB_PAGE = 25
+MAX_DAEMON_V2_TASK_PRESENTATION_PAGE = 25
 MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
@@ -1882,6 +1920,32 @@ class DevelopmentStateStore:
             ],
         }
 
+    def state_v2(self) -> DevelopmentStateV2:
+        with self._lock, self._connection() as connection:
+            projects = [
+                DevelopmentProjectAuthorityV2(
+                    project_id=row["project_id"],
+                    display_name=row["display_name"],
+                    config=json.loads(row["config_json"]),
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+                for row in connection.execute(
+                    "SELECT * FROM development_projects ORDER BY created_at, project_id"
+                )
+            ]
+            active_row = connection.execute(
+                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
+            ).fetchone()
+        project_ids = {project.project_id for project in projects}
+        active_project_id = active_row["value"] if active_row else None
+        if active_project_id not in project_ids:
+            active_project_id = projects[-1].project_id if projects else None
+        return DevelopmentStateV2(
+            active_project_id=active_project_id,
+            projects=projects,
+        )
+
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
         with self._lock, self._connection() as connection:
@@ -1897,7 +1961,24 @@ class DevelopmentStateStore:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
-                raise StateConflictError("project_id already exists") from exc
+                existing = connection.execute(
+                    "SELECT * FROM development_projects WHERE project_id = ?",
+                    (request["project_id"],),
+                ).fetchone()
+                if (
+                    existing is None
+                    or existing["display_name"] != request["display_name"]
+                    or json.loads(existing["config_json"]) != request["config"]
+                ):
+                    raise StateConflictError("project_id already exists") from exc
+                self._set_active(connection, request["project_id"])
+                return {
+                    "project_id": existing["project_id"],
+                    "display_name": existing["display_name"],
+                    "config": json.loads(existing["config_json"]),
+                    "created_at": existing["created_at"],
+                    "updated_at": existing["updated_at"],
+                }
             self._set_active(connection, request["project_id"])
         self.workspaces.ensure_project(request["project_id"])
         return {**request, "created_at": now, "updated_at": now}
@@ -2418,6 +2499,73 @@ class DevelopmentStateStore:
         if row is None:
             raise KeyError(task_id)
         return self._task_observation_v2(row)
+
+    def task_presentations_v2(
+        self,
+        *,
+        project_id: str,
+        after_task_id: str | None = None,
+        limit: int = MAX_DAEMON_V2_TASK_PRESENTATION_PAGE,
+    ) -> DevelopmentTaskPresentationPageV2:
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
+            ).fetchone() is None:
+                raise KeyError(project_id)
+            rows = connection.execute(
+                "SELECT * FROM development_sessions WHERE project_id = ? "
+                "ORDER BY created_at, session_id",
+                (project_id,),
+            ).fetchall()
+            evidence_ids = {
+                row["session_id"]
+                for row in connection.execute(
+                    "SELECT session_id FROM development_dataset_artifacts "
+                    "WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            }
+        presentations = [
+            self._task_presentation_v2(
+                row,
+                evolution_evidence_ready=row["session_id"] in evidence_ids,
+            )
+            for row in rows
+        ]
+        start = 0
+        if after_task_id is not None:
+            try:
+                start = next(
+                    index + 1
+                    for index, item in enumerate(presentations)
+                    if item.task_id == after_task_id
+                )
+            except StopIteration as exc:
+                raise RequestError(
+                    "Task presentation cursor is not part of this project"
+                ) from exc
+        page = presentations[start : start + limit]
+        has_more = start + len(page) < len(presentations)
+        return DevelopmentTaskPresentationPageV2(
+            items=page,
+            next_cursor=page[-1].task_id if has_more and page else None,
+            has_more=has_more,
+        )
+
+    def task_presentation_v2(self, task_id: str) -> DevelopmentTaskPresentationV2:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_sessions WHERE session_id = ?", (task_id,)
+            ).fetchone()
+            evidence_ready = connection.execute(
+                "SELECT 1 FROM development_dataset_artifacts WHERE session_id = ?",
+                (task_id,),
+            ).fetchone() is not None
+        if row is None:
+            raise KeyError(task_id)
+        return self._task_presentation_v2(
+            row, evolution_evidence_ready=evidence_ready
+        )
 
     def task_logs_v2(
         self,
@@ -3686,6 +3834,51 @@ class DevelopmentStateStore:
         )
 
     @staticmethod
+    def _task_presentation_v2(
+        row: sqlite3.Row,
+        *,
+        evolution_evidence_ready: bool,
+    ) -> DevelopmentTaskPresentationV2:
+        record = DevelopmentStateStore._session_record(
+            row, evolution_evidence_ready=evolution_evidence_ready
+        )
+        return DevelopmentTaskPresentationV2.model_validate({
+            "schema_version": "2",
+            "task_id": record["session_id"],
+            "project_id": record["project_id"],
+            "task_title": record["task_title"],
+            "instruction": record["instruction"],
+            "response": record["response"],
+            "model": record["model"],
+            "state": record["state"],
+            "duration_ms": record["duration_ms"],
+            "selected_evolution": [
+                {"schema_version": "2", **selection}
+                for selection in record["selected_evolution"]
+            ],
+            "evolution_errors": [
+                {"schema_version": "2", **error}
+                for error in record["evolution_errors"]
+            ],
+            "workspace_changes": [
+                {
+                    "schema_version": "2",
+                    **change,
+                    "diff_lines": [
+                        {"schema_version": "2", **line}
+                        for line in change.get("diff_lines", [])
+                    ],
+                }
+                for change in record["workspace_changes"]
+            ],
+            "context_artifact_ids": record["context_artifact_ids"],
+            "evolution_evidence_ready": record["evolution_evidence_ready"],
+            "error": record["error"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        })
+
+    @staticmethod
     def _artifact_record(row: sqlite3.Row) -> dict[str, Any]:
         documents = json.loads(row["documents_json"])
         primary = documents[0] if documents else None
@@ -4913,10 +5106,33 @@ class DevelopmentSessionCoordinator:
         self._executions_lock = threading.Lock()
         self._executions: dict[str, HarnessCancellation] = {}
 
-    def submit(self, request: dict[str, str]) -> str:
+    def submit(
+        self, request: dict[str, str], *, session_id: str | None = None
+    ) -> str:
+        if session_id is not None:
+            try:
+                existing = self._store.get_session(session_id)
+            except KeyError:
+                pass
+            else:
+                expected = (
+                    request["project_id"],
+                    request["task_title"],
+                    request["instruction"],
+                )
+                actual = (
+                    existing["project_id"],
+                    existing["task_title"],
+                    existing["instruction"],
+                )
+                if actual != expected:
+                    raise StateConflictError(
+                        "Task action_id is already bound to another request"
+                    )
+                return session_id
         if not self._turn_lock.acquire(blocking=False):
             raise StateConflictError("another development session is running")
-        session_id = f"dev-session-{secrets.token_hex(8)}"
+        session_id = session_id or f"dev-session-{secrets.token_hex(8)}"
         try:
             self._store.start_session(session_id, request)
         except Exception:
@@ -5586,6 +5802,63 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, run.model_dump(mode="json"))
             return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_TASKS_PATH:
+            try:
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"project_id", "after", "limit"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError(
+                        "Task presentation query contains unsupported parameters"
+                    )
+                project_id = parameters.get("project_id", [None])[0]
+                if project_id is None or not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is required and must be valid")
+                after = parameters.get("after", [None])[0]
+                if after == "":
+                    raise RequestError("Task presentation cursor cannot be empty")
+                limit_raw = parameters.get(
+                    "limit", [str(MAX_DAEMON_V2_TASK_PRESENTATION_PAGE)]
+                )[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("Task presentation limit must be an integer")
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_TASK_PRESENTATION_PAGE:
+                    raise RequestError(
+                        "Task presentation limit is outside the supported bound"
+                    )
+                page = self.server.store.task_presentations_v2(
+                    project_id=project_id,
+                    after_task_id=after,
+                    limit=limit,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "project not found"
+                )
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        presentation_match = DAEMON_V2_DEVELOPMENT_TASK_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if presentation_match:
+            task_id = presentation_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(task_id):
+                    raise RequestError("task_id is invalid")
+                presentation = self.server.store.task_presentation_v2(task_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "task not found")
+            else:
+                self._json(HTTPStatus.OK, presentation.model_dump(mode="json"))
+            return
         task_match = DAEMON_V2_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
         if task_match:
             task_id = task_match.group(1)
@@ -5697,10 +5970,66 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if self.path == "/openevo-dev-agent/health":
             self._json(HTTPStatus.OK, {"schema_version": "1", "status": "ready"})
             return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_STATE_PATH:
+            self._json(
+                HTTPStatus.OK,
+                self.server.store.state_v2().model_dump(mode="json"),
+            )
+            return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_CAPABILITIES_PATH:
+            if self.server.evolution_runner is None:
+                self._json_error_v2(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "capabilities_unavailable",
+                    "development evolution runner is unavailable",
+                )
+            else:
+                legacy = self.server.evolution_runner.capabilities()
+                response = DevelopmentCapabilitiesV2(
+                    authority="development_catalog_unverified",
+                    capabilities=legacy["capabilities"],
+                )
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_PROJECTS_PATH:
+            state = self.server.store.state_v2()
+            self._json(
+                HTTPStatus.OK,
+                {
+                    "schema_version": "2",
+                    "items": [item.model_dump(mode="json") for item in state.projects],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+            return
+        project_v2_match = DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if project_v2_match:
+            project_id = project_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                project = self.server.store.project(project_id)
+                response = DevelopmentProjectAuthorityV2.model_validate({
+                    "schema_version": "2",
+                    **project,
+                })
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
         if self.path == "/openevo-dev-agent/v1/state":
             self._json(HTTPStatus.OK, self.server.store.snapshot())
             return
-        if parsed_path.path == DEVELOPMENT_EVENTS_PATH:
+        if parsed_path.path in {
+            DEVELOPMENT_EVENTS_PATH,
+            DAEMON_V2_DEVELOPMENT_EVENTS_PATH,
+        }:
             try:
                 parameters = parse_qs(
                     parsed_path.query,
@@ -5735,6 +6064,8 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                     limit=limit,
                     wait_seconds=wait_ms / 1000,
                 )
+                if parsed_path.path == DAEMON_V2_DEVELOPMENT_EVENTS_PATH:
+                    result = {**result, "schema_version": "2"}
             except (RequestError, ValueError) as exc:
                 self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
             except EventCursorExpiredError as exc:
@@ -5772,6 +6103,94 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
+            return
+        if self.path == DAEMON_V2_DEVELOPMENT_PROJECTS_PATH:
+            try:
+                request = DevelopmentProjectCreateV2.model_validate(self._read_json())
+                project = self.server.store.create_project({
+                    "project_id": request.project_id,
+                    "display_name": request.display_name,
+                    "config": request.config.model_dump(mode="json"),
+                })
+                response = DevelopmentProjectAuthorityV2.model_validate({
+                    "schema_version": "2", **project
+                })
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.CREATED, response.model_dump(mode="json"))
+            return
+        activate_project_v2_match = (
+            DAEMON_V2_DEVELOPMENT_PROJECT_ACTIVATE_PATH_PATTERN.fullmatch(self.path)
+        )
+        if activate_project_v2_match:
+            project_id = activate_project_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                DevelopmentProjectActivateV2.model_validate(self._read_json())
+                self.server.store.activate_project(project_id)
+                project = self.server.store.project(project_id)
+                response = DevelopmentProjectAuthorityV2.model_validate({
+                    "schema_version": "2", **project
+                })
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
+        if self.path == DAEMON_V2_DEVELOPMENT_TASKS_PATH:
+            try:
+                request = DevelopmentTaskCreateV2.model_validate(self._read_json())
+                task_id = f"dev-session-{hashlib.sha256(request.action_id.encode('utf-8')).hexdigest()[:16]}"
+                self.server.sessions.submit(
+                    {
+                        "project_id": request.project_id,
+                        "project_name": request.project_name,
+                        "task_title": request.task_title,
+                        "instruction": request.instruction,
+                    },
+                    session_id=task_id,
+                )
+                response = self.server.store.task_presentation_v2(task_id)
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "project not found"
+                )
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
+            return
+        cancel_task_v2_match = (
+            DAEMON_V2_DEVELOPMENT_TASK_CANCEL_PATH_PATTERN.fullmatch(self.path)
+        )
+        if cancel_task_v2_match:
+            task_id = cancel_task_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(task_id):
+                    raise RequestError("task_id is invalid")
+                DevelopmentTaskCancelV2.model_validate(self._read_json())
+                self.server.sessions.cancel(task_id)
+                response = self.server.store.task_presentation_v2(task_id)
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "task not found")
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
             return
         if self.path == DAEMON_V2_DEVELOPMENT_EVOLUTION_RUNS_PATH:
             try:
@@ -5993,6 +6412,36 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed_path = urlsplit(self.path)
+        project_v2_match = DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if project_v2_match:
+            project_id = project_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                request = DevelopmentProjectUpdateV2.model_validate(self._read_json())
+                project = self.server.store.update_project(
+                    project_id,
+                    {
+                        "display_name": request.display_name,
+                        "config": request.config.model_dump(mode="json"),
+                    },
+                )
+                response = DevelopmentProjectAuthorityV2.model_validate({
+                    "schema_version": "2", **project
+                })
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
         workspace_v2_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(
             parsed_path.path
         )

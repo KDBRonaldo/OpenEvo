@@ -87,6 +87,8 @@ export async function createSelfHostedFormalProvider(
     artifactV2BaseUrl: "/desktop/v2/development/artifacts",
     evolutionV2BaseUrl: "/desktop/v2/development/evolution-runs",
     evolutionJobV2BaseUrl: "/desktop/v2/development/evolution-jobs",
+    taskPresentationV2BaseUrl: "/desktop/v2/development/task-presentations",
+    presentationV2BaseUrl: "/desktop/v2/development",
     desktopSessionToken: bootstrap.session_token,
   });
   return combineSelfHostedProviders(formal, presentation);
@@ -108,15 +110,10 @@ export function combineSelfHostedProviders(
     if (formalResult.status !== "fresh") return formalResult;
     if (presentationResult.status !== "fresh") return presentationResult;
     const compatibilityPresentation = presentationResult.snapshot.runtimePresentation;
-    const formalTaskIds = new Set(formalResult.snapshot.tasks.map((task) => task.task_id));
-    const tasks = Object.fromEntries(Object.entries(compatibilityPresentation?.tasks ?? {}).map(
-      ([taskId, task]) => [taskId, formalTaskIds.has(taskId) ? { ...task, transcript: [] } : task],
-    ));
     const snapshot: DesktopProductSnapshotV2 = {
       ...formalResult.snapshot,
       runtimePresentation: compatibilityPresentation === undefined ? undefined : {
         ...compatibilityPresentation,
-        tasks,
       },
     };
     return { status: "fresh", snapshot };

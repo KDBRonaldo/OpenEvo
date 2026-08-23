@@ -62,6 +62,46 @@ def test_validate_request_rejects_non_contract_input(change: dict[str, str]) -> 
         MODULE.validate_request(payload)
 
 
+def test_task_presentation_v2_is_paginated_and_restart_safe(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    project_id = "development-project-presentations"
+    task_id = "development-task-presentation-1"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": project_id,
+        "display_name": "Presentation project",
+        "config": {},
+    })
+    store.start_session(task_id, {
+        "project_id": project_id,
+        "project_name": "Presentation project",
+        "task_title": "Read the answer",
+        "instruction": "Reply with the durable answer.",
+    })
+    store.complete_session(task_id, {
+        "response": "The durable answer.",
+        "model": "codex-test",
+        "duration_ms": 12,
+        "logs": ["Harness completed."],
+        "workspace_changes": [],
+        "runtime_activation": None,
+    })
+
+    page = MODULE.DevelopmentStateStore(database).task_presentations_v2(
+        project_id=project_id, limit=25
+    )
+
+    assert page.has_more is False
+    assert page.next_cursor is None
+    assert len(page.items) == 1
+    presentation = page.items[0]
+    assert presentation.task_id == task_id
+    assert presentation.instruction == "Reply with the durable answer."
+    assert presentation.response == "The durable answer."
+    assert presentation.state == "completed"
+    assert presentation.model_dump(mode="json")["schema_version"] == "2"
+
+
 def test_extract_event_logs_ignores_agent_message_content() -> None:
     stdout = "\n".join(
         [

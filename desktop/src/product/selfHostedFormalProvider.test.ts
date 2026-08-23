@@ -48,12 +48,7 @@ describe("self-hosted formal provider", () => {
     expect(result.status).toBe("fresh");
     if (result.status !== "fresh") throw new Error("expected a fresh snapshot");
     expect(result.snapshot.state.active_project_id).toBe("formal-project");
-    expect(result.snapshot.runtimePresentation).toEqual({
-      ...runtimePresentation,
-      tasks: {
-        "task-1": { ...runtimePresentation.tasks["task-1"], transcript: [] },
-      },
-    });
+    expect(result.snapshot.runtimePresentation).toEqual(runtimePresentation);
   });
 
   it("routes project and task mutations formally but standalone Evolution explicitly to the proven bridge", async () => {

@@ -39,6 +39,15 @@ inventory, detail, ordered Attempts, bounded logs, and retry likewise use
 `/v2/development/evolution-jobs*`. Retry binds its action ID to exactly one Attempt, so an
 ambiguous browser retry returns that Attempt instead of executing the method twice.
 
+Session presentation is now a separate daemon-owned v2 projection. The browser loads bounded,
+paginated instructions, terminal agent responses, evidence readiness, context identities, and
+workspace changes through `/desktop/v2/development/task-presentations*`; it does not read
+`sessions` embedded in the legacy state snapshot. Project/active state, project mutations,
+capabilities, and the Web Layer event relay likewise use `/v2/development/*` daemon routes.
+Submitting and cancelling a Session are also v2 mutations: the Desktop contract is terminated at
+the Web Layer, which validates the pinned Task authority and forwards an action-ID-bound request to
+`/v2/development/tasks*`. The renderer never calls the daemon or the legacy Session API directly.
+
 ## Start command
 
 From `desktop/`:
@@ -107,6 +116,9 @@ payloads; the self-hosted provider ignores Evolution Runs embedded in v1 state.
 Evolution Job list/detail/Attempt history/logs and retry also use closed daemon-owned v2 payloads;
 the self-hosted provider ignores Evolution Jobs embedded in v1 state. The direct development
 provider keeps v1 only as an explicit compatibility fallback.
+The self-hosted provider also ignores Sessions embedded in v1 state. Its Project list and
+capability catalog are loaded through the Desktop-session authenticated development v2 surface,
+while the formal Desktop provider remains authoritative for Project and Task control models.
 
 The web layer converts remote development state to closed Desktop/Core v2 response models.
 It maps the development-only `report` artifact type to renderer-safe `diagnostic`; it does

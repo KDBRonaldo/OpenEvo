@@ -123,11 +123,17 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `/desktop/v2/development/evolution-jobs*`: development-only, Desktop-session authenticated
   list/detail/retry operations. The daemon owns ordered Attempt history and bounded logs; an
   action ID is durably bound to one retry Attempt and exact repeats are idempotent.
-- `/openevo-dev-agent/v1/events`: authenticated development-daemon long poll used only by the
+- `/desktop/v2/development/presentation-state`, `/capabilities`, and
+  `/task-presentations*`: Desktop-session authenticated, closed v2 projections for the unchanged
+  renderer. Session transcript/result presentation is paginated and remains separate from
+  standalone Evolution. Session submit/cancel actions are validated by the formal Desktop provider
+  and forwarded to the daemon's `/v2/development/tasks*` mutations.
+- Remote daemon `/v2/development/events`: authenticated development-daemon long poll used only by the
   Web Layer. An omitted cursor establishes the current daemon sequence; `after=<sequence>` returns
   contiguous committed events and `410 event_cursor_expired` forces snapshot resynchronization.
 - `/openevo-dev-agent/v1/*`: authenticated development-only transcript compatibility surface;
-  it no longer owns Project, Task, Workspace browser mutations, Workspace
+  it is no longer used by the self-hosted formal browser chain. It remains only for the explicit
+  direct-development compatibility provider and no longer owns Project, Task, Workspace browser mutations, Workspace
   reads, Artifact reads, standalone Evolution Run actions/reads, or the terminal Session response.
 - Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, `/v2/tasks/{task_id}/timeline`, and
   `/v2/tasks/{task_id}/logs`: bounded, bearer-authenticated Task status, durable timeline,

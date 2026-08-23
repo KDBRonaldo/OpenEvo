@@ -838,6 +838,32 @@ describe("development agent provider", () => {
         expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
         return jsonResponse({ schema_version: "2", items: jobs, next_cursor: null, has_more: false });
       }
+      if (url.includes("/desktop/v2/development/task-presentations?")) {
+        return jsonResponse({
+          schema_version: "2",
+          items: [{
+            schema_version: "2",
+            task_id: taskId,
+            project_id: projectId,
+            task_title: "Retry a method",
+            instruction: "Produce reusable context.",
+            response: "Authoritative v2 transcript.",
+            model: "test",
+            state: "completed",
+            duration_ms: 1,
+            selected_evolution: [],
+            evolution_errors: [],
+            workspace_changes: [],
+            context_artifact_ids: [],
+            evolution_evidence_ready: true,
+            error: null,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:01Z",
+          }],
+          next_cursor: null,
+          has_more: false,
+        });
+      }
       if (url.endsWith(`/desktop/v2/development/evolution-jobs/${jobId}/retry`)) {
         const request = JSON.parse(String(init?.body)) as { action_id: string };
         const current = jobs[0]!;
@@ -870,6 +896,7 @@ describe("development agent provider", () => {
     const provider = createDevelopmentAgentProvider({
       fetchImpl,
       evolutionJobV2BaseUrl: "/desktop/v2/development/evolution-jobs",
+      taskPresentationV2BaseUrl: "/desktop/v2/development/task-presentations",
       desktopSessionToken: "session-secret",
     });
 
@@ -879,6 +906,10 @@ describe("development agent provider", () => {
       jobId,
       state: "failed",
       attempts: [{ ordinal: 1, errorCode: "method_execution_failed" }],
+    });
+    expect(refreshed.snapshot.runtimePresentation?.tasks[taskId]?.transcript).toContainEqual({
+      speaker: "agent",
+      text: "Authoritative v2 transcript.",
     });
 
     await provider.retryEvolutionJob?.(jobId, {

@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from fastapi.testclient import TestClient
 
+from desktop.sidecar.contracts.v2 import models as m
 from scripts.dev.development_agent_web_layer import (
     DevelopmentDaemonClient,
     DevelopmentDaemonEventCursorExpired,
@@ -104,8 +105,97 @@ class FakeDaemonClient:
         raise AssertionError(path)
 
     def request_v2(self, path: str, *, method: str = "GET", body: object | None = None) -> object:
-        del method, body
         parsed = urlsplit(path)
+        if parsed.path == "/development/state":
+            self.state_requests += 1
+            return {
+                "schema_version": "2",
+                "active_project_id": self.state["active_project_id"],
+                "projects": [
+                    {"schema_version": "2", **project}
+                    for project in self.state["projects"]
+                ],
+            }
+        if parsed.path == "/development/capabilities":
+            legacy = self.request("/capabilities")
+            return {
+                "schema_version": "2",
+                "authority": legacy["authority"],
+                "capabilities": legacy["capabilities"],
+            }
+        if parsed.path == "/development/events":
+            legacy = self.request(f"/events?{parsed.query}")
+            return {**legacy, "schema_version": "2"}
+        if parsed.path == "/development/projects" and method == "POST":
+            assert isinstance(body, dict)
+            existing = next(
+                (item for item in self.state["projects"] if item["project_id"] == body["project_id"]),
+                None,
+            )
+            if existing is None:
+                existing = {
+                    "project_id": body["project_id"],
+                    "display_name": body["display_name"],
+                    "config": body["config"],
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+                self.state["projects"].append(existing)
+            self.state["active_project_id"] = existing["project_id"]
+            return {"schema_version": "2", **existing}
+        activate_project = re.fullmatch(r"/development/projects/([^/]+)/activate", parsed.path)
+        if activate_project and method == "POST":
+            project = next(item for item in self.state["projects"] if item["project_id"] == activate_project.group(1))
+            self.state["active_project_id"] = project["project_id"]
+            return {"schema_version": "2", **project}
+        update_project = re.fullmatch(r"/development/projects/([^/]+)", parsed.path)
+        if update_project and method == "PUT":
+            assert isinstance(body, dict)
+            project = next(item for item in self.state["projects"] if item["project_id"] == update_project.group(1))
+            project.update({
+                "display_name": body["display_name"],
+                "config": body["config"],
+                "updated_at": "2026-08-23T00:00:01Z",
+            })
+            return {"schema_version": "2", **project}
+        if parsed.path == "/development/tasks" and method == "POST":
+            assert isinstance(body, dict)
+            session_id = f"dev-session-{hashlib.sha256(body['action_id'].encode()).hexdigest()[:16]}"
+            existing = next(
+                (item for item in self.state["sessions"] if item["session_id"] == session_id),
+                None,
+            )
+            if existing is None:
+                existing = {
+                    "session_id": session_id,
+                    "project_id": body["project_id"],
+                    "task_title": body["task_title"],
+                    "instruction": body["instruction"],
+                    "response": None,
+                    "model": None,
+                    "state": "running",
+                    "duration_ms": None,
+                    "logs": ["Remote development daemon admitted the session."],
+                    "selected_evolution": [],
+                    "evolution_errors": [],
+                    "workspace_changes": [],
+                    "context_artifact_ids": [],
+                    "runtime_activation": None,
+                    "evolution_evidence_ready": False,
+                    "error": None,
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+                self.state["sessions"].append(existing)
+            return self._task_presentation(existing)
+        cancel_task = re.fullmatch(r"/development/tasks/([^/]+)/cancel", parsed.path)
+        if cancel_task and method == "POST":
+            session = next(
+                item for item in self.state["sessions"]
+                if item["session_id"] == cancel_task.group(1)
+            )
+            session["updated_at"] = "2026-08-23T00:00:02Z"
+            return self._task_presentation(session)
         if parsed.path == "/tasks":
             items = []
             for session in self.state["sessions"]:
@@ -224,6 +314,44 @@ class FakeDaemonClient:
         raise AssertionError(path)
 
     @staticmethod
+    def _task_presentation(session: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": "2",
+            "task_id": session["session_id"],
+            "project_id": session["project_id"],
+            "task_title": session["task_title"],
+            "instruction": session["instruction"],
+            "response": session.get("response"),
+            "model": session.get("model"),
+            "state": session["state"],
+            "duration_ms": session.get("duration_ms"),
+            "selected_evolution": [
+                {"schema_version": "2", **item}
+                for item in session.get("selected_evolution", [])
+            ],
+            "evolution_errors": [
+                {"schema_version": "2", **item}
+                for item in session.get("evolution_errors", [])
+            ],
+            "workspace_changes": [
+                {
+                    "schema_version": "2",
+                    **item,
+                    "diff_lines": [
+                        {"schema_version": "2", **line}
+                        for line in item.get("diff_lines", [])
+                    ],
+                }
+                for item in session.get("workspace_changes", [])
+            ],
+            "context_artifact_ids": session.get("context_artifact_ids", []),
+            "evolution_evidence_ready": session.get("evolution_evidence_ready", False),
+            "error": session.get("error"),
+            "created_at": session["created_at"],
+            "updated_at": session["updated_at"],
+        }
+
+    @staticmethod
     def _core_artifact(raw: dict[str, object]) -> dict[str, object]:
         return {
             "schema_version": "2",
@@ -247,6 +375,19 @@ class FakeDaemonClient:
     ) -> tuple[int, bytes, dict[str, str]]:
         del content_type
         parameters = parse_qs(query)
+        if path == "development/tasks" and method == "GET":
+            project_id = parameters["project_id"][0]
+            payload = {
+                "schema_version": "2",
+                "items": [
+                    self._task_presentation(session)
+                    for session in self.state["sessions"]
+                    if session["project_id"] == project_id
+                ],
+                "next_cursor": None,
+                "has_more": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
         if path == "development/evolution-jobs" and method == "GET":
             project_id = parameters["project_id"][0]
             session_projects = {
@@ -1178,6 +1319,55 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].task_id == "session-1"
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
+
+
+def test_provider_cancels_task_through_daemon_v2_authority() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [{
+                "project_id": "project-1",
+                "display_name": "Development project",
+                "config": _config(),
+                "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }],
+            "sessions": [{
+                "session_id": "session-1",
+                "project_id": "project-1",
+                "task_title": "Long-running task",
+                "instruction": "Keep working until cancelled.",
+                "state": "running",
+                "logs": ["started"],
+                "created_at": "2026-08-22T00:01:00Z",
+                "updated_at": "2026-08-22T00:01:00Z",
+            }],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+    task = provider.invoke("getDesktopTaskV2", {"task_id": "session-1"})
+
+    operation = provider.invoke(
+        "cancelDesktopTaskV2",
+        {
+            "task_id": task.task_id,
+            "request": m.TaskActionV2(
+                task_admission_id=task.admission.task_admission_id,
+                admission_sha256=task.admission.admission_sha256,
+                predecessor_project_head_id=(
+                    task.admission.predecessor_project_head.project_head_id
+                ),
+            ),
+            "idempotency_key": "cancel-action-00000001",
+            "resource_generation": 1,
+            "if_match": task.etag,
+        },
+    )
+
+    assert operation.kind == "attempt_cancel"
+    assert operation.status == "succeeded"
+    assert operation.progress_completed == operation.progress_total == 1
 
 
 def test_provider_reads_terminal_agent_result_from_daemon_v2_logs() -> None:
