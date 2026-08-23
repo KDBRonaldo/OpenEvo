@@ -42,6 +42,16 @@ from desktop.sidecar.contracts.v2 import models as m
 from desktop.sidecar.contracts.v2.app import create_desktop_local_v2_contract_app
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from openevo.backend.contracts.v2 import models as core
+try:  # package import in tests; direct import when launched as a script
+    from scripts.dev.development_agent_v2_contract import (
+        DevelopmentTaskObservationPageV2,
+        DevelopmentTaskObservationV2,
+    )
+except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
+    from development_agent_v2_contract import (  # type: ignore[no-redef]
+        DevelopmentTaskObservationPageV2,
+        DevelopmentTaskObservationV2,
+    )
 
 
 OPENAPI_SHA256 = "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af"
@@ -74,15 +84,30 @@ def _now() -> str:
 
 class DevelopmentDaemonClient:
     def __init__(self, endpoint: str, token: str) -> None:
-        self._endpoint = endpoint.rstrip("/") + "/openevo-dev-agent/v1"
+        self._root_endpoint = endpoint.rstrip("/")
+        self._endpoint = self._root_endpoint + "/openevo-dev-agent/v1"
+        self._v2_endpoint = self._root_endpoint + "/v2"
         self._token = token
 
     def request(self, path: str, *, method: str = "GET", body: object | None = None) -> object:
+        return self._request_at(self._endpoint, path, method=method, body=body)
+
+    def request_v2(self, path: str, *, method: str = "GET", body: object | None = None) -> object:
+        return self._request_at(self._v2_endpoint, path, method=method, body=body)
+
+    def _request_at(
+        self,
+        endpoint: str,
+        path: str,
+        *,
+        method: str,
+        body: object | None,
+    ) -> object:
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
         headers = {"Authorization": f"Bearer {self._token}"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(self._endpoint + path, data=data, headers=headers, method=method)
+        request = urllib.request.Request(endpoint + path, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
                 declared_length = response.headers.get("Content-Length")
@@ -90,7 +115,7 @@ class DevelopmentDaemonClient:
                     raise HTTPException(status_code=503, detail="development daemon response exceeds the bounded bridge limit")
                 payload = response.read(MAX_DEVELOPMENT_DAEMON_STATE_BYTES + 1)
         except urllib.error.HTTPError as exc:
-            if exc.code == 410 and path.startswith("/events?"):
+            if endpoint == self._endpoint and exc.code == 410 and path.startswith("/events?"):
                 raise DevelopmentDaemonEventCursorExpired from exc
             raise HTTPException(status_code=503, detail="development daemon is unavailable") from exc
         except OSError as exc:
@@ -432,9 +457,50 @@ class DevelopmentAgentDesktopV2Provider:
             authoritative_attempt_id=attempt_id, successor_transition=None, state=state,
             created_at=raw["created_at"], updated_at=raw["updated_at"], etag=ETAG)
 
+    def _task_observations_v2(self) -> list[DevelopmentTaskObservationV2]:
+        items: list[DevelopmentTaskObservationV2] = []
+        after: str | None = None
+        seen: set[str] = set()
+        while True:
+            query = "?limit=100"
+            if after is not None:
+                query += f"&after={quote(after, safe='')}"
+            try:
+                page = DevelopmentTaskObservationPageV2.model_validate(
+                    self._client.request_v2(f"/tasks{query}")
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid v2 Task authority",
+                ) from exc
+            items.extend(page.items)
+            if not page.has_more:
+                return items
+            if page.next_cursor is None or page.next_cursor in seen:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid v2 Task cursor",
+                )
+            seen.add(page.next_cursor)
+            after = page.next_cursor
+
     def _all_tasks(self) -> tuple[dict[str, object], list[core.TaskV2]]:
         state = self._remote_state(); projects = {p.project_id: p for p in self._project_models(state)}
-        tasks = [self._task_model(raw, projects[raw["project_id"]], index + 1) for index, raw in enumerate(state.get("sessions", [])) if raw["project_id"] in projects]
+        observations = self._task_observations_v2()
+        raw_by_id = {raw["session_id"]: raw for raw in state.get("sessions", [])}
+        tasks = []
+        for index, observation in enumerate(observations):
+            raw = raw_by_id.get(observation.task_id)
+            project = projects.get(observation.project_id)
+            if raw is None or project is None:
+                raise HTTPException(status_code=503, detail="development daemon Task authority drifted across v1/v2 reads")
+            task = self._task_model(raw, project, index + 1)
+            tasks.append(task.model_copy(update={
+                "state": observation.state,
+                "created_at": observation.created_at,
+                "updated_at": observation.updated_at,
+            }))
         return state, tasks
 
     def _tasks(self, arguments: Mapping[str, object]) -> core.TaskPageV2:
@@ -463,9 +529,21 @@ class DevelopmentAgentDesktopV2Provider:
         return core.TimelinePageV2(items=[], next_cursor=None, has_more=False)
 
     def _logs(self, arguments: Mapping[str, object]) -> core.LogPageV2:
-        raw = self._raw_task(arguments.get("task_id")); created = raw["created_at"]
-        return core.LogPageV2(items=[{"sequence": i + 1, "occurred_at": created, "stream": "system" if i == 0 else "transcript", "message": text}
-                                       for i, text in enumerate(raw.get("logs", []))], next_cursor=None, has_more=False)
+        task_id = str(arguments.get("task_id"))
+        after = arguments.get("after")
+        limit = arguments.get("limit", 100)
+        query = f"?limit={limit}"
+        if after is not None:
+            query += f"&after={quote(str(after), safe='')}"
+        try:
+            return core.LogPageV2.model_validate(
+                self._client.request_v2(f"/tasks/{quote(task_id, safe='')}/logs{query}")
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid v2 Task logs",
+            ) from exc
 
     def _task_context(self, arguments: Mapping[str, object]) -> core.TaskContextV2:
         task = self._task(arguments)

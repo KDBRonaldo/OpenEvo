@@ -17,9 +17,24 @@ function providerWith(
 describe("self-hosted formal provider", () => {
   it("keeps formal authority while merging readable development presentation", async () => {
     const formalSnapshot = { state: { active_project_id: "formal-project" } } as unknown as DesktopProductSnapshotV2;
-    const runtimePresentation = { tasks: {}, artifacts: {} } as const;
+    const runtimePresentation = {
+      tasks: {
+        "task-1": {
+          instruction: null,
+          transcript: [{ speaker: "agent" as const, text: "legacy answer" }],
+          outputFiles: [],
+          usedArtifactIds: [],
+          producedArtifactIds: [],
+        },
+      },
+      artifacts: {},
+    } as const;
+    const formalTask = { task_id: "task-1" } as DesktopProductSnapshotV2["tasks"][number];
     const formal = providerWith({
-      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot: formalSnapshot })),
+      refresh: vi.fn(async () => ({
+        status: "fresh" as const,
+        snapshot: { ...formalSnapshot, tasks: [formalTask] },
+      })),
     });
     const presentation = providerWith({
       refresh: vi.fn(async () => ({
@@ -33,7 +48,12 @@ describe("self-hosted formal provider", () => {
     expect(result.status).toBe("fresh");
     if (result.status !== "fresh") throw new Error("expected a fresh snapshot");
     expect(result.snapshot.state.active_project_id).toBe("formal-project");
-    expect(result.snapshot.runtimePresentation).toBe(runtimePresentation);
+    expect(result.snapshot.runtimePresentation).toEqual({
+      ...runtimePresentation,
+      tasks: {
+        "task-1": { ...runtimePresentation.tasks["task-1"], transcript: [] },
+      },
+    });
   });
 
   it("routes project and task mutations formally but standalone Evolution explicitly to the proven bridge", async () => {

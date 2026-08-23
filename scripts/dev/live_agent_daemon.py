@@ -48,6 +48,17 @@ from openevo.backend.harness_adapter import (  # noqa: E402
     HarnessRunCancelled,
     HarnessRunError,
 )
+from openevo.backend.contracts.v2 import models as core_v2  # noqa: E402
+try:  # package import in tests; direct import when launched as a script
+    from scripts.dev.development_agent_v2_contract import (  # noqa: E402
+        DevelopmentTaskObservationPageV2,
+        DevelopmentTaskObservationV2,
+    )
+except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launcher
+    from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
+        DevelopmentTaskObservationPageV2,
+        DevelopmentTaskObservationV2,
+    )
 
 
 MAX_REQUEST_BYTES = 256 * 1024
@@ -98,6 +109,12 @@ WORKSPACE_FILES_PATH_PATTERN = re.compile(
     r"^/openevo-dev-agent/v1/projects/([^/]+)/workspace/files$"
 )
 DEVELOPMENT_EVENTS_PATH = "/openevo-dev-agent/v1/events"
+DAEMON_V2_TASKS_PATH = "/v2/tasks"
+DAEMON_V2_TASK_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)$")
+DAEMON_V2_TASK_LOGS_PATH_PATTERN = re.compile(r"^/v2/tasks/([^/]+)/logs$")
+MAX_DAEMON_V2_LOG_PAGE = 100
+MAX_DAEMON_V2_TASK_PAGE = 100
+MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
 class RequestError(ValueError):
@@ -1810,6 +1827,89 @@ class DevelopmentStateStore:
             raise KeyError(session_id)
         return self._session_record(row, evolution_evidence_ready=evidence_ready)
 
+    def task_observations_v2(
+        self,
+        *,
+        project_id: str | None = None,
+        after_task_id: str | None = None,
+        limit: int = MAX_DAEMON_V2_TASK_PAGE,
+    ) -> DevelopmentTaskObservationPageV2:
+        with self._lock, self._connection() as connection:
+            if project_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM development_sessions ORDER BY created_at, session_id"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM development_sessions WHERE project_id = ? "
+                    "ORDER BY created_at, session_id",
+                    (project_id,),
+                ).fetchall()
+        observations = [self._task_observation_v2(row) for row in rows]
+        start = 0
+        if after_task_id is not None:
+            try:
+                start = next(
+                    index + 1
+                    for index, observation in enumerate(observations)
+                    if observation.task_id == after_task_id
+                )
+            except StopIteration as exc:
+                raise RequestError("task cursor is not part of this collection") from exc
+        page = observations[start : start + limit]
+        has_more = start + len(page) < len(observations)
+        return DevelopmentTaskObservationPageV2(
+            items=page,
+            next_cursor=page[-1].task_id if has_more and page else None,
+            has_more=has_more,
+        )
+
+    def task_observation_v2(self, task_id: str) -> DevelopmentTaskObservationV2:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_sessions WHERE session_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return self._task_observation_v2(row)
+
+    def task_logs_v2(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> core_v2.LogPageV2:
+        session = self.get_session(task_id)
+        entries: list[core_v2.LogEntryV2] = []
+
+        def append(stream: str, message: object) -> None:
+            if not isinstance(message, str) or not message:
+                return
+            for offset in range(0, len(message), MAX_DAEMON_V2_LOG_TEXT):
+                entries.append(
+                    core_v2.LogEntryV2(
+                        sequence=len(entries) + 1,
+                        occurred_at=session["updated_at"],
+                        stream=stream,
+                        message=message[offset : offset + MAX_DAEMON_V2_LOG_TEXT],
+                    )
+                )
+
+        for message in session["logs"]:
+            append("system", message)
+        append("transcript", session["response"])
+        append("system", session["error"])
+        remaining = [entry for entry in entries if entry.sequence > after_sequence]
+        page = remaining[:limit]
+        has_more = len(remaining) > limit
+        return core_v2.LogPageV2(
+            items=page,
+            next_cursor=str(page[-1].sequence) if has_more and page else None,
+            has_more=has_more,
+        )
+
     def cancellation_requested(self, session_id: str) -> bool:
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -2601,6 +2701,23 @@ class DevelopmentStateStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    @staticmethod
+    def _task_observation_v2(row: sqlite3.Row) -> DevelopmentTaskObservationV2:
+        state = row["state"]
+        if row["terminal_kind"] == "cancelled":
+            state = "cancelled"
+        elif state == "running" and row["cancellation_requested"]:
+            state = "cancelling"
+        elif state == "completed":
+            state = "closed"
+        return DevelopmentTaskObservationV2(
+            task_id=row["session_id"],
+            project_id=row["project_id"],
+            state=state,
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
 
     @staticmethod
     def _artifact_record(row: sqlite3.Row) -> dict[str, Any]:
@@ -4031,6 +4148,87 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed_path = urlsplit(self.path)
+        if parsed_path.path == DAEMON_V2_TASKS_PATH:
+            try:
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"project_id", "after", "limit"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError("task query contains unsupported parameters")
+                project_id = parameters.get("project_id", [None])[0]
+                if project_id is not None and not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                after_task_id = parameters.get("after", [None])[0]
+                if after_task_id is not None and not ID_PATTERN.fullmatch(after_task_id):
+                    raise RequestError("task cursor is invalid")
+                limit_raw = parameters.get(
+                    "limit", [str(MAX_DAEMON_V2_TASK_PAGE)]
+                )[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("task limit must be an integer")
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_TASK_PAGE:
+                    raise RequestError("task limit is outside the supported bound")
+                page = self.server.store.task_observations_v2(
+                    project_id=project_id,
+                    after_task_id=after_task_id,
+                    limit=limit,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        task_logs_match = DAEMON_V2_TASK_LOGS_PATH_PATTERN.fullmatch(parsed_path.path)
+        if task_logs_match:
+            task_id = task_logs_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(task_id):
+                    raise RequestError("task_id is invalid")
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"after", "limit"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError("log query contains unsupported parameters")
+                after_raw = parameters.get("after", ["0"])[0]
+                limit_raw = parameters.get("limit", [str(MAX_DAEMON_V2_LOG_PAGE)])[0]
+                if not after_raw.isascii() or not after_raw.isdigit():
+                    raise RequestError("log cursor must be a non-negative integer")
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("log limit must be an integer")
+                after_sequence = int(after_raw)
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_LOG_PAGE:
+                    raise RequestError("log limit is outside the supported bound")
+                page = self.server.store.task_logs_v2(
+                    task_id, after_sequence=after_sequence, limit=limit
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "task not found")
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        task_match = DAEMON_V2_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
+        if task_match:
+            task_id = task_match.group(1)
+            if not ID_PATTERN.fullmatch(task_id):
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", "task_id is invalid"
+                )
+                return
+            try:
+                task = self.server.store.task_observation_v2(task_id)
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "task not found")
+            else:
+                self._json(HTTPStatus.OK, task.model_dump(mode="json"))
+            return
         workspace_match = WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
         if workspace_match:
             project_id = workspace_match.group(1)
@@ -4376,6 +4574,15 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
 
     def _json_error(self, status: HTTPStatus, code: str, message: str) -> None:
         self._json(status, {"schema_version": "1", "error": {"code": code, "message": message}})
+
+    def _json_error_v2(self, status: HTTPStatus, code: str, message: str) -> None:
+        self._json(
+            status,
+            {
+                "schema_version": "2",
+                "error": {"code": code, "message": message, "retryable": False},
+            },
+        )
 
     def _json(self, status: HTTPStatus, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

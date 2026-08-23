@@ -99,6 +99,51 @@ class FakeDaemonClient:
             }
         raise AssertionError(path)
 
+    def request_v2(self, path: str, *, method: str = "GET", body: object | None = None) -> object:
+        del method, body
+        parsed = urlsplit(path)
+        if parsed.path == "/tasks":
+            items = []
+            for session in self.state["sessions"]:
+                state = "closed" if session["state"] == "completed" else session["state"]
+                items.append({
+                    "schema_version": "2",
+                    "task_id": session["session_id"],
+                    "project_id": session["project_id"],
+                    "state": state,
+                    "created_at": session["created_at"],
+                    "updated_at": session["updated_at"],
+                })
+            return {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": None,
+                "has_more": False,
+            }
+        task_logs = re.fullmatch(r"/tasks/([^/]+)/logs", parsed.path)
+        if task_logs:
+            session = next(
+                item for item in self.state["sessions"]
+                if item["session_id"] == task_logs.group(1)
+            )
+            messages = [
+                *[("system", message) for message in session.get("logs", [])],
+                *([("transcript", session["response"])] if session.get("response") else []),
+                *([("system", session["error"])] if session.get("error") else []),
+            ]
+            return {
+                "schema_version": "2",
+                "items": [{
+                    "sequence": index + 1,
+                    "occurred_at": session["updated_at"],
+                    "stream": stream,
+                    "message": message,
+                } for index, (stream, message) in enumerate(messages)],
+                "next_cursor": None,
+                "has_more": False,
+            }
+        raise AssertionError(path)
+
 
 def _config() -> dict[str, object]:
     return {
@@ -395,6 +440,42 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].task_id == "session-1"
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
+
+
+def test_provider_reads_terminal_agent_result_from_daemon_v2_logs() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [{
+                "project_id": "project-1",
+                "display_name": "Development project",
+                "config": _config(),
+                "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }],
+            "sessions": [{
+                "session_id": "session-1",
+                "project_id": "project-1",
+                "state": "completed",
+                "logs": ["completed"],
+                "response": "Authoritative v2 answer.",
+                "error": None,
+                "created_at": "2026-08-22T00:01:00Z",
+                "updated_at": "2026-08-22T00:02:00Z",
+            }],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+    provider.invoke("listDesktopTasksV2", {"project_id": "project-1"})
+
+    logs = provider.invoke(
+        "getDesktopTaskLogsV2",
+        {"task_id": "session-1", "limit": 100, "after": None},
+    )
+
+    assert logs.items[-1].stream == "transcript"
+    assert logs.items[-1].message == "Authoritative v2 answer."
 
 
 def test_active_project_tunnel_exposes_only_its_bound_project() -> None:

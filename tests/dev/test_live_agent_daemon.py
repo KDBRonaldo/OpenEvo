@@ -1533,6 +1533,13 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
             if time.monotonic() >= deadline:
                 raise AssertionError("asynchronous session did not finish")
             time.sleep(0.01)
+        task_page_v2 = _request_json(base_url, "/v2/tasks", token)
+        task_v2 = _request_json(base_url, f"/v2/tasks/{turn['session_id']}", token)
+        logs_v2 = _request_json(
+            base_url,
+            f"/v2/tasks/{turn['session_id']}/logs?limit=100",
+            token,
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -1545,6 +1552,10 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
     assert state["sessions"][0]["state"] == "completed"
     assert state["sessions"][0]["workspace_changes"][0]["path"] == "hello.py"
     assert state["workspaces"][0]["entries"][0]["content"] == "print('hello')\n"
+    assert task_page_v2["items"][0]["task_id"] == turn["session_id"]
+    assert task_v2["state"] == "closed"
+    assert logs_v2["items"][-1]["stream"] == "transcript"
+    assert logs_v2["items"][-1]["message"] == "Answer to: Hello"
 
 
 def test_session_coordinator_cancels_a_running_harness(tmp_path: Path) -> None:

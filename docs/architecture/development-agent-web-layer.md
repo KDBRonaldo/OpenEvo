@@ -19,11 +19,12 @@ Vite authenticates to the Web Layer with an ephemeral local token. The developme
 bearer token remains only in the launcher/Web Layer process and is never compiled into or
 returned to browser code.
 
-The Web Layer also exposes the strict `/desktop/v2/*` projection in parallel. That
-projection is not yet the development UI's primary provider because the frozen v2 product
-contract intentionally omits development-only readable transcript/workspace presentation
-and standalone evolution run actions. The primary UI will move route-by-route only after
-the replacement preserves the full development acceptance path.
+The Web Layer also exposes the strict `/desktop/v2/*` projection in parallel. Project/Task
+authority and mutations now use this provider. Task status and terminal agent responses are
+read from the daemon's bounded `/v2/tasks*` observation routes; the renderer consumes the
+response through the existing Desktop v2 Task log contract. Workspace/artifact presentation
+and standalone Evolution run actions remain on the compatibility surface until their own
+route-by-route replacement preserves the full development acceptance path.
 
 ## Start command
 
@@ -94,5 +95,5 @@ not fall back to SSH or claim release capabilities. Native-folder import, profil
 lifecycle, transition repair, daemon/service mutation, diagnostics generation, and full
 event replay remain for later increments.
 
-The module lives under `scripts/dev/` and is not included in packaged Desktop assets or
-the release daemon. `live_agent_daemon.py` is unchanged.
+The adapter and its small shared development v2 observation models live under `scripts/dev/`
+and are not included in packaged Desktop assets or the release daemon.

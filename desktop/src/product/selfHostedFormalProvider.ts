@@ -100,9 +100,17 @@ export function combineSelfHostedProviders(
     ]);
     if (formalResult.status !== "fresh") return formalResult;
     if (presentationResult.status !== "fresh") return presentationResult;
+    const compatibilityPresentation = presentationResult.snapshot.runtimePresentation;
+    const formalTaskIds = new Set(formalResult.snapshot.tasks.map((task) => task.task_id));
+    const tasks = Object.fromEntries(Object.entries(compatibilityPresentation?.tasks ?? {}).map(
+      ([taskId, task]) => [taskId, formalTaskIds.has(taskId) ? { ...task, transcript: [] } : task],
+    ));
     const snapshot: DesktopProductSnapshotV2 = {
       ...formalResult.snapshot,
-      runtimePresentation: presentationResult.snapshot.runtimePresentation,
+      runtimePresentation: compatibilityPresentation === undefined ? undefined : {
+        ...compatibilityPresentation,
+        tasks,
+      },
     };
     return { status: "fresh", snapshot };
   };
