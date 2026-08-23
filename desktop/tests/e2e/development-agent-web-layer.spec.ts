@@ -147,11 +147,37 @@ test("real browser can create a project, run an agent session, and produce evolu
     await currentRun.getByRole("button", { name: "Apply to future Sessions" }).click();
     await expect(currentRun.locator(".state-pill")).toHaveText("applied", { timeout: 120_000 });
     await expect(currentRun.getByText("Active context", { exact: true })).toBeVisible();
-    expect(observedRequests).toContain("POST /openevo-dev-agent/v1/evolution-runs");
+    expect(observedRequests).toContain("POST /desktop/v2/development/evolution-runs");
+    expect(observedRequests.some((request) => (
+      request.startsWith("POST /desktop/v2/development/evolution-runs/")
+      && request.endsWith("/apply")
+    ))).toBe(true);
     expect(observedRequests).toContain("GET /desktop/v2/development/artifacts");
     expect(observedRequests.some((request) => (
       request.startsWith("GET /desktop/v2/tasks/") && request.endsWith("/artifacts")
     ))).toBe(true);
+    await assertNoProductErrors(page);
+  });
+
+  await test.step("start the next Session with the applied Evolution context", async () => {
+    const nextResultMarker = `OPENEVO_APPLIED_CONTEXT_E2E_OK_${RUN_ID}`;
+    await page.getByRole("button", { name: "Research", exact: true }).click();
+    await page.getByLabel("Task title").fill(`Applied context acceptance ${RUN_ID}`);
+    await page.getByLabel("Task instructions").fill(
+      `Reply with exactly ${nextResultMarker}. Do not modify files and do not perform network access.`,
+    );
+    await page.getByRole("button", { name: "Start session" }).click();
+
+    const detail = page.getByTestId("session-detail-workspace");
+    await expect(detail).toBeVisible({ timeout: 120_000 });
+    const contextUsed = detail.locator(".v2-result-section").filter({ hasText: "Context used" });
+    await expect(contextUsed.locator(".v2-result-section-head strong")).not.toHaveText("0", {
+      timeout: 120_000,
+    });
+    await expect(detail.locator(".session-inspector-heading .state-pill")).toHaveText("closed", {
+      timeout: 10 * 60 * 1000,
+    });
+    await expect(detail.getByLabel("Agent")).toContainText(nextResultMarker, { timeout: 60_000 });
     await assertNoProductErrors(page);
   });
 

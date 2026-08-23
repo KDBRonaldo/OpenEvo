@@ -35,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterator
 
 from pypdf import PdfReader
+from pydantic import ValidationError
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +55,10 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionRunApplyV2,
+        DevelopmentEvolutionRunCreateV2,
+        DevelopmentEvolutionRunPageV2,
+        DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -65,6 +70,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the remote launch
     from development_agent_v2_contract import (  # type: ignore[no-redef]  # noqa: E402
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionRunApplyV2,
+        DevelopmentEvolutionRunCreateV2,
+        DevelopmentEvolutionRunPageV2,
+        DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -135,6 +144,13 @@ DAEMON_V2_DEVELOPMENT_ARTIFACTS_PATH = "/v2/development/artifacts"
 DAEMON_V2_DEVELOPMENT_ARTIFACT_PATH_PATTERN = re.compile(
     r"^/v2/development/artifacts/([^/]+)$"
 )
+DAEMON_V2_DEVELOPMENT_EVOLUTION_RUNS_PATH = "/v2/development/evolution-runs"
+DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_APPLY_PATH_PATTERN = re.compile(
+    r"^/v2/development/evolution-runs/([^/]+)/apply$"
+)
+DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_PATH_PATTERN = re.compile(
+    r"^/v2/development/evolution-runs/([^/]+)$"
+)
 DAEMON_V2_WORKSPACE_PATH_PATTERN = re.compile(
     r"^/v2/projects/([^/]+)/workspace$"
 )
@@ -146,6 +162,7 @@ MAX_DAEMON_V2_TASK_PAGE = 100
 MAX_DAEMON_V2_WORKSPACE_PAGE = 100
 MAX_DAEMON_V2_ARTIFACT_PAGE = 100
 MAX_DAEMON_V2_DEVELOPMENT_ARTIFACT_PAGE = 5
+MAX_DAEMON_V2_EVOLUTION_RUN_PAGE = 25
 MAX_DAEMON_V2_LOG_TEXT = 16_384
 
 
@@ -1280,6 +1297,7 @@ class DevelopmentStateStore:
                     );
                 CREATE TABLE IF NOT EXISTS development_evolution_runs (
                     run_id TEXT PRIMARY KEY,
+                    action_id TEXT NOT NULL UNIQUE,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
                     source_session_ids_json TEXT NOT NULL,
                     selections_json TEXT NOT NULL,
@@ -1405,6 +1423,25 @@ class DevelopmentStateStore:
                 connection.execute(
                     "ALTER TABLE development_evolution_artifacts_v2 ADD COLUMN run_id TEXT"
                 )
+            evolution_run_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(development_evolution_runs)"
+                )
+            }
+            if "action_id" not in evolution_run_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_runs ADD COLUMN action_id TEXT"
+                )
+                connection.execute(
+                    "UPDATE development_evolution_runs "
+                    "SET action_id = 'legacy-' || run_id WHERE action_id IS NULL"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "development_evolution_runs_action_id "
+                "ON development_evolution_runs(action_id)"
+            )
             job_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -2681,7 +2718,23 @@ class DevelopmentStateStore:
     ) -> dict[str, Any]:
         now = utc_now()
         session_ids = request["session_ids"]
+        action_id = request.get("action_id", f"legacy-{run_id}")
         with self._lock, self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM development_evolution_runs WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if existing is not None:
+                record = self._evolution_run_record(existing)
+                if (
+                    record["project_id"] != request["project_id"]
+                    or record["source_session_ids"] != session_ids
+                    or record["selections"] != request["selections"]
+                ):
+                    raise StateConflictError(
+                        "Evolution action_id is already bound to another request"
+                    )
+                return record
             if connection.execute(
                 "SELECT 1 FROM development_projects WHERE project_id = ?",
                 (request["project_id"],),
@@ -2723,12 +2776,13 @@ class DevelopmentStateStore:
             connection.execute(
                 """
                 INSERT INTO development_evolution_runs(
-                    run_id, project_id, source_session_ids_json, selections_json,
+                    run_id, action_id, project_id, source_session_ids_json, selections_json,
                     state, artifact_ids_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
                 """,
                 (
                     run_id,
+                    action_id,
                     request["project_id"],
                     canonical_json(session_ids),
                     canonical_json(request["selections"]),
@@ -2741,6 +2795,92 @@ class DevelopmentStateStore:
                 (run_id,),
             ).fetchone()
         return self._evolution_run_record(row)
+
+    def evolution_run_for_action(
+        self,
+        request: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        action_id = request.get("action_id")
+        if action_id is None:
+            return None
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_evolution_runs WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        record = self._evolution_run_record(row)
+        if (
+            record["project_id"] != request["project_id"]
+            or record["source_session_ids"] != request["session_ids"]
+            or record["selections"] != request["selections"]
+        ):
+            raise StateConflictError(
+                "Evolution action_id is already bound to another request"
+            )
+        return record
+
+    def evolution_run_v2(self, run_id: str) -> DevelopmentEvolutionRunV2:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_evolution_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return self._development_evolution_run_v2(
+            self._evolution_run_record(row, include_action_id=True)
+        )
+
+    def evolution_run_page_v2(
+        self,
+        *,
+        project_id: str,
+        after_run_id: str | None,
+        limit: int,
+    ) -> DevelopmentEvolutionRunPageV2:
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone() is None:
+                raise KeyError(project_id)
+            parameters: list[object] = [project_id]
+            cursor_clause = ""
+            if after_run_id is not None:
+                cursor = connection.execute(
+                    "SELECT created_at, run_id FROM development_evolution_runs "
+                    "WHERE project_id = ? AND run_id = ?",
+                    (project_id, after_run_id),
+                ).fetchone()
+                if cursor is None:
+                    raise RequestError("Evolution Run cursor is not part of this Project")
+                cursor_clause = (
+                    "AND (created_at > ? OR (created_at = ? AND run_id > ?)) "
+                )
+                parameters.extend(
+                    [cursor["created_at"], cursor["created_at"], cursor["run_id"]]
+                )
+            rows = connection.execute(
+                "SELECT * FROM development_evolution_runs WHERE project_id = ? "
+                + cursor_clause
+                + "ORDER BY created_at, run_id LIMIT ?",
+                (*parameters, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        items = [
+            self._development_evolution_run_v2(
+                self._evolution_run_record(row, include_action_id=True)
+            )
+            for row in selected
+        ]
+        return DevelopmentEvolutionRunPageV2(
+            items=items,
+            next_cursor=items[-1].run_id if has_more and items else None,
+            has_more=has_more,
+        )
 
     def finish_evolution_run(
         self,
@@ -3443,8 +3583,12 @@ class DevelopmentStateStore:
         }
 
     @staticmethod
-    def _evolution_run_record(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+    def _evolution_run_record(
+        row: sqlite3.Row,
+        *,
+        include_action_id: bool = False,
+    ) -> dict[str, Any]:
+        record = {
             "run_id": row["run_id"],
             "project_id": row["project_id"],
             "source_session_ids": json.loads(row["source_session_ids_json"]),
@@ -3455,6 +3599,30 @@ class DevelopmentStateStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+        if include_action_id:
+            record["action_id"] = row["action_id"]
+        return record
+
+    @staticmethod
+    def _development_evolution_run_v2(
+        record: dict[str, Any],
+    ) -> DevelopmentEvolutionRunV2:
+        return DevelopmentEvolutionRunV2.model_validate({
+            "schema_version": "2",
+            "run_id": record["run_id"],
+            "action_id": record["action_id"],
+            "project_id": record["project_id"],
+            "source_task_ids": record["source_session_ids"],
+            "selections": [
+                {"schema_version": "2", **selection}
+                for selection in record["selections"]
+            ],
+            "state": record["state"],
+            "artifact_ids": record["artifact_ids"],
+            "error": record["error"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+        })
 
     @staticmethod
     def _attempt_record(row: sqlite3.Row) -> dict[str, Any]:
@@ -4578,6 +4746,9 @@ class DevelopmentSessionCoordinator:
         if self._evolution_runner is None:
             raise StateConflictError("the Evolution runner is unavailable")
         if not self._turn_lock.acquire(blocking=False):
+            existing = self._store.evolution_run_for_action(request)
+            if existing is not None:
+                return existing
             raise StateConflictError("another development Session or Evolution Run is active")
         run_id = f"evolution-run-{secrets.token_hex(8)}"
         try:
@@ -4585,6 +4756,9 @@ class DevelopmentSessionCoordinator:
         except Exception:
             self._turn_lock.release()
             raise
+        if run["run_id"] != run_id:
+            self._turn_lock.release()
+            return run
         thread = threading.Thread(
             target=self._execute_evolution_run,
             name=f"openevo-{run_id}",
@@ -5056,6 +5230,63 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, artifact.model_dump(mode="json"))
             return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_EVOLUTION_RUNS_PATH:
+            try:
+                parameters = parse_qs(
+                    parsed_path.query, keep_blank_values=True, strict_parsing=True
+                )
+                if set(parameters) - {"project_id", "after", "limit"} or any(
+                    len(values) != 1 for values in parameters.values()
+                ):
+                    raise RequestError(
+                        "Evolution Run query contains unsupported parameters"
+                    )
+                project_id = parameters.get("project_id", [None])[0]
+                if project_id is None or not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                after_run_id = parameters.get("after", [None])[0]
+                if after_run_id is not None and not ID_PATTERN.fullmatch(after_run_id):
+                    raise RequestError("Evolution Run cursor is invalid")
+                limit_raw = parameters.get(
+                    "limit", [str(MAX_DAEMON_V2_EVOLUTION_RUN_PAGE)]
+                )[0]
+                if not limit_raw.isascii() or not limit_raw.isdigit():
+                    raise RequestError("Evolution Run limit must be an integer")
+                limit = int(limit_raw)
+                if not 1 <= limit <= MAX_DAEMON_V2_EVOLUTION_RUN_PAGE:
+                    raise RequestError(
+                        "Evolution Run limit is outside the supported bound"
+                    )
+                page = self.server.store.evolution_run_page_v2(
+                    project_id=project_id,
+                    after_run_id=after_run_id,
+                    limit=limit,
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            else:
+                self._json(HTTPStatus.OK, page.model_dump(mode="json"))
+            return
+        evolution_run_match = (
+            DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_PATH_PATTERN.fullmatch(parsed_path.path)
+        )
+        if evolution_run_match:
+            run_id = evolution_run_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(run_id):
+                    raise RequestError("run_id is invalid")
+                run = self.server.store.evolution_run_v2(run_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "Evolution Run not found"
+                )
+            else:
+                self._json(HTTPStatus.OK, run.model_dump(mode="json"))
+            return
         task_match = DAEMON_V2_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
         if task_match:
             task_id = task_match.group(1)
@@ -5242,6 +5473,76 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
+            return
+        if self.path == DAEMON_V2_DEVELOPMENT_EVOLUTION_RUNS_PATH:
+            try:
+                request = DevelopmentEvolutionRunCreateV2.model_validate(
+                    self._read_json()
+                )
+                run = self.server.sessions.submit_evolution({
+                    "action_id": request.action_id,
+                    "project_id": request.project_id,
+                    "session_ids": request.source_task_ids,
+                    "selections": [
+                        {
+                            "target_id": selection.target_id,
+                            "method": selection.method,
+                            "config": selection.config,
+                        }
+                        for selection in request.selections
+                    ],
+                })
+                response = self.server.store.evolution_run_v2(run["run_id"])
+            except ValidationError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except RequestError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "project not found"
+                )
+            except StateConflictError as exc:
+                self._json_error_v2(
+                    HTTPStatus.CONFLICT, "state_conflict", str(exc)
+                )
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
+            return
+        apply_v2_match = (
+            DAEMON_V2_DEVELOPMENT_EVOLUTION_RUN_APPLY_PATH_PATTERN.fullmatch(
+                self.path
+            )
+        )
+        if apply_v2_match:
+            run_id = apply_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(run_id):
+                    raise RequestError("run_id is invalid")
+                DevelopmentEvolutionRunApplyV2.model_validate(self._read_json())
+                self.server.sessions.apply_evolution(run_id)
+                response = self.server.store.evolution_run_v2(run_id)
+            except ValidationError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except RequestError as exc:
+                self._json_error_v2(
+                    HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                )
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", "Evolution Run not found"
+                )
+            except StateConflictError as exc:
+                self._json_error_v2(
+                    HTTPStatus.CONFLICT, "state_conflict", str(exc)
+                )
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
         if self.path == "/openevo-dev-agent/v1/projects":
             try:

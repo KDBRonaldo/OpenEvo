@@ -40,6 +40,7 @@ class FakeDaemonClient:
         self.events: list[dict[str, object]] = []
         self.expire_next_event_cursor = False
         self.workspace_files: dict[str, bytes] = {}
+        self.evolution_action_ids: dict[str, str] = {}
 
     def emit_event(self, project_id: str) -> None:
         sequence = len(self.events) + 1
@@ -245,6 +246,70 @@ class FakeDaemonClient:
     ) -> tuple[int, bytes, dict[str, str]]:
         del content_type
         parameters = parse_qs(query)
+        if path == "development/evolution-runs" and method == "GET":
+            project_id = parameters["project_id"][0]
+            items = [
+                self._evolution_run_v2(run)
+                for run in self.state["evolution_runs"]
+                if run["project_id"] == project_id
+            ]
+            payload = {
+                "schema_version": "2",
+                "items": items,
+                "next_cursor": None,
+                "has_more": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        if path == "development/evolution-runs" and method == "POST":
+            creation = json.loads(body)
+            existing_run_id = self.evolution_action_ids.get(creation["action_id"])
+            if existing_run_id is None:
+                run_id = f"evolution-run-{len(self.state['evolution_runs']) + 1}"
+                run = {
+                    "run_id": run_id,
+                    "project_id": creation["project_id"],
+                    "source_session_ids": creation["source_task_ids"],
+                    "selections": [
+                        {
+                            "target_id": selection["target_id"],
+                            "method": selection["method"],
+                            "config": selection["config"],
+                        }
+                        for selection in creation["selections"]
+                    ],
+                    "state": "running",
+                    "artifact_ids": [],
+                    "error": None,
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+                self.state["evolution_runs"].append(run)
+                self.evolution_action_ids[creation["action_id"]] = run_id
+            else:
+                run = next(
+                    item for item in self.state["evolution_runs"]
+                    if item["run_id"] == existing_run_id
+                )
+            payload = self._evolution_run_v2(run)
+            return 202, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        evolution_apply = re.fullmatch(r"development/evolution-runs/([^/]+)/apply", path)
+        if evolution_apply and method == "POST":
+            run = next(
+                item for item in self.state["evolution_runs"]
+                if item["run_id"] == evolution_apply.group(1)
+            )
+            run["state"] = "applied"
+            run["updated_at"] = "2026-08-23T00:00:01Z"
+            payload = self._evolution_run_v2(run)
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        evolution_detail = re.fullmatch(r"development/evolution-runs/([^/]+)", path)
+        if evolution_detail and method == "GET":
+            run = next(
+                item for item in self.state["evolution_runs"]
+                if item["run_id"] == evolution_detail.group(1)
+            )
+            payload = self._evolution_run_v2(run)
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
         if path == "development/artifacts" and method == "GET":
             project_id = parameters["project_id"][0]
             items = [
@@ -347,6 +412,31 @@ class FakeDaemonClient:
                 }
                 return 200, json.dumps(result).encode(), {"Content-Type": "application/json"}
         raise AssertionError((method, path, query))
+
+    def _evolution_run_v2(self, run: dict[str, object]) -> dict[str, object]:
+        action_id = next(
+            (
+                action_id for action_id, run_id in self.evolution_action_ids.items()
+                if run_id == run["run_id"]
+            ),
+            f"legacy-{run['run_id']}",
+        )
+        return {
+            "schema_version": "2",
+            "run_id": run["run_id"],
+            "action_id": action_id,
+            "project_id": run["project_id"],
+            "source_task_ids": run["source_session_ids"],
+            "selections": [
+                {"schema_version": "2", **selection}
+                for selection in run["selections"]
+            ],
+            "state": run["state"],
+            "artifact_ids": run["artifact_ids"],
+            "error": run["error"],
+            "created_at": run["created_at"],
+            "updated_at": run["updated_at"],
+        }
 
 
 def _config() -> dict[str, object]:
@@ -720,6 +810,77 @@ def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:
         )
         assert content_metadata.status_code == 200
         assert content_metadata.json()["media_type"] == "text/markdown"
+
+
+def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> None:
+    import scripts.dev.development_agent_web_layer as web
+
+    fake = FakeDaemonClient()
+    project_id = "project-evolution-v2"
+    fake.state.update({
+        "active_project_id": project_id,
+        "projects": [{
+            "project_id": project_id,
+            "display_name": "Evolution v2",
+            "config": _config(),
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+    })
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    creation = {
+        "schema_version": "2",
+        "action_id": "action-evolution-v2",
+        "project_id": project_id,
+        "source_task_ids": ["task-evolution-v2"],
+        "selections": [{
+            "schema_version": "2",
+            "target_id": "text_memory",
+            "method": "text_memory_reflector",
+            "config": {},
+        }],
+    }
+    root = "/desktop/v2/development/evolution-runs"
+    with TestClient(app) as client:
+        assert client.get(f"{root}?project_id={project_id}").status_code == 401
+        created = client.post(root, headers=headers, json=creation)
+        assert created.status_code == 202
+        assert created.json()["action_id"] == creation["action_id"]
+        run_id = created.json()["run_id"]
+
+        inventory = client.get(
+            f"{root}?project_id={project_id}&limit=25", headers=headers
+        )
+        assert inventory.status_code == 200
+        assert inventory.json()["items"][0]["run_id"] == run_id
+
+        fake.state["evolution_runs"][0]["state"] = "candidate_ready"
+        fake.state["evolution_runs"][0]["artifact_ids"] = ["candidate-memory-v2"]
+        applied = client.post(
+            f"{root}/{run_id}/apply",
+            headers=headers,
+            json={"schema_version": "2"},
+        )
+        assert applied.status_code == 200
+        assert applied.json()["state"] == "applied"
+
+        detail = client.get(f"{root}/{run_id}", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["artifact_ids"] == ["candidate-memory-v2"]
 
 
 def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:

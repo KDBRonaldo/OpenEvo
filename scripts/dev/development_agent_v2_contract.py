@@ -203,11 +203,78 @@ class DevelopmentArtifactPageV2(StrictDevelopmentModelV2):
     has_more: bool = False
 
 
+class DevelopmentEvolutionSelectionV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    target_id: core.OpaqueId
+    method: core.OpaqueId
+    config: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _validate_config_budget(self) -> "DevelopmentEvolutionSelectionV2":
+        encoded = json.dumps(
+            self.config,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 192 * 1024:
+            raise ValueError("Evolution method config exceeds the development v2 byte budget")
+        return self
+
+
+class DevelopmentEvolutionRunCreateV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    project_id: core.OpaqueId
+    source_task_ids: list[core.OpaqueId] = Field(min_length=1, max_length=128)
+    selections: list[DevelopmentEvolutionSelectionV2] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_unique_inputs(self) -> "DevelopmentEvolutionRunCreateV2":
+        if len(set(self.source_task_ids)) != len(self.source_task_ids):
+            raise ValueError("source_task_ids must not contain duplicates")
+        target_ids = [selection.target_id for selection in self.selections]
+        if len(set(target_ids)) != len(target_ids):
+            raise ValueError("selections must contain at most one method per target")
+        return self
+
+
+class DevelopmentEvolutionRunApplyV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+
+
+class DevelopmentEvolutionRunV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    run_id: core.OpaqueId
+    action_id: core.OpaqueId
+    project_id: core.OpaqueId
+    source_task_ids: list[core.OpaqueId] = Field(min_length=1, max_length=128)
+    selections: list[DevelopmentEvolutionSelectionV2] = Field(min_length=1, max_length=64)
+    state: Literal["running", "candidate_ready", "applied", "failed"]
+    artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    error: str | None = Field(default=None, max_length=32_000)
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+
+class DevelopmentEvolutionRunPageV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    items: list[DevelopmentEvolutionRunV2] = Field(max_length=25)
+    next_cursor: core.Cursor | None = None
+    has_more: bool = False
+
+
 __all__ = [
     "DevelopmentAttemptAppendedObservationV2",
     "DevelopmentArtifactDocumentV2",
     "DevelopmentArtifactPageV2",
     "DevelopmentArtifactV2",
+    "DevelopmentEvolutionRunApplyV2",
+    "DevelopmentEvolutionRunCreateV2",
+    "DevelopmentEvolutionRunPageV2",
+    "DevelopmentEvolutionRunV2",
+    "DevelopmentEvolutionSelectionV2",
     "DevelopmentDatasetSealedObservationV2",
     "DevelopmentTaskAdmittedObservationV2",
     "DevelopmentTaskObservationPageV2",

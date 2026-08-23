@@ -85,6 +85,7 @@ export async function createSelfHostedFormalProvider(
   const presentation = createDevelopmentAgentProvider({
     workspaceV2BaseUrl: "/desktop/v2/development/projects",
     artifactV2BaseUrl: "/desktop/v2/development/artifacts",
+    evolutionV2BaseUrl: "/desktop/v2/development/evolution-runs",
     desktopSessionToken: bootstrap.session_token,
   });
   return combineSelfHostedProviders(formal, presentation);

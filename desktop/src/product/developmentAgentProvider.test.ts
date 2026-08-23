@@ -590,6 +590,136 @@ describe("development agent provider", () => {
     expect(refreshed.snapshot.runtimePresentation?.artifacts[artifactId]?.documents[0]?.content)
       .toBe("# Real daemon v2 skill\n");
   });
+
+  it("loads, creates, and applies Evolution Runs through the authenticated daemon v2 bridge", async () => {
+    const projectId = "project-evolution-v2";
+    const runs: Record<string, unknown>[] = [{
+      schema_version: "2",
+      run_id: "evolution-run-v2-1",
+      action_id: "action-evolution-v2-1",
+      project_id: projectId,
+      source_task_ids: ["task-evolution-v2"],
+      selections: [{
+        schema_version: "2",
+        target_id: "text_memory",
+        method: "text_memory_reflector",
+        config: {},
+      }],
+      state: "candidate_ready",
+      artifact_ids: ["artifact-memory-v2"],
+      error: null,
+      created_at: "2026-08-23T00:00:00Z",
+      updated_at: "2026-08-23T00:00:01Z",
+    }];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/state")) {
+        return jsonResponse({
+          schema_version: "1",
+          active_project_id: projectId,
+          projects: [{
+            project_id: projectId,
+            display_name: "Evolution v2",
+            config,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:00Z",
+          }],
+          sessions: [],
+          artifacts: [],
+          evolution_jobs: [],
+          evolution_runs: [{
+            run_id: "legacy-run-that-must-be-ignored",
+            project_id: projectId,
+            source_session_ids: ["legacy-task"],
+            selections: [{ target_id: "text_memory", method: "text_memory_reflector", config: {} }],
+            state: "failed",
+            artifact_ids: [],
+            error: "legacy",
+            created_at: "2026-08-22T00:00:00Z",
+            updated_at: "2026-08-22T00:00:00Z",
+          }],
+          workspaces: [],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "1",
+          authority: "development_catalog_unverified",
+          capabilities: {
+            schema_version: "1",
+            core_version: "development",
+            registry_digest: "a".repeat(64),
+            evaluated_profile: {
+              execution_mode: "subscription",
+              capture_mode: "transcript",
+              harness_id: "codex",
+              harness_capabilities: [],
+              runtime_capabilities: [],
+            },
+            targets: [],
+          },
+        });
+      }
+      if (url.includes("/desktop/v2/development/evolution-runs?") && init?.method === undefined) {
+        expect(new Headers(init?.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+        return jsonResponse({ schema_version: "2", items: runs, next_cursor: null, has_more: false });
+      }
+      if (url.endsWith("/desktop/v2/development/evolution-runs") && init?.method === "POST") {
+        const creation = JSON.parse(String(init.body)) as Record<string, unknown>;
+        const created = {
+          schema_version: "2",
+          run_id: "evolution-run-v2-2",
+          action_id: creation.action_id,
+          project_id: creation.project_id,
+          source_task_ids: creation.source_task_ids,
+          selections: creation.selections,
+          state: "running",
+          artifact_ids: [],
+          error: null,
+          created_at: "2026-08-23T00:00:02Z",
+          updated_at: "2026-08-23T00:00:02Z",
+        };
+        runs.push(created);
+        return jsonResponse(created, 202);
+      }
+      if (url.endsWith("/desktop/v2/development/evolution-runs/evolution-run-v2-1/apply")) {
+        const applied = { ...runs[0]!, state: "applied", updated_at: "2026-08-23T00:00:03Z" };
+        runs[0] = applied;
+        return jsonResponse(applied);
+      }
+      throw new Error(`Unexpected Evolution v2 request: ${init?.method ?? "GET"} ${url}`);
+    });
+    const provider = createDevelopmentAgentProvider({
+      fetchImpl,
+      evolutionV2BaseUrl: "/desktop/v2/development/evolution-runs",
+      desktopSessionToken: "session-secret",
+    });
+
+    let refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Evolution v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.evolutionRuns?.map((run) => run.runId))
+      .toEqual(["evolution-run-v2-1"]);
+
+    await provider.applyEvolutionRun?.("evolution-run-v2-1", {
+      actionId: "apply-evolution-v2",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    });
+    refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Applied Evolution v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.evolutionRuns?.[0]?.state).toBe("applied");
+
+    await provider.startEvolutionRun?.(
+      projectId,
+      ["task-evolution-v2"],
+      [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
+      { actionId: "start-evolution-v2", streamEpoch: refreshed.snapshot.stream.epoch },
+    );
+    refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Created Evolution v2 provider was not fresh");
+    expect(refreshed.snapshot.runtimePresentation?.evolutionRuns?.[1]?.state).toBe("running");
+    expect(fetchImpl.mock.calls.some(([input]) => String(input).includes("/openevo-dev-agent/v1/evolution-runs")))
+      .toBe(false);
+  });
 });
 
 function jsonResponse(body: object, status = 200): Response {

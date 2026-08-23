@@ -158,6 +158,50 @@ const sessionSchema = z.object({
   updated_at: z.string().min(1),
 }).strict();
 
+const evolutionRunSchema = z.object({
+  run_id: z.string().min(1),
+  project_id: z.string().min(1),
+  source_session_ids: z.array(z.string().min(1)).min(1),
+  selections: z.array(z.object({
+    target_id: z.string().min(1),
+    method: z.string().min(1),
+    config: z.record(z.string(), z.unknown()).default({}),
+  }).strict()).min(1),
+  state: z.enum(["running", "candidate_ready", "applied", "failed"]),
+  artifact_ids: z.array(z.string().min(1)),
+  error: z.string().nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const evolutionSelectionV2Schema = z.object({
+  schema_version: z.literal("2"),
+  target_id: z.string().min(1),
+  method: z.string().min(1),
+  config: z.record(z.string(), z.unknown()),
+}).strict();
+
+const evolutionRunV2Schema = z.object({
+  schema_version: z.literal("2"),
+  run_id: z.string().min(1),
+  action_id: z.string().min(1),
+  project_id: z.string().min(1),
+  source_task_ids: z.array(z.string().min(1)).min(1).max(128),
+  selections: z.array(evolutionSelectionV2Schema).min(1).max(64),
+  state: z.enum(["running", "candidate_ready", "applied", "failed"]),
+  artifact_ids: z.array(z.string().min(1)).max(256),
+  error: z.string().max(32_000).nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const evolutionRunPageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  items: z.array(evolutionRunV2Schema).max(25),
+  next_cursor: z.string().min(1).nullable(),
+  has_more: z.boolean(),
+}).strict();
+
 const stateSchema = z.object({
   schema_version: z.literal("1"),
   active_project_id: z.string().min(1).nullable(),
@@ -195,21 +239,7 @@ const stateSchema = z.object({
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
   }).strict()),
-  evolution_runs: z.array(z.object({
-    run_id: z.string().min(1),
-    project_id: z.string().min(1),
-    source_session_ids: z.array(z.string().min(1)).min(1),
-    selections: z.array(z.object({
-      target_id: z.string().min(1),
-      method: z.string().min(1),
-      config: z.record(z.string(), z.unknown()).default({}),
-    }).strict()).min(1),
-    state: z.enum(["running", "candidate_ready", "applied", "failed"]),
-    artifact_ids: z.array(z.string().min(1)),
-    error: z.string().nullable(),
-    created_at: z.string().min(1),
-    updated_at: z.string().min(1),
-  }).strict()).default([]),
+  evolution_runs: z.array(evolutionRunSchema).default([]),
   workspaces: z.array(workspaceSnapshotSchema).default([]),
 }).strict();
 
@@ -224,6 +254,7 @@ export interface DevelopmentAgentProviderOptions {
   readonly fetchImpl?: typeof fetch;
   readonly workspaceV2BaseUrl?: string;
   readonly artifactV2BaseUrl?: string;
+  readonly evolutionV2BaseUrl?: string;
   readonly desktopSessionToken?: string;
 }
 
@@ -238,6 +269,7 @@ export function createDevelopmentAgentProvider(
   const fetchImpl = options.fetchImpl ?? fetch;
   const workspaceV2BaseUrl = options.workspaceV2BaseUrl?.replace(/\/$/, "");
   const artifactV2BaseUrl = options.artifactV2BaseUrl?.replace(/\/$/, "");
+  const evolutionV2BaseUrl = options.evolutionV2BaseUrl?.replace(/\/$/, "");
 
   const digestHex = async (payload: ArrayBuffer): Promise<string> => Array.from(
     new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
@@ -363,6 +395,82 @@ export function createDevelopmentAgentProvider(
     throw new Error("Artifact v2 exceeded the bounded pagination limit.");
   };
 
+  const requestEvolutionV2 = async (
+    suffix: string,
+    init: RequestInit = {},
+    timeoutMs = 60_000,
+  ): Promise<unknown> => {
+    if (evolutionV2BaseUrl === undefined) throw new Error("Evolution Run v2 is not configured.");
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const headers = new Headers(init.headers);
+      if (options.desktopSessionToken !== undefined) {
+        headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
+      }
+      const response = await fetchImpl(`${evolutionV2BaseUrl}${suffix}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The Evolution Run request timed out. Check the SSH development tunnel.");
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  };
+
+  const loadEvolutionRunsV2 = async (projectId: string) => {
+    const runs: z.infer<typeof evolutionRunSchema>[] = [];
+    let cursor: string | null = null;
+    for (let pageNumber = 0; pageNumber < 40; pageNumber += 1) {
+      const parameters = new URLSearchParams({ project_id: projectId, limit: "25" });
+      if (cursor !== null) parameters.set("after", cursor);
+      const page = evolutionRunPageV2Schema.parse(
+        await requestEvolutionV2(`?${parameters.toString()}`),
+      );
+      for (const item of page.items) {
+        if (item.project_id !== projectId) {
+          throw new Error("Evolution Run v2 crossed project authority.");
+        }
+        runs.push({
+          run_id: item.run_id,
+          project_id: item.project_id,
+          source_session_ids: item.source_task_ids,
+          selections: item.selections.map((selection) => ({
+            target_id: selection.target_id,
+            method: selection.method,
+            config: selection.config,
+          })),
+          state: item.state,
+          artifact_ids: item.artifact_ids,
+          error: item.error,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+        });
+      }
+      if (!page.has_more) {
+        if (page.next_cursor !== null) {
+          throw new Error("Evolution Run v2 returned an invalid terminal cursor.");
+        }
+        return runs;
+      }
+      if (page.next_cursor === null || page.next_cursor === cursor) {
+        throw new Error("Evolution Run v2 returned an invalid continuation cursor.");
+      }
+      cursor = page.next_cursor;
+    }
+    throw new Error("Evolution Run v2 exceeded the bounded pagination limit.");
+  };
+
   const requestJson = async (
     path: string,
     init?: RequestInit,
@@ -421,13 +529,17 @@ export function createDevelopmentAgentProvider(
         requestJson("/state").then((value) => stateSchema.parse(value)),
         requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
       ]);
-      const [workspaces, artifacts] = await Promise.all([
+      const [workspaces, artifacts, evolutionRuns] = await Promise.all([
         workspaceV2BaseUrl === undefined
           ? payload.workspaces
           : Promise.all(payload.projects.map((project) => loadWorkspaceV2(project.project_id))),
         artifactV2BaseUrl === undefined
           ? payload.artifacts
           : Promise.all(payload.projects.map((project) => loadArtifactsV2(project.project_id)))
+            .then((pages) => pages.flat()),
+        evolutionV2BaseUrl === undefined
+          ? payload.evolution_runs
+          : Promise.all(payload.projects.map((project) => loadEvolutionRunsV2(project.project_id)))
             .then((pages) => pages.flat()),
       ]);
       return {
@@ -498,7 +610,7 @@ export function createDevelopmentAgentProvider(
           createdAt: job.created_at,
           updatedAt: job.updated_at,
         })),
-        evolutionRuns: payload.evolution_runs.map((run) => ({
+        evolutionRuns: evolutionRuns.map((run) => ({
           runId: run.run_id,
           projectId: run.project_id,
           sourceSessionIds: run.source_session_ids,
@@ -560,25 +672,56 @@ export function createDevelopmentAgentProvider(
       );
     },
     startEvolutionRun: async (projectId, sourceSessionIds, selections) => {
-      await requestJson(
-        "/evolution-runs",
+      const serializedSelections = selections.map((selection) => ({
+        target_id: selection.targetId,
+        method: selection.method,
+        config: selection.config,
+      }));
+      if (evolutionV2BaseUrl === undefined) {
+        await requestJson(
+          "/evolution-runs",
+          jsonRequest("POST", {
+            schema_version: "1",
+            project_id: projectId,
+            session_ids: sourceSessionIds,
+            selections: serializedSelections,
+          }),
+        );
+        return;
+      }
+      const actionId = globalThis.crypto.randomUUID();
+      const created = evolutionRunV2Schema.parse(await requestEvolutionV2(
+        "",
         jsonRequest("POST", {
-          schema_version: "1",
+          schema_version: "2",
+          action_id: actionId,
           project_id: projectId,
-          session_ids: sourceSessionIds,
-          selections: selections.map((selection) => ({
-            target_id: selection.targetId,
-            method: selection.method,
-            config: selection.config,
+          source_task_ids: sourceSessionIds,
+          selections: serializedSelections.map((selection) => ({
+            schema_version: "2",
+            ...selection,
           })),
         }),
-      );
+      ));
+      if (created.action_id !== actionId || created.project_id !== projectId) {
+        throw new Error("Evolution Run v2 returned inconsistent creation authority.");
+      }
     },
     applyEvolutionRun: async (runId) => {
-      await requestJson(
-        `/evolution-runs/${encodeURIComponent(runId)}/apply`,
-        jsonRequest("POST", { schema_version: "1" }),
-      );
+      if (evolutionV2BaseUrl === undefined) {
+        await requestJson(
+          `/evolution-runs/${encodeURIComponent(runId)}/apply`,
+          jsonRequest("POST", { schema_version: "1" }),
+        );
+        return;
+      }
+      const applied = evolutionRunV2Schema.parse(await requestEvolutionV2(
+        `/${encodeURIComponent(runId)}/apply`,
+        jsonRequest("POST", { schema_version: "2" }),
+      ));
+      if (applied.run_id !== runId || applied.state !== "applied") {
+        throw new Error("Evolution Run v2 returned inconsistent apply authority.");
+      }
     },
     uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite) => {
       if (workspaceV2BaseUrl !== undefined) {

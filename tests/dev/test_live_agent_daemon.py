@@ -1120,6 +1120,185 @@ def test_daemon_v2_artifacts_are_paginated_bounded_and_restart_safe(tmp_path: Pa
     assert restored_page.items[0].documents[0].path == "SKILL.md"
 
 
+def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
+    tmp_path: Path,
+) -> None:
+    token = "e" * 32
+    database = tmp_path / "state.sqlite3"
+    project_id = "development-project-v2-evolution"
+    task_id = "development-task-v2-evolution"
+    action_id = "development-action-v2-evolution"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": project_id,
+        "display_name": "V2 Evolution",
+        "config": {},
+    })
+    store.start_session(task_id, {
+        "project_id": project_id,
+        "project_name": "V2 Evolution",
+        "task_title": "Evolution evidence",
+        "instruction": "Create reusable evidence",
+    })
+    store.complete_session(task_id, {
+        "response": "Reusable observation",
+        "model": "test-model",
+        "duration_ms": 1,
+        "logs": [],
+    })
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text("{}", encoding="utf-8")
+    store.record_dataset_artifact(
+        artifact_id="dataset-v2-evolution",
+        project_id=project_id,
+        session_id=task_id,
+        uri=dataset.resolve().as_uri(),
+        name="Evolution evidence",
+    )
+    evolution_started = threading.Event()
+    release_evolution = threading.Event()
+
+    class FakeEvolutionRunner:
+        def evolve_run(self, *, run: dict[str, object], store: object) -> dict[str, object]:
+            evolution_started.set()
+            if not release_evolution.wait(5):
+                raise RuntimeError("test did not release the Evolution runner")
+            content = "# Applied memory\n"
+            artifact = store.record_evolution_artifact(
+                artifact_id=f"artifact-{run['run_id']}",
+                project_id=project_id,
+                session_id=task_id,
+                run_id=run["run_id"],
+                target_id="text_memory",
+                artifact_type="text_memory",
+                method_id="text_memory_reflector",
+                renderer_kind="markdown",
+                documents=[{
+                    "path": "memory.md",
+                    "media_type": "text/markdown",
+                    "content": content,
+                }],
+                manifest={"content_path": "memory.md"},
+                previous_artifact_id=None,
+                promoted=False,
+            )
+            return {"artifacts": [artifact], "errors": []}
+
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0),
+        token,
+        object(),
+        store,
+        evolution_runner=FakeEvolutionRunner(),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = f"http://127.0.0.1:{server.server_address[1]}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    request_body = {
+        "schema_version": "2",
+        "action_id": action_id,
+        "project_id": project_id,
+        "source_task_ids": [task_id],
+        "selections": [{
+            "schema_version": "2",
+            "target_id": "text_memory",
+            "method": "text_memory_reflector",
+            "config": {},
+        }],
+    }
+    try:
+        create = urllib.request.Request(
+            f"{root}/v2/development/evolution-runs",
+            data=json.dumps(request_body).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(create, timeout=5) as response:
+            created = json.loads(response.read())
+        assert created["action_id"] == action_id
+        run_id = created["run_id"]
+        assert evolution_started.wait(5)
+
+        duplicate = urllib.request.Request(
+            f"{root}/v2/development/evolution-runs",
+            data=json.dumps(request_body).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(duplicate, timeout=5) as response:
+            duplicate_running = json.loads(response.read())
+        assert duplicate_running["run_id"] == run_id
+        assert duplicate_running["state"] == "running"
+        release_evolution.set()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            detail_request = urllib.request.Request(
+                f"{root}/v2/development/evolution-runs/{run_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(detail_request, timeout=5) as response:
+                detail = json.loads(response.read())
+            if detail["state"] == "candidate_ready":
+                break
+            time.sleep(0.01)
+        assert detail["state"] == "candidate_ready"
+        assert len(detail["artifact_ids"]) == 1
+
+        duplicate = urllib.request.Request(
+            f"{root}/v2/development/evolution-runs",
+            data=json.dumps(request_body).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(duplicate, timeout=5) as response:
+            duplicate_result = json.loads(response.read())
+        assert duplicate_result["run_id"] == run_id
+        assert duplicate_result["state"] == "candidate_ready"
+
+        inventory = urllib.request.Request(
+            f"{root}/v2/development/evolution-runs?{urlencode({'project_id': project_id, 'limit': 25})}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(inventory, timeout=5) as response:
+            page = json.loads(response.read())
+        assert [item["run_id"] for item in page["items"]] == [run_id]
+
+        apply = urllib.request.Request(
+            f"{root}/v2/development/evolution-runs/{run_id}/apply",
+            data=b'{"schema_version":"2"}',
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(apply, timeout=5) as response:
+            applied = json.loads(response.read())
+        assert applied["state"] == "applied"
+    finally:
+        release_evolution.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    restored = MODULE.DevelopmentStateStore(database)
+    restored_run = restored.evolution_run_v2(run_id)
+    assert restored_run.state == "applied"
+    restored.start_session("development-task-after-v2-evolution", {
+        "project_id": project_id,
+        "project_name": "V2 Evolution",
+        "task_title": "Use applied context",
+        "instruction": "Use the newly applied memory",
+    })
+    next_session = next(
+        session for session in restored.snapshot()["sessions"]
+        if session["session_id"] == "development-task-after-v2-evolution"
+    )
+    assert next_session["context_artifact_ids"] == list(restored_run.artifact_ids)
+
+
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)

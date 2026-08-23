@@ -47,6 +47,10 @@ try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionRunApplyV2,
+        DevelopmentEvolutionRunCreateV2,
+        DevelopmentEvolutionRunPageV2,
+        DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -58,6 +62,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the launcher
     from development_agent_v2_contract import (  # type: ignore[no-redef]
         DevelopmentArtifactPageV2,
         DevelopmentArtifactV2,
+        DevelopmentEvolutionRunApplyV2,
+        DevelopmentEvolutionRunCreateV2,
+        DevelopmentEvolutionRunPageV2,
+        DevelopmentEvolutionRunV2,
         DevelopmentTaskObservationPageV2,
         DevelopmentTaskObservationV2,
         DevelopmentTaskTimelinePageV2,
@@ -82,6 +90,7 @@ MAX_DEVELOPMENT_DAEMON_STATE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_WORKSPACE_UPLOAD_BYTES = 32 * 1024 * 1024
+MAX_DEVELOPMENT_EVOLUTION_REQUEST_BYTES = 256 * 1024
 STATE_CACHE_SECONDS = 1.0
 DAEMON_EVENT_WAIT_MILLISECONDS = 5_000
 LOGGER = logging.getLogger("openevo.development_agent_web_layer")
@@ -1079,6 +1088,146 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
                     detail="development daemon returned invalid artifact detail",
                 ) from exc
             provider._find_project(validated.project_id)
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.api_route(
+        "/desktop/v2/development/evolution-runs",
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+    async def development_evolution_runs(request: Request) -> Response:
+        body = bytearray()
+        if request.method == "POST":
+            async for chunk in request.stream():
+                if len(chunk) > MAX_DEVELOPMENT_EVOLUTION_REQUEST_BYTES - len(body):
+                    return _desktop_error_response(
+                        status=413,
+                        code="desktop_request_too_large",
+                        summary="The Evolution Run request exceeds the development limit.",
+                        retryable=False,
+                        action="none",
+                    )
+                body.extend(chunk)
+            try:
+                creation = DevelopmentEvolutionRunCreateV2.model_validate_json(body)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Evolution Run request did not match the closed v2 contract",
+                ) from exc
+            provider._find_project(creation.project_id)
+            body = bytearray(creation.model_dump_json().encode("utf-8"))
+        else:
+            project_id = request.query_params.get("project_id")
+            if project_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Evolution Run inventory requires project_id",
+                )
+            provider._find_project(project_id)
+
+        status, payload, headers = provider._client.proxy_v2(
+            "development/evolution-runs",
+            query=request.url.query if request.method == "GET" else "",
+            method=request.method,
+            body=bytes(body),
+            content_type="application/json" if request.method == "POST" else None,
+        )
+        if status in {HTTPStatus.OK, HTTPStatus.ACCEPTED}:
+            try:
+                if request.method == "GET":
+                    validated = DevelopmentEvolutionRunPageV2.model_validate_json(payload)
+                    expected_project_id = request.query_params["project_id"]
+                    if any(
+                        item.project_id != expected_project_id
+                        for item in validated.items
+                    ):
+                        raise ValueError(
+                            "Evolution Run inventory crossed project authority"
+                        )
+                else:
+                    validated = DevelopmentEvolutionRunV2.model_validate_json(payload)
+                    if validated.project_id != creation.project_id:
+                        raise ValueError(
+                            "Evolution Run creation crossed project authority"
+                        )
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid Evolution Run payload",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/evolution-runs/{run_id}",
+        include_in_schema=False,
+    )
+    async def development_evolution_run_detail(run_id: str) -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/evolution-runs/{quote(run_id, safe='')}",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentEvolutionRunV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid Evolution Run detail",
+                ) from exc
+            provider._find_project(validated.project_id)
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.post(
+        "/desktop/v2/development/evolution-runs/{run_id}/apply",
+        include_in_schema=False,
+    )
+    async def development_evolution_run_apply(run_id: str, request: Request) -> Response:
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(chunk) > MAX_DEVELOPMENT_EVOLUTION_REQUEST_BYTES - len(body):
+                return _desktop_error_response(
+                    status=413,
+                    code="desktop_request_too_large",
+                    summary="The Evolution apply request exceeds the development limit.",
+                    retryable=False,
+                    action="none",
+                )
+            body.extend(chunk)
+        try:
+            apply_request = DevelopmentEvolutionRunApplyV2.model_validate_json(body)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Evolution apply request did not match the closed v2 contract",
+            ) from exc
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/evolution-runs/{quote(run_id, safe='')}/apply",
+            query="",
+            method="POST",
+            body=apply_request.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentEvolutionRunV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid applied Evolution Run",
+                ) from exc
+            provider._find_project(validated.project_id)
+            if validated.run_id != run_id or validated.state != "applied":
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned inconsistent Evolution apply authority",
+                )
             payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
 

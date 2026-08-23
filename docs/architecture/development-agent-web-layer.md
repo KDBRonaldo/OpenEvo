@@ -30,8 +30,10 @@ uploads and downloads are SHA-256 verified. Artifact presentation and standalone
 are still separate product actions. Artifact metadata now uses the standard Desktop/Core v2
 contracts, while bounded rich document presentation uses the development-only
 `/desktop/v2/development/artifacts*` bridge to daemon `/v2/development/artifacts*`. Standalone
-Evolution run/apply remains on the compatibility surface until its own route-by-route replacement
-preserves the full development acceptance path.
+Evolution create, inventory, detail, and apply now use the development-only
+`/desktop/v2/development/evolution-runs*` bridge to daemon
+`/v2/development/evolution-runs*`. Creation is action-ID idempotent; run state and candidate
+artifact identities are durable across daemon/Web Layer restarts.
 
 ## Start command
 
@@ -72,6 +74,8 @@ It opens the real product page, creates a uniquely named remote project, uploads
 workspace file through daemon v2, starts a Session, waits for the remote agent and evolution worker,
 refreshes task logs, applies a text-memory candidate, and saves a success screenshot. It also proves
 that the rendered Artifact result was reloaded through the authenticated daemon v2 Artifact routes.
+The test then starts another Session, verifies in the rendered Session inspector that the applied
+Artifact is pinned as context, and waits for that real agent turn to close successfully.
 A failed run retains its browser trace and screenshot under
 `desktop/test-results/`. Because project deletion is not currently part of the development daemon
 contract, each full test leaves its timestamped acceptance project in remote development state.
@@ -93,7 +97,9 @@ project/task/artifact projections, service status, and an SSE heartbeat on `/des
 Task admission, attempt, dataset-sealed timeline events and Task logs are now daemon-owned
 durable v2 journals rather than responses reconstructed by the Web Layer. Artifact list, metadata,
 content metadata, and rich bounded documents are likewise read from daemon-owned v2 routes; the
-Web Layer no longer reconstructs Artifact authority from the v1 state response.
+Web Layer no longer reconstructs Artifact authority from the v1 state response. Evolution Run
+create/list/detail/apply and the frontend's polling authority now use closed daemon-owned v2
+payloads; the self-hosted provider ignores Evolution Runs embedded in v1 state.
 
 The web layer converts remote development state to closed Desktop/Core v2 response models.
 It maps the development-only `report` artifact type to renderer-safe `diagnostic`; it does

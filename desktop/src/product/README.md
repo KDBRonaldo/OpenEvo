@@ -592,6 +592,12 @@ unapplied candidates. `POST /openevo-dev-agent/v1/evolution-runs/<run-id>/apply`
 atomically replaces the active artifact for each produced target; only then can later
 Sessions receive those artifacts as runtime context.
 
+The self-hosted WebUI path no longer calls those v1 Evolution Run endpoints. It uses the
+Desktop-session authenticated `/desktop/v2/development/evolution-runs*` bridge, which validates
+closed bounded payloads and forwards to daemon `/v2/development/evolution-runs*`. Creation binds a
+stable action ID so an exact retry returns the existing Run instead of starting the algorithms
+again. The direct development provider retains the v1 calls only as its compatibility fallback.
+
 Harness mechanics are isolated behind `HarnessAdapter`. The first concrete
 implementation is `CodexHarnessAdapter`, which owns runtime preparation,
 memory instruction injection, native skill and agent-system staging, runtime

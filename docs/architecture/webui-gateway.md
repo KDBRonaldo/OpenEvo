@@ -22,6 +22,8 @@ OpenEvo development Web Layer (remote loopback service)
   |- existing browser bootstrap -> Desktop session
   |- /desktop/v2/events -> authenticated SSE projection and browser cursor replay
   |- /desktop/v2/development/projects/{id}/workspace* -> daemon /v2 workspace API
+  |- /desktop/v2/development/artifacts* -> daemon /v2 Artifact API
+  |- /desktop/v2/development/evolution-runs* -> daemon /v2 Evolution Run API
   `- remaining /openevo-dev-agent/v1 compatibility and daemon credential isolation
   |
   v
@@ -39,8 +41,10 @@ The first migration step deliberately leaves the formal release Daemon compositi
 tunnel to it. The first walking skeleton now uses the strict `/desktop/v2` provider for Project
 and Task authority and mutations. Workspace inventory/upload/download now cross an authenticated,
 typed development-only Desktop v2 route and a daemon-owned `/v2` route; the old v1 workspace
-payload is ignored by the self-hosted provider. Readable transcript presentation and standalone
-Evolution actions remain explicit compatibility calls until their typed product contracts exist.
+  payload is ignored by the self-hosted provider. Readable transcript presentation and individual
+  Evolution Job retry remain explicit compatibility calls until their typed product contracts
+  exist. Standalone Evolution create, status, and apply now use closed development v2 contracts
+  with daemon-owned persistence and action-ID idempotency.
 Promotion to the release Daemon remains gated on removing that remaining compatibility
 surface and completing the full browser acceptance path.
 
@@ -112,12 +116,15 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - `/desktop/v2/development/artifacts*`: development-only, Desktop-session authenticated rich
   Artifact document projection. The Web Layer validates closed, bounded v2 payloads and project
   authority before the unchanged renderer receives them.
+- `/desktop/v2/development/evolution-runs*`: development-only, Desktop-session authenticated
+  create/list/detail/apply operations. The Web Layer validates bounded closed payloads while the
+  daemon owns run state, candidate identities, apply state, and idempotent action binding.
 - `/openevo-dev-agent/v1/events`: authenticated development-daemon long poll used only by the
   Web Layer. An omitted cursor establishes the current daemon sequence; `after=<sequence>` returns
   contiguous committed events and `410 event_cursor_expired` forces snapshot resynchronization.
-- `/openevo-dev-agent/v1/*`: authenticated development-only Evolution/transcript
+- `/openevo-dev-agent/v1/*`: authenticated development-only transcript and Evolution Job retry
   compatibility surface; it no longer owns Project, Task, Workspace browser mutations, Workspace
-  reads, Artifact reads, or the terminal Session response.
+  reads, Artifact reads, standalone Evolution Run actions/reads, or the terminal Session response.
 - Remote daemon `/v2/tasks`, `/v2/tasks/{task_id}`, `/v2/tasks/{task_id}/timeline`, and
   `/v2/tasks/{task_id}/logs`: bounded, bearer-authenticated Task status, durable timeline,
   and persistent log/result observations consumed only by the Web Layer. Timeline and log
@@ -130,6 +137,9 @@ the Web Layer retains the Daemon bearer and never exposes it to `desktop/src` or
 - Remote daemon `/v2/tasks/{task_id}/artifacts`, `/v2/artifacts/{artifact_id}*`, and
   `/v2/development/artifacts*`: stable Artifact metadata pagination plus bounded rich documents.
   Artifact rows and contents remain daemon-owned and survive daemon/Web Layer restarts.
+- Remote daemon `/v2/development/evolution-runs*`: bounded stable pagination, detail, idempotent
+  create, and idempotent apply. Applied candidate artifacts become the context pinned by the next
+  Session; the browser acceptance test verifies that context in the unchanged Session inspector.
 
 ## Deliberate boundaries
 
