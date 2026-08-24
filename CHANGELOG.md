@@ -1,5 +1,8 @@
 # Changelog
 
+- Extracted the recoverable SQLite state event journal into `openevo.daemon`
+  without changing event routes, payloads, sequence continuity, bounded replay,
+  or commit-time long-poll wakeups.
 - Extracted durable project catalog and active-project SQLite ownership into
   `openevo.daemon` while preserving the working remote WebUI command, existing
   database layout, event behavior, and multi-project visibility.

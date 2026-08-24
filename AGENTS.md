@@ -43,9 +43,11 @@ daemon bind to remote loopback; the browser reaches one local loopback port.
   Desktop v2 contract modules are the current browser/Web Layer wire boundary.
 - `src/openevo/daemon/project_catalog.py` owns the existing SQLite project
   table and active-project metadata behind the unchanged development API.
+- `src/openevo/daemon/event_journal.py` owns the bounded recoverable state
+  event journal, commit-time append semantics, cursors, and long-poll wakeups.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns task, workspace, artifact, and evolution state in SQLite until
-  each remaining owner is extracted behind the same API.
+  root and owns session/task, workspace, artifact, and evolution state in
+  SQLite until each remaining owner is extracted behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.
@@ -73,9 +75,10 @@ Migrate one independently testable capability at a time:
    acceptance; do not combine several authority migrations into one cutover.
 
 The preferred order is process lifecycle, Web Layer lifecycle, project catalog
-and persistence, sessions and events, workspace and artifacts, agent runner,
-evolution orchestration, and finally process composition.  This is a strangler
-migration of the proven chain, not a launcher switch to a second chain.
+and persistence, recoverable events, sessions/tasks, workspace and artifacts,
+agent runner, evolution orchestration, and finally process composition.  This
+is a strangler migration of the proven chain, not a launcher switch to a second
+chain.
 
 The MIT-licensed `nanobot/` source may be copied or adapted for process
 lifecycle, token storage, atomic state, bounded session persistence, and

@@ -21,6 +21,12 @@ artifact, capability, and evolution reads remain scoped to the active project.
 Selecting another project performs an idempotent activation before its
 project-bound collections are loaded.
 
+The Web Layer's event relay still consumes the same `/v2/development/events`
+contract.  Its durable sequence, bounded replay window, cursor expiry, and
+commit-time long-poll notification are owned by
+`src/openevo/daemon/event_journal.py`; browser payloads and reconnect behavior
+did not change during that extraction.
+
 Start from `desktop/`:
 
 ```bash

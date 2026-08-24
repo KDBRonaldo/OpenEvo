@@ -23,7 +23,6 @@ import stat
 import sys
 import tempfile
 import threading
-import time
 import zipfile
 from urllib.parse import parse_qs, quote, urlsplit
 from xml.etree import ElementTree
@@ -50,6 +49,10 @@ from openevo.backend.harness_adapter import (  # noqa: E402
     HarnessRunError,
 )
 from openevo.backend.contracts.v2 import models as core_v2  # noqa: E402
+from openevo.daemon.event_journal import (  # noqa: E402
+    EventCursorExpiredError,
+    SqliteStateEventJournal,
+)
 from openevo.daemon.project_catalog import (  # noqa: E402
     ProjectCatalogConflictError,
     SqliteProjectCatalog,
@@ -234,10 +237,6 @@ class EvolutionRunError(RuntimeError):
 
 
 class StateConflictError(RuntimeError):
-    pass
-
-
-class EventCursorExpiredError(RuntimeError):
     pass
 
 
@@ -1206,6 +1205,13 @@ class DevelopmentStateStore:
         self._lock = threading.RLock()
         self._event_condition = threading.Condition(self._lock)
         self.workspaces = ProjectWorkspaceStore(path.parent / "workspaces")
+        self.event_journal = SqliteStateEventJournal(
+            path,
+            condition=self._event_condition,
+            connection_factory=lambda: self._connection(emit_event=False),
+            retention_limit=lambda: MAX_DEVELOPMENT_STATE_EVENTS,
+            clock=utc_now,
+        )
         self.project_catalog = SqliteProjectCatalog(
             path,
             lock=self._lock,
@@ -1219,18 +1225,9 @@ class DevelopmentStateStore:
             pass
         with self._connection() as connection:
             self.project_catalog.initialize_schema(connection)
+            self.event_journal.initialize_schema(connection)
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS development_state_events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    project_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL CHECK (event_type = 'state_changed'),
-                    payload_sha256 TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS development_state_events_project_sequence
-                    ON development_state_events(project_id, sequence);
                 CREATE TABLE IF NOT EXISTS development_sessions (
                     session_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
@@ -1729,70 +1726,14 @@ class DevelopmentStateStore:
                 initial_changes = connection.total_changes
                 yield connection
                 if emit_event and connection.total_changes > initial_changes:
-                    emitted = self._append_state_event(connection)
+                    emitted = self.event_journal.append(connection)
         finally:
             connection.close()
         if emitted:
-            with self._event_condition:
-                self._event_condition.notify_all()
-
-    @staticmethod
-    def _append_state_event(
-        connection: sqlite3.Connection,
-        *,
-        project_id: str | None = None,
-    ) -> bool:
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'development_state_events'"
-        ).fetchone()
-        if table is None:
-            return False
-        if project_id is None:
-            active = connection.execute(
-                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
-            ).fetchone()
-            project_id = active["value"] if active is not None else None
-        if not project_id:
-            latest = connection.execute(
-                "SELECT project_id FROM development_projects "
-                "ORDER BY updated_at DESC, project_id DESC LIMIT 1"
-            ).fetchone()
-            project_id = latest["project_id"] if latest is not None else None
-        if not project_id:
-            return False
-        occurred_at = utc_now()
-        event_id = f"development-event-{secrets.token_hex(16)}"
-        payload_sha256 = hashlib.sha256(
-            canonical_json(
-                {
-                    "event_id": event_id,
-                    "event_type": "state_changed",
-                    "occurred_at": occurred_at,
-                    "project_id": project_id,
-                }
-            ).encode("utf-8")
-        ).hexdigest()
-        connection.execute(
-            "INSERT INTO development_state_events("
-            "event_id, project_id, event_type, payload_sha256, occurred_at"
-            ") VALUES (?, ?, 'state_changed', ?, ?)",
-            (event_id, project_id, payload_sha256, occurred_at),
-        )
-        connection.execute(
-            "DELETE FROM development_state_events WHERE sequence < ("
-            "SELECT sequence FROM development_state_events "
-            "ORDER BY sequence DESC LIMIT 1 OFFSET ?)",
-            (MAX_DEVELOPMENT_STATE_EVENTS - 1,),
-        )
-        return True
+            self.event_journal.notify_committed_change()
 
     def _emit_project_event(self, project_id: str) -> None:
-        with self._event_condition:
-            with self._connection(emit_event=False) as connection:
-                emitted = self._append_state_event(connection, project_id=project_id)
-            if emitted:
-                self._event_condition.notify_all()
+        self.event_journal.emit(project_id)
 
     def read_events(
         self,
@@ -1801,51 +1742,11 @@ class DevelopmentStateStore:
         limit: int,
         wait_seconds: float,
     ) -> dict[str, Any]:
-        deadline = time.monotonic() + wait_seconds
-        with self._event_condition:
-            while True:
-                with self._connection(emit_event=False) as connection:
-                    bounds = connection.execute(
-                        "SELECT MIN(sequence) AS earliest, MAX(sequence) AS latest "
-                        "FROM development_state_events"
-                    ).fetchone()
-                    earliest = bounds["earliest"] if bounds is not None else None
-                    latest = bounds["latest"] if bounds is not None else None
-                    latest_sequence = int(latest or 0)
-                    if after_sequence is None:
-                        return {
-                            "schema_version": "1",
-                            "events": [],
-                            "latest_sequence": latest_sequence,
-                            "has_more": False,
-                        }
-                    if after_sequence > latest_sequence:
-                        raise EventCursorExpiredError("event cursor is ahead of daemon authority")
-                    if earliest is not None and after_sequence < int(earliest) - 1:
-                        raise EventCursorExpiredError("event cursor is outside the replay window")
-                    rows = connection.execute(
-                        "SELECT * FROM development_state_events WHERE sequence > ? "
-                        "ORDER BY sequence LIMIT ?",
-                        (after_sequence, limit + 1),
-                    ).fetchall()
-                has_more = len(rows) > limit
-                page = rows[:limit]
-                if page:
-                    return {
-                        "schema_version": "1",
-                        "events": [self._event_record(row) for row in page],
-                        "latest_sequence": latest_sequence,
-                        "has_more": has_more,
-                    }
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return {
-                        "schema_version": "1",
-                        "events": [],
-                        "latest_sequence": latest_sequence,
-                        "has_more": False,
-                    }
-                self._event_condition.wait(remaining)
+        return self.event_journal.read(
+            after_sequence=after_sequence,
+            limit=limit,
+            wait_seconds=wait_seconds,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
@@ -3840,17 +3741,6 @@ class DevelopmentStateStore:
                 {"schema_version": "2", **document}
                 for document in record["documents"]
             ],
-        }
-
-    @staticmethod
-    def _event_record(row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "sequence": row["sequence"],
-            "event_id": row["event_id"],
-            "project_id": row["project_id"],
-            "event_type": row["event_type"],
-            "payload_sha256": row["payload_sha256"],
-            "occurred_at": row["occurred_at"],
         }
 
     @staticmethod
