@@ -1,5 +1,9 @@
 # Changelog
 
+- Added deterministic, versioned self-hosted Release Bundles containing the
+  built WebUI, Web Layer, daemon, server contract code, and dependency lock;
+  the formal launcher now verifies and installs these bundles by immutable
+  release ID over SSH without Docker or a server-side GitHub checkout.
 - Promoted the proven SSH/Git-bundle/tunnel path into `openevo webui`, with
   bounded `~/.ssh/config` host discovery, interactive selection, last-server
   persistence, automatic browser opening, and a thin historical script adapter.

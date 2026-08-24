@@ -6,9 +6,10 @@ Status: canonical for the experimental product branch.
 
 OpenEvo gives a researcher one browser UI for remote projects, agent sessions,
 workspace files, artifacts, and evolution.  The researcher supplies an
-ordinary OpenSSH target; OpenEvo installs or updates the committed local source
-through SSH, starts the remote processes, opens one private tunnel, and
-launches the local browser.
+ordinary OpenSSH target; OpenEvo installs or updates one verified versioned
+release through SSH, starts the remote processes, opens one private tunnel,
+and launches the local browser. Maintainers may use the exact-commit Git-bundle
+delivery path during source development.
 
 ## Supported topology
 
@@ -30,9 +31,10 @@ paths.
 1. The user has a working SSH configuration and remote Codex login.
 2. The user runs `openevo webui`, selects a discovered `~/.ssh/config` host,
    or supplies explicit SSH connection arguments.
-3. The launcher deploys the exact committed local branch head through SSH; the
-   remote host does not need GitHub access and the branch does not need to be
-   pushed before use.
+3. The launcher verifies and deploys a versioned Release Bundle through SSH.
+   During source development it may instead deploy the exact committed local
+   branch head. The remote host does not need GitHub access and a development
+   branch does not need to be pushed before use.
 4. The browser creates or selects a persistent project.
 5. Sessions run against that project's remote workspace.
 6. Completed session evidence can produce and apply evolution artifacts.
@@ -41,12 +43,17 @@ paths.
 
 ## Required behavior
 
-- WebUI, Web Layer, and daemon versions come from one exact commit.
-- A matching installed commit starts without source transfer.  Source install,
-  update, and start are independently invocable, while the default command may
-  compose them as one bounded operation.
-- Source bundles are integrity-checked before use.  SSH connection, transfer,
-  remote bootstrap, and readiness waits have finite timeouts.
+- WebUI, Web Layer, daemon, server contract code, and dependency lock come from
+  one exact committed release payload and share one content-derived release ID.
+- A matching installed release (or development commit) starts without source
+  transfer. Install, update, and start are independently invocable, while the
+  default command may compose them as one bounded operation.
+- Release and development source bundles are integrity-checked before use.
+  Release contents are verified locally, after SSH transfer, and again when an
+  installed release is reused. SSH connection, transfer, remote bootstrap, and
+  readiness waits have finite timeouts.
+- Release payloads are immutable and versioned separately from their Python
+  environment and authoritative SQLite/workspace state.
 - The daemon persists authority in
   `~/.openevo/dev-agent/state.sqlite3` and project workspaces under the same
   managed state root.
@@ -62,8 +69,9 @@ paths.
 
 ## Acceptance
 
-A candidate is usable only when the real remote command starts successfully
-and a browser can create two projects, switch between them, run a session,
+A candidate is usable only when its Release Bundle is built from an exact
+commit, installed on a real remote host without a server-side GitHub checkout,
+and the browser can create two projects, switch between them, run a session,
 reload history, upload/download a file, produce an evolution artifact, apply
 it, and observe it in the next session.
 

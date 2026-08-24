@@ -26,6 +26,13 @@ import webbrowser
 from pathlib import Path
 from typing import Callable, Iterator
 
+from openevo.release_bundle import (
+    RELEASE_ID_PATTERN,
+    ReleaseBundleError,
+    ReleaseBundleReceipt,
+    verify_release_bundle,
+)
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPOSITORY_ROOT / "desktop"
@@ -608,6 +615,278 @@ def upload_source_bundle(
         )
 
 
+def build_remote_release_probe_script() -> str:
+    return f"""\
+set -eu
+state_root="{REMOTE_DEVELOPMENT_STATE_ROOT}"
+active_marker="$state_root/active-release-v1"
+if [ ! -f "$active_marker" ]; then
+  printf 'absent\n'
+  exit 0
+fi
+release_id="$(cat "$active_marker" 2>/dev/null || true)"
+case "$release_id" in
+  ''|*[!0-9a-f]*) printf 'invalid\n'; exit 0 ;;
+esac
+release_root="$state_root/releases/$release_id"
+if [ ! -f "$release_root/manifest.json" ] || [ ! -d "$release_root/payload" ]; then
+  printf 'invalid\n'
+else
+  printf 'managed:%s\n' "$release_id"
+fi
+"""
+
+
+def probe_remote_release_id(ssh_binary: str, connection: SshConnection) -> str | None:
+    result = _run_remote_capture(
+        ssh_binary,
+        connection,
+        build_remote_release_probe_script(),
+        timeout=30,
+    ).strip()
+    if result == "absent":
+        return None
+    if result.startswith("managed:"):
+        release_id = result.removeprefix("managed:")
+        if RELEASE_ID_PATTERN.fullmatch(release_id):
+            return release_id
+    raise LauncherError(f"remote release probe returned an invalid result: {result!r}")
+
+
+def upload_release_bundle(
+    ssh_binary: str,
+    connection: SshConnection,
+    bundle: ReleaseBundleReceipt,
+) -> None:
+    remote_command = (
+        "set -eu; umask 077; "
+        'mkdir -p "$HOME/.openevo/dev-agent/incoming"; '
+        f'cat > "$HOME/.openevo/dev-agent/incoming/release-{bundle.release_id}.oevobundle"'
+    )
+    try:
+        with bundle.path.open("rb") as source:
+            completed = subprocess.run(
+                [
+                    ssh_binary,
+                    *connection.options,
+                    *_ssh_transport_options(),
+                    connection.destination,
+                    remote_command,
+                ],
+                stdin=source,
+                check=False,
+                timeout=SOURCE_TRANSFER_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise LauncherError(
+            f"release upload exceeded {SOURCE_TRANSFER_TIMEOUT_SECONDS} seconds"
+        ) from exc
+    if completed.returncode != 0:
+        raise LauncherError(
+            f"release upload failed with SSH exit code {completed.returncode}"
+        )
+
+
+def build_remote_release_install_script(
+    bundle: ReleaseBundleReceipt,
+    *,
+    archive_uploaded: bool,
+) -> str:
+    """Install or re-verify one immutable release and atomically activate it."""
+
+    values = {
+        "release_id": bundle.release_id,
+        "bundle_sha256": bundle.sha256 if archive_uploaded else "",
+        "source_commit": bundle.source_commit,
+        "product_version": bundle.product_version,
+    }
+    quoted = {key: shlex.quote(value) for key, value in values.items()}
+    return rf"""\
+set -eu
+umask 077
+state_root="{REMOTE_DEVELOPMENT_STATE_ROOT}"
+release_id={quoted['release_id']}
+bundle_sha256={quoted['bundle_sha256']}
+expected_commit={quoted['source_commit']}
+expected_version={quoted['product_version']}
+archive="$state_root/incoming/release-$release_id.oevobundle"
+releases_root="$state_root/releases"
+release_root="$releases_root/$release_id"
+active_marker="$state_root/active-release-v1"
+mkdir -p "$state_root/incoming" "$releases_root"
+
+if [ ! -e "$release_root" ]; then
+  if [ -z "$bundle_sha256" ] || [ ! -f "$archive" ]; then
+    echo "Release $release_id is not installed and its uploaded bundle is missing." >&2
+    exit 51
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "sha256sum is required to verify the uploaded release." >&2
+    exit 52
+  fi
+  actual_sha256="$(sha256sum "$archive" | awk '{{print $1}}')"
+  if [ "$actual_sha256" != "$bundle_sha256" ]; then
+    echo "Uploaded release digest does not match the local receipt." >&2
+    exit 53
+  fi
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Python 3 is required to install the OpenEvo release." >&2
+  exit 54
+fi
+
+python3 - "$archive" "$releases_root" "$release_id" "$expected_commit" "$expected_version" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shutil
+import sys
+import tempfile
+import zipfile
+
+archive_path = Path(sys.argv[1])
+releases_root = Path(sys.argv[2])
+expected_id, expected_commit, expected_version = sys.argv[3:]
+release_root = releases_root / expected_id
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+
+def safe_path(value):
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        raise RuntimeError("release manifest contains an invalid path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts) or path.as_posix() != value:
+        raise RuntimeError("release manifest contains an unsafe path")
+    return path
+
+def validate_manifest(value):
+    required = {{"schema_version", "release_id", "product_version", "source_commit", "payload_root", "files"}}
+    if not isinstance(value, dict) or set(value) != required:
+        raise RuntimeError("release manifest does not match the closed schema")
+    if value["schema_version"] != "1" or value["payload_root"] != "payload":
+        raise RuntimeError("release manifest schema is unsupported")
+    if value["release_id"] != expected_id or value["source_commit"] != expected_commit or value["product_version"] != expected_version:
+        raise RuntimeError("release manifest identity does not match the requested release")
+    files = value["files"]
+    if not isinstance(files, list) or not 1 <= len(files) <= 10000:
+        raise RuntimeError("release manifest file inventory is invalid")
+    seen = set()
+    normalized = []
+    total = 0
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {{"path", "byte_size", "sha256"}}:
+            raise RuntimeError("release manifest file record is invalid")
+        path = safe_path(item["path"])
+        size, digest = item["byte_size"], item["sha256"]
+        if path.as_posix() in seen or not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= 134217728:
+            raise RuntimeError("release manifest file identity is invalid")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise RuntimeError("release manifest file digest is invalid")
+        total += size
+        if total > 536870912:
+            raise RuntimeError("release manifest payload is too large")
+        seen.add(path.as_posix())
+        normalized.append({{"path": path.as_posix(), "byte_size": size, "sha256": digest}})
+    if [item["path"] for item in normalized] != sorted(seen):
+        raise RuntimeError("release manifest is not canonically sorted")
+    identity = {{
+        "schema_version": "1",
+        "product_version": value["product_version"],
+        "source_commit": value["source_commit"],
+        "payload_root": "payload",
+        "files": normalized,
+    }}
+    if hashlib.sha256(canonical(identity)).hexdigest() != expected_id:
+        raise RuntimeError("release manifest digest is invalid")
+    return normalized
+
+def verify_installed(root, manifest, files):
+    manifest_bytes = canonical(manifest) + b"\n"
+    if (root / "manifest.json").read_bytes() != manifest_bytes:
+        raise RuntimeError("installed release manifest changed")
+    payload = root / "payload"
+    expected_files = {{item["path"] for item in files}}
+    expected_directories = set()
+    for expected_path in expected_files:
+        parts = PurePosixPath(expected_path).parts
+        expected_directories.update(
+            PurePosixPath(*parts[:index]).as_posix()
+            for index in range(1, len(parts))
+        )
+    for installed_path in payload.rglob("*"):
+        relative = installed_path.relative_to(payload).as_posix()
+        if installed_path.is_symlink():
+            raise RuntimeError(f"installed release contains a symbolic link: {{relative}}")
+        if installed_path.is_dir():
+            if relative not in expected_directories:
+                raise RuntimeError(f"installed release contains an extra directory: {{relative}}")
+        elif not installed_path.is_file() or relative not in expected_files:
+            raise RuntimeError(f"installed release contains an extra file: {{relative}}")
+    for item in files:
+        path = payload.joinpath(*PurePosixPath(item["path"]).parts)
+        if not path.is_file() or path.is_symlink() or path.stat().st_size != item["byte_size"]:
+            raise RuntimeError(f"installed release file changed: {{item['path']}}")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1048576):
+                digest.update(chunk)
+        if digest.hexdigest() != item["sha256"]:
+            raise RuntimeError(f"installed release file digest changed: {{item['path']}}")
+
+if release_root.exists():
+    manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
+    files = validate_manifest(manifest)
+    verify_installed(release_root, manifest, files)
+else:
+    if not archive_path.is_file():
+        raise RuntimeError("uploaded release archive is missing")
+    temporary = Path(tempfile.mkdtemp(prefix=".install-", dir=releases_root))
+    candidate = temporary / "release"
+    candidate.mkdir(mode=0o700)
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)) or names.count("manifest.json") != 1:
+                raise RuntimeError("release archive entries are invalid")
+            manifest = json.loads(archive.read("manifest.json"))
+            files = validate_manifest(manifest)
+            expected_names = {{"manifest.json", *(f"payload/{{item['path']}}" for item in files)}}
+            if set(names) != expected_names:
+                raise RuntimeError("release archive does not match its manifest")
+            (candidate / "manifest.json").write_bytes(canonical(manifest) + b"\n")
+            for item in files:
+                name = f"payload/{{item['path']}}"
+                info = archive.getinfo(name)
+                if info.file_size != item["byte_size"]:
+                    raise RuntimeError("release archive file size is invalid")
+                data = archive.read(info)
+                if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                    raise RuntimeError("release archive file digest is invalid")
+                destination = candidate / "payload" / PurePosixPath(item["path"])
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with destination.open("xb") as output:
+                    output.write(data)
+                os.chmod(destination, 0o600)
+        verify_installed(candidate, manifest, files)
+        try:
+            os.rename(candidate, release_root)
+        except FileExistsError:
+            existing_manifest = json.loads((release_root / "manifest.json").read_text(encoding="utf-8"))
+            verify_installed(release_root, existing_manifest, validate_manifest(existing_manifest))
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+PY
+
+marker_tmp="$active_marker.tmp.$$"
+printf '%s\n' "$release_id" > "$marker_tmp"
+mv "$marker_tmp" "$active_marker"
+rm -f "$archive"
+echo "OpenEvo release $expected_version ($release_id) is installed and verified."
+"""
+
+
 def build_remote_lifecycle_script(*, action: str, tail_lines: int = 200) -> str:
     """Build a bounded management command for the remote development stack.
 
@@ -761,6 +1040,7 @@ def build_remote_script(
     web_bootstrap_token: str = "",
     remote_web_port: int = 8788,
     browser_endpoint: str = "http://127.0.0.1:8765",
+    release_id: str = "",
 ) -> str:
     values = {
         "branch": branch,
@@ -775,6 +1055,8 @@ def build_remote_script(
         "web_bootstrap_token": web_bootstrap_token,
         "remote_web_port": str(remote_web_port),
         "browser_endpoint": browser_endpoint,
+        "release_id": release_id,
+        "delivery_mode": "release" if release_id else "git",
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
     webui_script = ""
@@ -855,7 +1137,13 @@ agent_token={quoted['token']}
 remote_port={quoted['remote_port']}
 evolution_model={quoted['evolution_model']}
 state_root="$HOME/.openevo/dev-agent"
-source_root="$state_root/source"
+delivery_mode={quoted['delivery_mode']}
+release_id={quoted['release_id']}
+if [ "$delivery_mode" = release ]; then
+  source_root="$state_root/releases/$release_id/payload"
+else
+  source_root="$state_root/source"
+fi
 source_marker="$state_root/managed-source-v1"
 source_bundle="$state_root/incoming/source-$expected_commit.bundle"
 pid_file="$state_root/daemon.pid"
@@ -863,6 +1151,15 @@ log_file="$state_root/daemon.log"
 
 mkdir -p "$state_root"
 
+if [ "$delivery_mode" = release ]; then
+  active_release="$(cat "$state_root/active-release-v1" 2>/dev/null || true)"
+  if [ "$active_release" != "$release_id" ] || [ ! -d "$source_root" ] || \
+     [ ! -f "$state_root/releases/$release_id/manifest.json" ]; then
+    echo "Requested OpenEvo release is not installed and active." >&2
+    exit 50
+  fi
+  deployed_commit="$expected_commit"
+else
 installed_commit=''
 if [ -e "$source_root" ]; then
   if [ ! -f "$source_marker" ] || [ ! -d "$source_root/.git" ]; then
@@ -950,13 +1247,28 @@ if [ "$deployed_commit" != "$expected_commit" ]; then
   echo "The locally delivered source did not activate commit $expected_commit." >&2
   exit 26
 fi
+fi
 
-runtime_marker="$state_root/runtime-commit-v1"
+if [ "$delivery_mode" = release ]; then
+  runtime_marker="$state_root/runtime-release-v1"
+  runtime_identity="$release_id"
+  runtime_environment="$state_root/runtimes/$release_id"
+  mkdir -p "$state_root/runtimes"
+else
+  runtime_marker="$state_root/runtime-commit-v1"
+  runtime_identity="$expected_commit"
+  runtime_environment="$source_root/.venv"
+fi
+export UV_PROJECT_ENVIRONMENT="$runtime_environment"
+export PYTHONDONTWRITEBYTECODE=1
 runtime_commit="$(cat "$runtime_marker" 2>/dev/null || true)"
-if [ "$runtime_commit" = "$expected_commit" ]; then
-  echo "[remote 2/4] Runtime already prepared for $expected_commit; skipping dependency sync."
+if [ ! -x "$runtime_environment/bin/python" ]; then
+  runtime_commit=''
+fi
+if [ "$runtime_commit" = "$runtime_identity" ]; then
+  echo "[remote 2/4] Runtime already prepared for $runtime_identity; skipping dependency sync."
 elif [ "$prepare_runtime" -ne 1 ]; then
-  echo "The runtime is not prepared for commit $expected_commit; run --source-action install or update first." >&2
+  echo "The runtime is not prepared for $runtime_identity; run --source-action install or update first." >&2
   exit 35
 else
   echo "[remote 2/4] Preparing uv and Python 3.11..."
@@ -998,19 +1310,23 @@ if [ -z "$uv_bin" ]; then
 fi
 
 cd "$source_root"
-if [ "$runtime_commit" != "$expected_commit" ]; then
+if [ "$runtime_commit" != "$runtime_identity" ]; then
   if ! command -v timeout >/dev/null 2>&1; then
     echo "timeout is required for bounded dependency installation." >&2
     exit 36
   fi
-  timeout 300 "$uv_bin" sync --frozen --python 3.11
+  if [ "$delivery_mode" = release ]; then
+    timeout 300 "$uv_bin" sync --frozen --no-dev --python 3.11
+  else
+    timeout 300 "$uv_bin" sync --frozen --python 3.11
+  fi
   runtime_marker_tmp="$runtime_marker.tmp.$$"
-  printf '%s\n' "$expected_commit" > "$runtime_marker_tmp"
+  printf '%s\n' "$runtime_identity" > "$runtime_marker_tmp"
   mv "$runtime_marker_tmp" "$runtime_marker"
 fi
 
 if [ "$start_services" -ne 1 ]; then
-  echo "Remote OpenEvo source and runtime are installed at commit $deployed_commit."
+  echo "Remote OpenEvo source and runtime are installed at $runtime_identity."
   exit 0
 fi
 
@@ -1307,6 +1623,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="committed local branch to deliver; defaults to the current branch",
     )
     parser.add_argument(
+        "--release-bundle",
+        type=Path,
+        help=(
+            "verified .oevobundle server release to install instead of deploying "
+            "the current Git checkout"
+        ),
+    )
+    parser.add_argument(
         "--source-action",
         choices=sorted(SOURCE_ACTIONS),
         default="auto",
@@ -1424,17 +1748,28 @@ def main(argv: list[str] | None = None) -> int:
             local_ports.append(args.web_port)
         ensure_local_ports_available(local_ports)
     connection = resolve_launcher_connection(args)
-    branch = resolve_branch(args.branch)
-    local_only_changes = validate_checkout_for_deployment(
-        web_layer=args.web_layer and not args.self_hosted_webui,
-        deploy_only=args.deploy_only or source_only,
-    )
-    if local_only_changes:
-        print(
-            "Using uncommitted local WebUI/Web Layer changes; the remote daemon will "
-            "remain pinned to the committed branch head."
+    release_bundle: ReleaseBundleReceipt | None = None
+    if args.release_bundle is not None:
+        if args.branch is not None:
+            raise LauncherError("--branch cannot be combined with --release-bundle")
+        try:
+            release_bundle = verify_release_bundle(args.release_bundle)
+        except ReleaseBundleError as exc:
+            raise LauncherError(f"release bundle verification failed: {exc}") from exc
+        branch = "release"
+        expected_commit = release_bundle.source_commit
+    else:
+        branch = resolve_branch(args.branch)
+        local_only_changes = validate_checkout_for_deployment(
+            web_layer=args.web_layer and not args.self_hosted_webui,
+            deploy_only=args.deploy_only or source_only,
         )
-    expected_commit = _git_output("rev-parse", "HEAD")
+        if local_only_changes:
+            print(
+                "Using uncommitted local WebUI/Web Layer changes; the remote daemon will "
+                "remain pinned to the committed branch head."
+            )
+        expected_commit = _git_output("rev-parse", "HEAD")
     token = secrets.token_urlsafe(32)
     web_session_token = secrets.token_hex(32) if args.self_hosted_webui else ""
     web_bootstrap_token = secrets.token_hex(32) if args.self_hosted_webui else ""
@@ -1442,34 +1777,83 @@ def main(argv: list[str] | None = None) -> int:
     if not ssh_binary:
         raise LauncherError("system OpenSSH client was not found")
 
+    delivery_label = "release" if release_bundle is not None else "source"
     print(
-        f"Checking installed OpenEvo source through SSH {connection.display_name}...",
+        f"Checking installed OpenEvo {delivery_label} through SSH {connection.display_name}...",
         flush=True,
     )
-    remote_commit = probe_remote_source_commit(ssh_binary, connection)
-    if args.source_action == "install" and remote_commit is not None:
+    expected_identity = (
+        release_bundle.release_id if release_bundle is not None else expected_commit
+    )
+    remote_identity = (
+        probe_remote_release_id(ssh_binary, connection)
+        if release_bundle is not None
+        else probe_remote_source_commit(ssh_binary, connection)
+    )
+    if args.source_action == "install" and remote_identity is not None:
         raise LauncherError(
-            f"OpenEvo is already installed at {remote_commit}; use --source-action update"
+            f"OpenEvo is already installed at {remote_identity}; use --source-action update"
         )
-    if args.source_action == "update" and remote_commit is None:
+    if args.source_action == "update" and remote_identity is None:
         raise LauncherError(
             "OpenEvo is not installed; use --source-action install"
         )
-    if args.source_action == "start" and remote_commit != expected_commit:
-        installed = remote_commit or "nothing"
+    if args.source_action == "start" and remote_identity != expected_identity:
+        installed = remote_identity or "nothing"
         raise LauncherError(
-            f"start requires local commit {expected_commit}, but the server has {installed}; "
+            f"start requires {expected_identity}, but the server has {installed}; "
             "run --source-action update first"
         )
 
-    needs_source_delivery = remote_commit != expected_commit
+    needs_source_delivery = remote_identity != expected_identity
     prepare_runtime = args.source_action != "start"
     start_services = not source_only
-    if needs_source_delivery:
+    if release_bundle is not None:
+        if needs_source_delivery:
+            print(
+                f"Uploading OpenEvo {release_bundle.product_version} release "
+                f"{release_bundle.release_id[:12]} ({release_bundle.byte_size} bytes) over SSH...",
+                flush=True,
+            )
+            upload_release_bundle(ssh_binary, connection, release_bundle)
+        else:
+            print(
+                f"Installed release already matches {release_bundle.release_id[:12]}; "
+                "no upload is needed.",
+                flush=True,
+            )
+        _run_remote(
+            ssh_binary,
+            connection,
+            build_remote_release_install_script(
+                release_bundle,
+                archive_uploaded=needs_source_delivery,
+            ),
+        )
+        _run_remote(
+            ssh_binary,
+            connection,
+            build_remote_script(
+                branch=branch,
+                expected_commit=expected_commit,
+                prepare_runtime=prepare_runtime,
+                start_services=start_services,
+                token=token,
+                remote_port=args.remote_port,
+                evolution_model=args.evolution_model,
+                self_hosted_webui=args.self_hosted_webui,
+                web_session_token=web_session_token,
+                web_bootstrap_token=web_bootstrap_token,
+                remote_web_port=args.remote_web_port,
+                browser_endpoint=f"http://127.0.0.1:{args.local_port}",
+                release_id=release_bundle.release_id,
+            ),
+        )
+    elif needs_source_delivery:
         with create_source_bundle(
             branch=branch,
             expected_commit=expected_commit,
-            remote_commit=remote_commit,
+            remote_commit=remote_identity,
         ) as bundle:
             print(
                 f"Uploading committed source {expected_commit[:12]} "

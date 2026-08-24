@@ -67,6 +67,31 @@ workflow. Source delivery requires a local commit, but it does not require a
 push. SSH connection, source transfer, remote command, dependency bootstrap,
 and health checks are bounded so a failed network phase reports an error.
 
+## Build and install a release bundle
+
+The Git-bundle path above remains the development workflow. A versioned server
+release can instead be built from one exact committed tree:
+
+```bash
+uv run python scripts/release/build_self_hosted_bundle.py \
+  --output dist/openevo-self-hosted.oevobundle
+```
+
+Install or update that exact release through the same SSH-config launcher:
+
+```bash
+uv run openevo webui \
+  --release-bundle dist/openevo-self-hosted.oevobundle
+```
+
+The bundle contains the built WebUI, Web Layer, daemon, server-side Desktop v2
+contract code, and the locked dependency manifest. It does not contain the
+repository history, tests, or frontend source. The launcher verifies the
+manifest and every file before uploading, verifies the archive again on the
+server, and installs it under an immutable release ID. Docker is not required.
+The server may still need its configured Python package source on first install
+to materialize the dependencies pinned by `uv.lock`.
+
 ## OpenEvo daemon
 
 The remote daemon is composed under `src/openevo/daemon/product_app.py`. It owns
@@ -110,6 +135,7 @@ npm run build:webui-gateway
 ```
 
 Python tests for the retained product path live mainly under `tests/dev/`,
+`tests/release/`,
 `tests/backend/test_evolution_runtime.py`, and the retained WebUI contract tests.
 
 ## Repository boundary
@@ -118,6 +144,8 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 - `scripts/dev/`: development automation and thin compatibility entry points.
 - `src/openevo/launcher.py`: formal SSH discovery, source delivery, tunnel,
   browser bootstrap, and lifecycle launcher.
+- `src/openevo/release_bundle.py`: deterministic server release construction
+  and strict local bundle verification.
 - `src/openevo/web_gateway/`: formal Web Layer composition and built,
   version-matched WebUI assets.
 - `src/openevo/daemon/`: formal process composition, closed daemon contracts,

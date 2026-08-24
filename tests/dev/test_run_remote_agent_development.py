@@ -3,10 +3,12 @@ from __future__ import annotations
 import shutil
 import socket
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from openevo import launcher as remote_launcher
+from openevo.release_bundle import ReleaseBundleReceipt
 
 
 @pytest.mark.parametrize("alias", ["openevo-lab", "gpu_lab.2", "server_01"])
@@ -58,6 +60,97 @@ def test_self_hosted_webui_is_an_explicit_opt_in() -> None:
 
     assert args.self_hosted_webui is True
     assert args.remote_web_port == 8788
+
+
+def test_release_bundle_is_an_explicit_delivery_input() -> None:
+    args = remote_launcher.parse_args(
+        [
+            "--host",
+            "example.com",
+            "--user",
+            "root",
+            "--release-bundle",
+            "dist/openevo.oevobundle",
+        ]
+    )
+
+    assert args.release_bundle.as_posix() == "dist/openevo.oevobundle"
+
+
+def test_remote_runtime_can_activate_an_installed_release() -> None:
+    release_id = "a" * 64
+
+    script = remote_launcher.build_remote_script(
+        branch="release",
+        expected_commit="b" * 40,
+        token="token-with-more-than-thirty-two-characters",
+        remote_port=8787,
+        evolution_model="gpt-5.5",
+        release_id=release_id,
+    )
+
+    assert "delivery_mode=release" in script
+    assert 'source_root="$state_root/releases/$release_id/payload"' in script
+    assert 'runtime_marker="$state_root/runtime-release-v1"' in script
+    assert 'runtime_environment="$state_root/runtimes/$release_id"' in script
+    assert 'export PYTHONDONTWRITEBYTECODE=1' in script
+    assert "sync --frozen --no-dev --python 3.11" in script
+
+
+def test_release_install_uses_verified_bundle_without_checkout_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    receipt = ReleaseBundleReceipt(
+        path=tmp_path / "openevo.oevobundle",
+        release_id="a" * 64,
+        product_version="0.1.10",
+        source_commit="b" * 40,
+        sha256="c" * 64,
+        byte_size=123,
+        file_count=20,
+    )
+    uploaded: list[ReleaseBundleReceipt] = []
+    remote_scripts: list[str] = []
+
+    monkeypatch.setattr(remote_launcher.shutil, "which", lambda _: "ssh")
+    monkeypatch.setattr(remote_launcher, "verify_release_bundle", lambda _: receipt)
+    monkeypatch.setattr(remote_launcher, "probe_remote_release_id", lambda *_: None)
+    monkeypatch.setattr(
+        remote_launcher,
+        "upload_release_bundle",
+        lambda _ssh, _connection, bundle: uploaded.append(bundle),
+    )
+    monkeypatch.setattr(
+        remote_launcher,
+        "_run_remote",
+        lambda _ssh, _connection, script: remote_scripts.append(script),
+    )
+    monkeypatch.setattr(
+        remote_launcher,
+        "validate_checkout_for_deployment",
+        lambda **_: pytest.fail("release delivery must not inspect the source checkout"),
+    )
+
+    result = remote_launcher.main(
+        [
+            "--host",
+            "example.com",
+            "--user",
+            "root",
+            "--release-bundle",
+            str(receipt.path),
+            "--source-action",
+            "install",
+        ]
+    )
+
+    assert result == 0
+    assert uploaded == [receipt]
+    assert len(remote_scripts) == 2
+    assert receipt.release_id in remote_scripts[0]
+    assert "delivery_mode=release" in remote_scripts[1]
+    assert "start_services=0" in remote_scripts[1]
 
 
 @pytest.mark.parametrize("action", ["auto", "install", "update", "start"])

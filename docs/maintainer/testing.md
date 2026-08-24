@@ -35,6 +35,21 @@ uv run pytest \
 Run broader Core tests when changing capture, evolution, gateway, rollout, or
 runtime code.
 
+Release packaging and the generated POSIX remote installer are covered by:
+
+```bash
+uv run pytest tests/release tests/dev/test_run_remote_agent_development.py
+```
+
+Build a candidate only after committing the exact tree being released:
+
+```bash
+uv run python scripts/release/build_self_hosted_bundle.py \
+  --output dist/openevo-self-hosted.oevobundle
+```
+
+The builder packages committed files, not dirty working-tree bytes.
+
 The new daemon lifecycle can also be smoke-tested independently without
 switching the product path:
 

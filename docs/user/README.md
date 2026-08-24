@@ -37,6 +37,20 @@ state is authoritative on the remote host; the browser is only a client. The
 default command uploads the current committed source over SSH only when the
 server has a different commit. It does not require `git push`.
 
+## Release candidate
+
+Maintainers can provide a versioned `.oevobundle` instead of asking a user to
+run from the OpenEvo source tree. The current release-candidate invocation is:
+
+```bash
+uv run openevo webui \
+  --release-bundle /path/to/openevo-self-hosted.oevobundle
+```
+
+OpenEvo verifies the complete release locally and remotely, installs it under
+an immutable release ID, keeps project/session data outside the release
+directory, and then opens the same loopback WebUI. Docker is not required.
+
 ## Requirements
 
 - local WSL with Git, Node/npm, Python, `uv`, and OpenSSH;
