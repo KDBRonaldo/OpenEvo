@@ -84,6 +84,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Host the formal Desktop UI on localhost and open the system browser instead of Tauri.",
     )
     parser.add_argument(
+        "--browser-no-open",
+        action="store_true",
+        help=(
+            "Print the one-time formal browser URL without opening it. "
+            "This is intended for the real-browser acceptance test."
+        ),
+    )
+    parser.add_argument(
         "--managed-runtime-archive",
         type=Path,
         default=(
@@ -377,6 +385,8 @@ def main() -> int:
     if platform.system() not in {"Linux", "Darwin"}:
         _fail("the native sidecar requires Linux/WSL or macOS; Windows is unsupported")
     args = _parser().parse_args()
+    if args.browser_no_open and not args.browser:
+        _fail("--browser-no-open requires --browser")
     if args.prepare:
         _ensure_uv_on_path()
         _ensure_cargo_on_path()
@@ -445,26 +455,29 @@ def main() -> int:
         if built.returncode != 0:
             return built.returncode
         print("Starting the real OpenEvo Sidecar in the system browser (fixtures disabled).")
+        browser_launcher_args = [
+            sys.executable,
+            "-m",
+            "desktop.server.browser_launcher",
+            "--static-root",
+            os.fspath(DESKTOP_ROOT / "dist"),
+            "--source-commit",
+            source_commit,
+            "--build-channel",
+            "development",
+            "--release-assets-root",
+            os.fspath(assets_root),
+            "--ssh-askpass-helper-path",
+            os.fspath(helper),
+            "--ssh-askpass-helper-sha256",
+            helper_sha256,
+            "--ssh-askpass-helper-byte-size",
+            str(helper_size),
+        ]
+        if args.browser_no_open:
+            browser_launcher_args.append("--no-open")
         completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "desktop.server.browser_launcher",
-                "--static-root",
-                os.fspath(DESKTOP_ROOT / "dist"),
-                "--source-commit",
-                source_commit,
-                "--build-channel",
-                "development",
-                "--release-assets-root",
-                os.fspath(assets_root),
-                "--ssh-askpass-helper-path",
-                os.fspath(helper),
-                "--ssh-askpass-helper-sha256",
-                helper_sha256,
-                "--ssh-askpass-helper-byte-size",
-                str(helper_size),
-            ],
+            browser_launcher_args,
             cwd=REPOSITORY_ROOT,
             check=False,
         )

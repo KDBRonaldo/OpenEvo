@@ -9,6 +9,10 @@ export default defineConfig({
   workers: 1,
   timeout: 15 * 60 * 1000,
   expect: { timeout: 30_000 },
+  metadata: {
+    openevoChain: "development",
+    productURL: baseURL,
+  },
   reporter: [["list"], ["html", { outputFolder: "test-results/development-agent-web-report", open: "never" }]],
   outputDir: "test-results/development-agent-web",
   use: {

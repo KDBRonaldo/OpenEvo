@@ -124,6 +124,31 @@ is the browser-hosted product path, not a browser-only SSH implementation; a
 distributable build still needs to package and start the local Sidecar on the
 user's machine.
 
+The formal browser acceptance test is deliberately separate from the development
+Web Layer test. Start a fresh formal browser host without consuming its one-time
+bootstrap URL:
+
+```bash
+npm run dev:formal:browser -- --browser-no-open
+```
+
+Keep that process running, copy the complete URL it prints, and run the acceptance
+test from a second terminal:
+
+```bash
+OPENEVO_FORMAL_BROWSER_URL='http://127.0.0.1:<port>/openevo#browser-bootstrap=<token>' \
+OPENEVO_FORMAL_SSH_ALIAS='gpu-lab' \
+  npm run test:formal:webui:e2e
+```
+
+Unlike `test:agent:web:e2e`, this command has no Vite `5173` default and fails
+before opening Chromium if the formal Sidecar URL is absent or malformed. It uses
+the real authenticated Desktop `/desktop/v2` provider and the formal tunneled
+Daemon `/v2` provider. `OPENEVO_FORMAL_SSH_ALIAS` must be a literal selectable
+`Host` entry in the current user's `~/.ssh/config`; the test uses the visible
+remote-workspace dialog to create/reuse that profile and connect it before it
+creates the Project.
+
 For the narrower "ask the remote Codex and evolve selected documents" loop, use
 `npm run dev:agent`. This mode bypasses the sealed release lifecycle, but obtains
 its target, method, support, schema, and renderer metadata from the Core framework

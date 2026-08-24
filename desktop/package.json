@@ -29,7 +29,7 @@
     "preview": "vite preview",
     "test": "vitest",
     "test:agent:web:e2e": "playwright install chromium && playwright test --config playwright.development-agent.config.ts",
-    "test:formal:webui:e2e": "playwright install chromium && playwright test --config playwright.development-agent.config.ts",
+    "test:formal:webui:e2e": "playwright install chromium && playwright test --config playwright.formal-desktop.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

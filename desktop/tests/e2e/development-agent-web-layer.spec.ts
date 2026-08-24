@@ -4,7 +4,12 @@ const RUN_ID = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const PROJECT_NAME = `Web Layer browser E2E ${RUN_ID}`;
 const TASK_TITLE = `Browser acceptance ${RUN_ID}`;
 const RESULT_MARKER = `OPENEVO_BROWSER_E2E_OK_${RUN_ID}`;
-const PRODUCT_URL = process.env.OPENEVO_E2E_BASE_URL ?? "";
+
+type OpenEvoE2EMetadata = {
+  openevoChain?: "development" | "formal";
+  productURL?: string;
+  sshHostAlias?: string;
+};
 
 function createPdfEvidence(text: string): Buffer {
   const stream = `BT /F1 12 Tf 72 720 Td (${text.replace(/[()\\]/g, "\\$&")}) Tj ET`;
@@ -35,6 +40,10 @@ async function assertNoProductErrors(page: Page): Promise<void> {
 }
 
 test("real browser can create a project, run an agent session, and produce evolution output", async ({ page }, testInfo: TestInfo) => {
+  const metadata = testInfo.config.metadata as OpenEvoE2EMetadata;
+  const formalChain = metadata.openevoChain === "formal";
+  const productURL = metadata.productURL ?? process.env.OPENEVO_E2E_BASE_URL ?? "";
+  expect(productURL, "the Playwright config must provide the complete product URL").not.toBe("");
   const browserErrors: string[] = [];
   const observedRequests: string[] = [];
   let eventConnectionAttempts = 0;
@@ -63,12 +72,27 @@ test("real browser can create a project, run an agent session, and produce evolu
     }
   });
 
-  await test.step("open the real development product through Vite and Web Layer", async () => {
-    await page.goto(PRODUCT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await test.step(`open the real ${formalChain ? "formal" : "development"} product`, async () => {
+    await page.goto(productURL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await expect(page.locator(".product-shell")).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText("Real-agent development mode", { exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
+    if (formalChain) {
+      await expect(page.getByText("Real-agent development mode", { exact: true })).toHaveCount(0);
+      const sshHostAlias = metadata.sshHostAlias;
+      expect(sshHostAlias, "the formal test requires a system OpenSSH alias").toBeTruthy();
+      if (await page.getByText("Connected", { exact: true }).count() === 0) {
+        await page.getByRole("button", { name: "Add remote workspace" }).first().click();
+        const dialog = page.getByRole("dialog", { name: "Connect a server" });
+        await expect(dialog).toBeVisible();
+        await dialog.getByLabel("Workspace name").fill(`Formal browser E2E ${RUN_ID}`);
+        await dialog.getByLabel("SSH host alias").selectOption(sshHostAlias!);
+        await dialog.getByRole("button", { name: "Save and connect" }).click();
+      }
+      await expect(page.getByText("Connected", { exact: true }).first()).toBeVisible({ timeout: 120_000 });
+    } else {
+      await expect(page.getByText("Real-agent development mode", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
+    }
     expect(observedRequests).toContain("GET /desktop/v2/state");
     await expect.poll(() => eventConnectionAttempts, { timeout: 30_000 }).toBeGreaterThanOrEqual(2);
     expect(observedRequests).toContain("GET /desktop/v2/events");
@@ -103,7 +127,7 @@ test("real browser can create a project, run an agent session, and produce evolu
       page.getByRole("treeitem").filter({ hasText: "browser-v2-evidence.pdf" }),
     ).toBeVisible({ timeout: 120_000 });
     expect(observedRequests.some((request) => (
-      request.startsWith("PUT /desktop/v2/development/projects/")
+      request.startsWith("PUT /desktop/v2/") && request.includes("/files/")
     ))).toBe(true);
     await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
     await expect(
@@ -135,7 +159,9 @@ test("real browser can create a project, run an agent session, and produce evolu
     await expect(detail).toBeVisible({ timeout: 120_000 });
     await expect(detail.locator(".session-inspector-heading .state-pill")).toHaveText("closed");
     await expect(detail.getByLabel("Agent")).toContainText(RESULT_MARKER);
-    expect(observedRequests).toContain("GET /desktop/v2/development/task-presentations");
+    expect(observedRequests.some((request) => (
+      request.startsWith("GET /desktop/v2/") && request.includes("task")
+    ))).toBe(true);
     expect(observedRequests.some((request) => request.includes("/openevo-dev-agent/v1/")))
       .toBe(false);
     await assertNoProductErrors(page);
@@ -172,13 +198,20 @@ test("real browser can create a project, run an agent session, and produce evolu
     await currentRun.getByRole("button", { name: "Apply to future Sessions" }).click();
     await expect(currentRun.locator(".state-pill")).toHaveText("applied", { timeout: 120_000 });
     await expect(currentRun.getByText("Active context", { exact: true })).toBeVisible();
-    expect(observedRequests).toContain("POST /desktop/v2/development/evolution-runs");
     expect(observedRequests.some((request) => (
-      request.startsWith("POST /desktop/v2/development/evolution-runs/")
+      request.startsWith("POST /desktop/v2/") && request.includes("evolution")
+    ))).toBe(true);
+    expect(observedRequests.some((request) => (
+      request.startsWith("POST /desktop/v2/")
+      && request.includes("evolution")
       && request.endsWith("/apply")
     ))).toBe(true);
-    expect(observedRequests).toContain("GET /desktop/v2/development/artifacts");
-    expect(observedRequests).toContain("GET /desktop/v2/development/evolution-jobs");
+    expect(observedRequests.some((request) => (
+      request.startsWith("GET /desktop/v2/") && request.includes("artifact")
+    ))).toBe(true);
+    expect(observedRequests.some((request) => (
+      request.startsWith("GET /desktop/v2/") && request.includes("evolution")
+    ))).toBe(true);
     expect(observedRequests.some((request) => request.includes("/openevo-dev-agent/v1/evolution-jobs")))
       .toBe(false);
     expect(observedRequests.some((request) => (

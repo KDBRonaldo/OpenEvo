@@ -60,6 +60,14 @@ def test_dirty_checkout_guard_only_requires_prepare() -> None:
     assert "development_snapshot_sha256" in source
 
 
+def test_browser_no_open_is_forwarded_only_to_browser_launcher() -> None:
+    source = Path("scripts/dev/run_desktop_live.py").read_text(encoding="utf-8")
+
+    assert '"--browser-no-open"' in source
+    assert "--browser-no-open requires --browser" in source
+    assert 'browser_launcher_args.append("--no-open")' in source
+
+
 def test_browser_npm_command_prefers_compatible_native_node() -> None:
     with patch.object(
         run_desktop_live,
