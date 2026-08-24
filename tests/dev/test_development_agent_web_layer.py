@@ -1448,7 +1448,7 @@ def test_provider_projects_daemon_v2_timeline_into_bound_desktop_events() -> Non
     assert second.items[0].attempt == task.attempts[0]
 
 
-def test_active_project_tunnel_exposes_only_its_bound_project() -> None:
+def test_project_catalog_keeps_inactive_projects_visible() -> None:
     fake = FakeDaemonClient()
     fake.state.update(
         {
@@ -1469,7 +1469,7 @@ def test_active_project_tunnel_exposes_only_its_bound_project() -> None:
 
     projects = provider.invoke("listDesktopProjectsV2", {})
 
-    assert [project.project_id for project in projects.items] == ["project-1"]
+    assert [project.project_id for project in projects.items] == ["project-1", "project-2"]
 
 
 def test_initial_snapshot_projections_share_the_bounded_state_cache() -> None:

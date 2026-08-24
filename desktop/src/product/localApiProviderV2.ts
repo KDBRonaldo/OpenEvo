@@ -1118,9 +1118,6 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const services = await collectPages((options) => this.client.listServices(options));
     const activeProject = projects.find((project) => project.project_id === state.active_project_id);
     if (!activeProject) throw new DesktopContractErrorV2("Active project is absent from the remote project collection");
-    if (projects.some((project) => project.project_id !== state.active_project_id)) {
-      throw new DesktopContractErrorV2("Active project tunnel returned another project");
-    }
     const capability = await this.client.projectCapabilities(activeProject.project_id);
     const taskDetails = [];
     for (const task of tasks) {

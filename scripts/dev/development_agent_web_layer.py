@@ -453,10 +453,7 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _projects(self, _: Mapping[str, object]) -> core.ProjectPageV2:
         state = self._remote_state()
-        active_project_id = state.get("active_project_id")
         projects = self._project_models(state)
-        if active_project_id is not None:
-            projects = [project for project in projects if project.project_id == active_project_id]
         return core.ProjectPageV2(items=projects, next_cursor=None, has_more=False)
 
     def _find_project(self, project_id: object) -> core.ProjectV2:

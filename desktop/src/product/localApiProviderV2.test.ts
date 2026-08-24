@@ -486,6 +486,75 @@ describe("Desktop v2 product provider", () => {
     expect(source.slice(start, capability)).not.toContain("Promise.all");
   });
 
+  it("keeps inactive projects in the catalog while loading active-project authority", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-active",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-active",
+    });
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: [
+        {
+          project_id: "project-old",
+          display_name: "Older project",
+          config: { execution: { mode: "codex_subscription_transcript" } },
+        },
+        {
+          project_id: "project-active",
+          display_name: "Active project",
+          config: { execution: { mode: "codex_subscription_transcript" } },
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listTasks).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.listServices).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.projectCapabilities).mockResolvedValue({
+      project_id: "project-active",
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+    } as never);
+
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+    expect(result.snapshot.projects.map((project) => project.project_id)).toEqual([
+      "project-old",
+      "project-active",
+    ]);
+    expect(client.listTasks).toHaveBeenCalledWith({ limit: 100, projectId: "project-active" });
+    expect(client.projectCapabilities).toHaveBeenCalledWith("project-active");
+  });
+
   it("preserves contract validation details in refresh failures", async () => {
     const localProfile = profile();
     const client = clientFixture([]);
