@@ -1,5 +1,8 @@
 # Changelog
 
+- Extracted durable Session schema, migrations, context pinning, lifecycle
+  transitions, cancellation, and restart recovery into `openevo.daemon` while
+  retaining the existing SQLite data, API payloads, and task journal transaction.
 - Reworked remote source delivery so the server never fetches OpenEvo from
   GitHub: matching commits start directly, changed commits travel as verified
   local Git bundles over SSH, install/update/start are explicit actions, and

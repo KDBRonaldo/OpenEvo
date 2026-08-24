@@ -52,9 +52,15 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   event journal, commit-time append semantics, cursors, and long-poll wakeups.
 - `src/openevo/daemon/task_journal.py` owns durable per-task logs, typed task
   timeline entries, pagination cursors, and legacy journal backfill.
+- `src/openevo/daemon/session_store.py` owns the existing Session SQLite table,
+  additive legacy migrations, admitted/running/completed/failed/cancelled state
+  transitions, context artifact pinning, and interrupted-session recovery.  It
+  shares the compatibility daemon transaction and task journal so lifecycle
+  state and journal entries commit atomically.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns session lifecycle rows, workspace, artifact, and evolution
-  state in SQLite until each remaining owner is extracted behind the same API.
+  root and owns workspace, artifact, evolution orchestration, the harness
+  coordinator, and process composition until each remaining owner is extracted
+  behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.

@@ -57,6 +57,11 @@ from openevo.daemon.project_catalog import (  # noqa: E402
     ProjectCatalogConflictError,
     SqliteProjectCatalog,
 )
+from openevo.daemon.session_store import (  # noqa: E402
+    SessionCancellationRequested,
+    SessionConflictError,
+    SqliteSessionStore,
+)
 from openevo.daemon.task_journal import (  # noqa: E402
     SqliteTaskJournal,
     TaskJournalCursorError,
@@ -1223,6 +1228,14 @@ class DevelopmentStateStore:
             max_log_text=MAX_DAEMON_V2_LOG_TEXT,
             clock=utc_now,
         )
+        self.session_store = SqliteSessionStore(
+            path,
+            task_journal=self.task_journal,
+            lock=self._lock,
+            connection_factory=self._connection,
+            clock=utc_now,
+            selection_normalizer=normalize_selected_evolution,
+        )
         self.project_catalog = SqliteProjectCatalog(
             path,
             lock=self._lock,
@@ -1237,32 +1250,9 @@ class DevelopmentStateStore:
         with self._connection() as connection:
             self.project_catalog.initialize_schema(connection)
             self.event_journal.initialize_schema(connection)
+            self.session_store.initialize_schema(connection)
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS development_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
-                    task_title TEXT NOT NULL,
-                    instruction TEXT NOT NULL,
-                    response TEXT,
-                    model TEXT,
-                    state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed')),
-                    duration_ms INTEGER,
-                    logs_json TEXT NOT NULL,
-                    selected_evolution_json TEXT NOT NULL DEFAULT '[]',
-                    evolution_errors_json TEXT NOT NULL DEFAULT '[]',
-                    workspace_changes_json TEXT NOT NULL DEFAULT '[]',
-                    context_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
-                    runtime_activation_json TEXT NOT NULL DEFAULT 'null',
-                    cancellation_requested INTEGER NOT NULL DEFAULT 0
-                        CHECK (cancellation_requested IN (0, 1)),
-                    terminal_kind TEXT CHECK (terminal_kind IN ('failed', 'cancelled')),
-                    error TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS development_sessions_project_created
-                    ON development_sessions(project_id, created_at, session_id);
                 CREATE TABLE IF NOT EXISTS development_artifacts (
                     artifact_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
@@ -1393,51 +1383,7 @@ class DevelopmentStateStore:
                 """
             )
             self.task_journal.initialize_schema(connection)
-            session_columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(development_sessions)")
-            }
-            if "selected_evolution_json" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN selected_evolution_json TEXT NOT NULL DEFAULT '[]'"
-                )
-            if "evolution_errors_json" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN evolution_errors_json TEXT NOT NULL DEFAULT '[]'"
-                )
-            if "workspace_changes_json" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN workspace_changes_json TEXT NOT NULL DEFAULT '[]'"
-                )
-            if "context_artifact_ids_json" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN context_artifact_ids_json TEXT NOT NULL DEFAULT '[]'"
-                )
-            if "runtime_activation_json" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN runtime_activation_json TEXT NOT NULL DEFAULT 'null'"
-                )
-            if "cancellation_requested" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN cancellation_requested INTEGER NOT NULL DEFAULT 0 "
-                    "CHECK (cancellation_requested IN (0, 1))"
-                )
-            if "terminal_kind" not in session_columns:
-                connection.execute(
-                    "ALTER TABLE development_sessions "
-                    "ADD COLUMN terminal_kind TEXT "
-                    "CHECK (terminal_kind IN ('failed', 'cancelled'))"
-                )
-            connection.execute(
-                "UPDATE development_sessions SET runtime_activation_json = 'null' "
-                "WHERE runtime_activation_json = '{}'"
-            )
+            self.session_store.migrate_schema(connection)
             artifact_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -1585,18 +1531,6 @@ class DevelopmentStateStore:
                 "ON development_evolution_job_attempts(action_id) "
                 "WHERE action_id IS NOT NULL"
             )
-            for row in connection.execute(
-                "SELECT session_id, selected_evolution_json FROM development_sessions"
-            ).fetchall():
-                stored = json.loads(row["selected_evolution_json"])
-                normalized = normalize_selected_evolution(stored)
-                normalized_json = canonical_json(normalized)
-                if normalized_json != row["selected_evolution_json"]:
-                    connection.execute(
-                        "UPDATE development_sessions SET selected_evolution_json = ? "
-                        "WHERE session_id = ?",
-                        (normalized_json, row["session_id"]),
-                    )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO development_document_artifacts(
@@ -1666,26 +1600,16 @@ class DevelopmentStateStore:
                 FROM development_evolution_jobs
                 """
             )
-            interrupted_sessions = connection.execute(
-                "SELECT session_id FROM development_sessions WHERE state = 'running'"
-            ).fetchall()
-            connection.execute(
-                """
-                UPDATE development_sessions
-                SET state = 'failed', terminal_kind = 'failed', error = ?, updated_at = ?
-                WHERE state = 'running'
-                """,
-                ("Development daemon restarted before this session completed.", restarted_at),
+            interrupted_sessions = self.session_store.recover_interrupted(
+                connection,
+                occurred_at=restarted_at,
             )
             self._backfill_task_journals(connection)
-            for interrupted in interrupted_sessions:
-                self._append_task_log_v2(
-                    connection,
-                    task_id=interrupted["session_id"],
-                    stream="system",
-                    message="Session failed: Development daemon restarted before this session completed.",
-                    occurred_at=restarted_at,
-                )
+            self.session_store.append_recovery_logs(
+                connection,
+                interrupted_sessions,
+                occurred_at=restarted_at,
+            )
             project_ids = [
                 project.project_id
                 for project in self.project_catalog.read_state(connection).projects
@@ -1983,169 +1907,22 @@ class DevelopmentStateStore:
         self.task_journal.backfill(connection)
 
     def start_session(self, session_id: str, request: dict[str, str]) -> None:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            project = connection.execute(
-                "SELECT display_name, config_json FROM development_projects WHERE project_id = ?",
-                (request["project_id"],),
-            ).fetchone()
-            if project is None:
-                raise KeyError(request["project_id"])
-            if project["display_name"] != request["project_name"]:
-                raise StateConflictError("project_name does not match the persisted project")
-            context_rows = connection.execute(
-                """
-                SELECT artifact.artifact_id
-                FROM development_evolution_artifacts_v2 AS artifact
-                JOIN (
-                    SELECT target_id, MAX(created_at || artifact_id) AS latest
-                    FROM development_evolution_artifacts_v2
-                    WHERE project_id = ? AND artifact_type != 'report' AND promoted = 1
-                    GROUP BY target_id
-                ) AS selected
-                  ON selected.target_id = artifact.target_id
-                 AND selected.latest = artifact.created_at || artifact.artifact_id
-                WHERE artifact.project_id = ?
-                ORDER BY artifact.target_id
-                """,
-                (request["project_id"], request["project_id"]),
-            ).fetchall()
-            context_artifact_ids = [row["artifact_id"] for row in context_rows]
-            connection.execute(
-                """
-                INSERT INTO development_sessions(
-                    session_id, project_id, task_title, instruction, response, model,
-                    state, duration_ms, logs_json, selected_evolution_json,
-                    evolution_errors_json, workspace_changes_json, context_artifact_ids_json,
-                    error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', ?, NULL, ?, ?)
-                """,
-                (
-                    session_id,
-                    request["project_id"],
-                    request["task_title"],
-                    request["instruction"],
-                    canonical_json(["Remote development daemon admitted the session."]),
-                    "[]",
-                    canonical_json(context_artifact_ids),
-                    now,
-                    now,
-                ),
-            )
-            self._append_task_log_v2(
-                connection,
-                task_id=session_id,
-                stream="system",
-                message="Remote development daemon admitted the session.",
-                occurred_at=now,
-            )
-            self._append_task_timeline_v2(
-                connection,
-                task_id=session_id,
-                project_id=request["project_id"],
-                event_type="task_admitted",
-                occurred_at=now,
-            )
-            self._append_task_timeline_v2(
-                connection,
-                task_id=session_id,
-                project_id=request["project_id"],
-                event_type="attempt_appended",
-                occurred_at=now,
-            )
+        try:
+            self.session_store.start(session_id, request)
+        except SessionConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
 
     def complete_session(self, session_id: str, result: dict[str, Any]) -> None:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT logs_json, cancellation_requested FROM development_sessions "
-                "WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            if row["cancellation_requested"]:
-                raise HarnessRunCancelled("Session cancelled by user")
-            existing_logs = json.loads(row["logs_json"])
-            merged_logs = [*existing_logs]
-            appended_logs: list[str] = []
-            for message in result["logs"]:
-                if message not in merged_logs:
-                    merged_logs.append(message)
-                    appended_logs.append(message)
-            connection.execute(
-                """
-                UPDATE development_sessions
-                SET response = ?, model = ?, state = 'completed', duration_ms = ?,
-                    logs_json = ?, workspace_changes_json = ?, runtime_activation_json = ?,
-                    cancellation_requested = 0, terminal_kind = NULL,
-                    error = NULL, updated_at = ?
-                WHERE session_id = ?
-                """,
-                (
-                    result["response"],
-                    result["model"],
-                    result["duration_ms"],
-                    canonical_json(merged_logs),
-                    canonical_json(result.get("workspace_changes", [])),
-                    canonical_json(result.get("runtime_activation")),
-                    now,
-                    session_id,
-                ),
-            )
-            for message in appended_logs:
-                self._append_task_log_v2(
-                    connection,
-                    task_id=session_id,
-                    stream="system",
-                    message=message,
-                    occurred_at=now,
-                )
-            self._append_task_log_v2(
-                connection,
-                task_id=session_id,
-                stream="transcript",
-                message=result["response"],
-                occurred_at=now,
-            )
+        try:
+            self.session_store.complete(session_id, result)
+        except SessionCancellationRequested as exc:
+            raise HarnessRunCancelled(str(exc)) from exc
 
     def append_session_log(self, session_id: str, message: str) -> list[str]:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            logs = json.loads(row["logs_json"])
-            logs.append(message)
-            connection.execute(
-                "UPDATE development_sessions SET logs_json = ?, updated_at = ? WHERE session_id = ?",
-                (canonical_json(logs), now, session_id),
-            )
-            self._append_task_log_v2(
-                connection,
-                task_id=session_id,
-                stream="system",
-                message=message,
-                occurred_at=now,
-            )
-        return logs
+        return self.session_store.append_log(session_id, message)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT * FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            evidence_ready = connection.execute(
-                "SELECT 1 FROM development_dataset_artifacts WHERE session_id = ?",
-                (session_id,),
-            ).fetchone() is not None
-        if row is None:
-            raise KeyError(session_id)
-        return self._session_record(row, evolution_evidence_ready=evidence_ready)
+        return self.session_store.get(session_id)
 
     def task_observations_v2(
         self,
@@ -2308,83 +2085,20 @@ class DevelopmentStateStore:
         })
 
     def cancellation_requested(self, session_id: str) -> bool:
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT cancellation_requested FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            raise KeyError(session_id)
-        return bool(row["cancellation_requested"])
+        return self.session_store.cancellation_requested(session_id)
 
     def request_session_cancellation(self, session_id: str) -> dict[str, Any]:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT state, logs_json FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            if row["state"] != "running":
-                raise StateConflictError("session is already terminal")
-            logs = json.loads(row["logs_json"])
-            message = "Cancellation requested; stopping the active harness process."
-            if message not in logs:
-                logs.append(message)
-                self._append_task_log_v2(
-                    connection,
-                    task_id=session_id,
-                    stream="system",
-                    message=message,
-                    occurred_at=now,
-                )
-            connection.execute(
-                "UPDATE development_sessions "
-                "SET cancellation_requested = 1, logs_json = ?, updated_at = ? "
-                "WHERE session_id = ? AND state = 'running'",
-                (canonical_json(logs), now, session_id),
-            )
-            updated = connection.execute(
-                "SELECT * FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        return self._session_record(updated)
+        try:
+            return self.session_store.request_cancellation(session_id)
+        except SessionConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
 
     def cancel_session(
         self,
         session_id: str,
         workspace_changes: list[dict[str, Any]] | None = None,
     ) -> None:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            logs = json.loads(row["logs_json"])
-            message = "Session cancelled by user."
-            if message not in logs:
-                logs.append(message)
-                self._append_task_log_v2(
-                    connection,
-                    task_id=session_id,
-                    stream="system",
-                    message=message,
-                    occurred_at=now,
-                )
-            connection.execute(
-                """
-                UPDATE development_sessions
-                SET state = 'failed', cancellation_requested = 1,
-                    terminal_kind = 'cancelled', logs_json = ?, workspace_changes_json = ?,
-                    error = NULL, updated_at = ?
-                WHERE session_id = ? AND state = 'running'
-                """,
-                (canonical_json(logs), canonical_json(workspace_changes or []), now, session_id),
-            )
+        self.session_store.cancel(session_id, workspace_changes)
 
     def record_evolution_errors(
         self,
@@ -3420,67 +3134,18 @@ class DevelopmentStateStore:
         error: str,
         workspace_changes: list[dict[str, Any]] | None = None,
     ) -> None:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            row = connection.execute(
-                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(session_id)
-            logs = json.loads(row["logs_json"])
-            message = f"Session failed: {error}"
-            logs.append(message)
-            connection.execute(
-                """
-                UPDATE development_sessions
-                SET state = 'failed', logs_json = ?, workspace_changes_json = ?,
-                    terminal_kind = 'failed', error = ?, updated_at = ?
-                WHERE session_id = ?
-                """,
-                (canonical_json(logs), canonical_json(workspace_changes or []), error, now, session_id),
-            )
-            self._append_task_log_v2(
-                connection,
-                task_id=session_id,
-                stream="system",
-                message=message,
-                occurred_at=now,
-            )
+        self.session_store.fail(session_id, error, workspace_changes)
 
-    @staticmethod
     def _session_record(
+        self,
         row: sqlite3.Row,
         *,
         evolution_evidence_ready: bool = False,
     ) -> dict[str, Any]:
-        state = row["state"]
-        if row["terminal_kind"] == "cancelled":
-            state = "cancelled"
-        elif state == "running" and row["cancellation_requested"]:
-            state = "cancelling"
-        return {
-            "session_id": row["session_id"],
-            "project_id": row["project_id"],
-            "task_title": row["task_title"],
-            "instruction": row["instruction"],
-            "response": row["response"],
-            "model": row["model"],
-            "state": state,
-            "duration_ms": row["duration_ms"],
-            "logs": json.loads(row["logs_json"]),
-            "selected_evolution": normalize_selected_evolution(
-                json.loads(row["selected_evolution_json"])
-            ),
-            "evolution_errors": json.loads(row["evolution_errors_json"]),
-            "workspace_changes": json.loads(row["workspace_changes_json"]),
-            "context_artifact_ids": json.loads(row["context_artifact_ids_json"]),
-            "runtime_activation": json.loads(row["runtime_activation_json"]),
-            "evolution_evidence_ready": evolution_evidence_ready,
-            "error": row["error"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
+        return self.session_store.record(
+            row,
+            evolution_evidence_ready=evolution_evidence_ready,
+        )
 
     @staticmethod
     def _task_observation_v2(row: sqlite3.Row) -> DevelopmentTaskObservationV2:
@@ -3499,13 +3164,13 @@ class DevelopmentStateStore:
             updated_at=row["updated_at"],
         )
 
-    @staticmethod
     def _task_presentation_v2(
+        self,
         row: sqlite3.Row,
         *,
         evolution_evidence_ready: bool,
     ) -> DevelopmentTaskPresentationV2:
-        record = DevelopmentStateStore._session_record(
+        record = self._session_record(
             row, evolution_evidence_ready=evolution_evidence_ready
         )
         return DevelopmentTaskPresentationV2.model_validate({
