@@ -1,5 +1,9 @@
 # Changelog
 
+- Extracted transcript dataset sealing, capability-driven fixed-input Evolution
+  jobs/retries, output validation, artifact publication, and explicit
+  multi-Session candidate runs into `openevo.daemon` without changing the
+  browser API or SQLite identities.
 - Extracted normalized Codex harness execution and the full admitted Session
   workspace/context/result transaction into `openevo.daemon`, preserving live
   cancellation, failure semantics, file mutation capture, and optional

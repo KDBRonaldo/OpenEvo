@@ -101,7 +101,8 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 - `src/openevo/web_gateway/`: built WebUI assets and gateway package boundary.
 - `src/openevo/daemon/`: extracted process, project, event, task-journal,
   Session lifecycle/execution, managed workspace, and artifact SQLite
-  ownership plus Agent harness execution used by the retained remote path.
+  ownership plus Agent harness and Evolution orchestration used by the retained
+  remote path.
 - `src/openevo/`: reusable agent, capture, evolution, runtime, and rollout code.
 - `benchmarks/`: standalone benchmark automation.
 

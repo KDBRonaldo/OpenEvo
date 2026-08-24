@@ -44,7 +44,11 @@ the admitted Session transaction across context loading, workspace mutation,
 terminal persistence, cancellation, failure, and optional evidence sealing are
 owned by `src/openevo/daemon/agent_runner.py`. The compatibility daemon now
 supplies its development runtime-context materializer and Evolution sealer to
-that runner while retaining unchanged HTTP models and SQLite rows.
+that runner. Transcript dataset sealing, development capability resolution,
+fixed-input Evolution jobs/retries, output validation, artifact publication,
+and explicit multi-Session candidate runs are owned by
+`src/openevo/daemon/evolution_orchestrator.py`. The compatibility daemon retains
+unchanged HTTP models, SQLite rows, and process composition.
 
 The renderer enters the Session conversation as soon as the user starts a
 task. It shows the submitted instruction during validation/admission, then

@@ -72,10 +72,14 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   and the admitted Session transaction across context loading, workspace
   mutation, result persistence, cancellation, failure, and optional evidence
   sealing.
+- `src/openevo/daemon/evolution_orchestrator.py` owns transcript dataset
+  sealing, development capability resolution, fixed-input Evolution jobs,
+  retries, output validation, artifact publication, and explicit multi-Session
+  candidate runs behind the existing SQLite/API contracts.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns development runtime-context materialization, evolution
-  orchestration, HTTP model projection, and process composition until each
-  remaining owner is extracted behind the same API.
+  root and owns development runtime-context materialization, HTTP model
+  projection, and process composition until each remaining owner is extracted
+  behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.

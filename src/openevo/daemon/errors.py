@@ -13,3 +13,7 @@ class AgentRunError(RuntimeError):
 
 class StateConflictError(RuntimeError):
     """A valid request conflicts with current durable daemon authority."""
+
+
+class EvolutionRunError(RuntimeError):
+    """Evolution orchestration cannot safely execute the requested operation."""
