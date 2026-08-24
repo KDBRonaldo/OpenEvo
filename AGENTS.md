@@ -57,10 +57,15 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   transitions, context artifact pinning, and interrupted-session recovery.  It
   shares the compatibility daemon transaction and task journal so lifecycle
   state and journal entries commit atomically.
+- `src/openevo/daemon/session_runtime.py` owns exclusive Session admission,
+  asynchronous worker lifetime, live cancellation-signal lookup, idempotent
+  action identity, and fail-closed cleanup.  It shares the compatibility
+  coordinator's operation lock so Session, Evolution, and workspace mutations
+  retain the existing serialization contract.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns workspace, artifact, evolution orchestration, the harness
-  coordinator, and process composition until each remaining owner is extracted
-  behind the same API.
+  root and owns workspace, artifact, evolution orchestration, harness/workspace
+  execution adaptation, and process composition until each remaining owner is
+  extracted behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.

@@ -1,5 +1,9 @@
 # Changelog
 
+- Extracted asynchronous Session execution ownership into `openevo.daemon`,
+  including exclusive admission, exact idempotency, live cancellation-signal
+  delivery, worker failure handling, and unconditional operation-lock cleanup,
+  without changing the working WebUI/API/SQLite path.
 - Open the Session conversation immediately after Start Session, show explicit
   Agent startup/working states while the daemon is running, stream refreshed
   replies into the chat, and expose Session cancellation in both the live chat

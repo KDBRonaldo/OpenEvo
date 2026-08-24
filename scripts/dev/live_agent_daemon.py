@@ -62,6 +62,10 @@ from openevo.daemon.session_store import (  # noqa: E402
     SessionConflictError,
     SqliteSessionStore,
 )
+from openevo.daemon.session_runtime import (  # noqa: E402
+    SessionExecutionConflictError,
+    SessionExecutionManager,
+)
 from openevo.daemon.task_journal import (  # noqa: E402
     SqliteTaskJournal,
     TaskJournalCursorError,
@@ -4423,60 +4427,43 @@ class DevelopmentSessionCoordinator:
         self._store = store
         self._evolution_runner = evolution_runner
         self._turn_lock = threading.Lock()
-        self._executions_lock = threading.Lock()
-        self._executions: dict[str, HarnessCancellation] = {}
+        self._session_runtime = SessionExecutionManager(
+            store=store,
+            executor=self._execute,
+            cancellation_factory=HarnessCancellation,
+            execution_failed=self._record_unhandled_execution_failure,
+            operation_lock=self._turn_lock,
+        )
 
     def submit(
         self, request: dict[str, str], *, session_id: str | None = None
     ) -> str:
-        if session_id is not None:
-            try:
-                existing = self._store.get_session(session_id)
-            except KeyError:
-                pass
-            else:
-                expected = (
-                    request["project_id"],
-                    request["task_title"],
-                    request["instruction"],
-                )
-                actual = (
-                    existing["project_id"],
-                    existing["task_title"],
-                    existing["instruction"],
-                )
-                if actual != expected:
-                    raise StateConflictError(
-                        "Task action_id is already bound to another request"
-                    )
-                return session_id
-        if not self._turn_lock.acquire(blocking=False):
-            raise StateConflictError("another development session is running")
-        session_id = session_id or f"dev-session-{secrets.token_hex(8)}"
         try:
-            self._store.start_session(session_id, request)
-        except Exception:
-            self._turn_lock.release()
-            raise
-        cancellation = HarnessCancellation()
-        with self._executions_lock:
-            self._executions[session_id] = cancellation
-        thread = threading.Thread(
-            target=self._execute,
-            name=f"openevo-{session_id}",
-            args=(session_id, request, cancellation),
-            daemon=True,
-        )
-        thread.start()
-        return session_id
+            return self._session_runtime.submit(request, session_id=session_id)
+        except SessionExecutionConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
 
     def cancel(self, session_id: str) -> dict[str, Any]:
-        session = self._store.request_session_cancellation(session_id)
-        with self._executions_lock:
-            cancellation = self._executions.get(session_id)
-        if cancellation is not None:
-            cancellation.cancel()
-        return session
+        return self._session_runtime.cancel(session_id)
+
+    def _record_unhandled_execution_failure(
+        self,
+        session_id: str,
+        error: BaseException,
+    ) -> None:
+        try:
+            if self._store.cancellation_requested(session_id):
+                self._store.cancel_session(session_id, [])
+            else:
+                self._store.fail_session(
+                    session_id,
+                    f"unexpected development session failure: {error}",
+                    [],
+                )
+        except Exception:
+            # Startup recovery remains the final authority when persistence is
+            # unavailable while a worker is already failing.
+            pass
 
     def retry_evolution(self, job_id: str, *, action_id: str | None = None) -> dict[str, Any]:
         if self._evolution_runner is None:
@@ -4770,10 +4757,6 @@ class DevelopmentSessionCoordinator:
                 )
             except Exception:
                 pass
-        finally:
-            with self._executions_lock:
-                self._executions.pop(session_id, None)
-            self._turn_lock.release()
 
 
 class DevelopmentAgentServer(ThreadingHTTPServer):

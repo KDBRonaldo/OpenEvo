@@ -32,8 +32,11 @@ contracts.  Their SQLite append, chunking, pagination, and restart backfill are
 owned by `src/openevo/daemon/task_journal.py`. Session schema, additive legacy
 migrations, context artifact pinning, lifecycle transitions, cancellation, and
 interrupted-run recovery are owned by `src/openevo/daemon/session_store.py`.
-The compatibility daemon still composes those owners with the harness runner,
-workspace, artifacts, and evolution orchestration.
+Exclusive Session admission, worker-thread lifetime, live cancellation signal
+lookup, and unconditional operation-lock cleanup are owned by
+`src/openevo/daemon/session_runtime.py`. The compatibility daemon still
+composes those owners with the harness runner, workspace, artifacts, and
+evolution orchestration.
 
 The renderer enters the Session conversation as soon as the user starts a
 task. It shows the submitted instruction during validation/admission, then
