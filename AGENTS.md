@@ -12,7 +12,7 @@ The only supported product path is:
 browser
   -> local SSH tunnel owned by scripts/dev/run_remote_agent_development.py
   -> remote scripts/dev/development_agent_web_layer.py
-  -> remote scripts/dev/live_agent_daemon.py
+  -> remote src/openevo/daemon/product_app.py
   -> Codex harness + OpenEvo evolution runtime
 ```
 
@@ -76,13 +76,16 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   sealing, development capability resolution, fixed-input Evolution jobs,
   retries, output validation, artifact publication, and explicit multi-Session
   candidate runs behind the existing SQLite/API contracts.
-- `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns development runtime-context materialization, HTTP model
-  projection, and process composition until each remaining owner is extracted
-  behind the same API.
-- `src/openevo/daemon` owns already-extracted daemon capabilities.  The
-  `scripts/dev` entry points remain compatibility composition roots until the
-  complete working path has passed real remote acceptance.
+- `src/openevo/daemon/product_app.py` is the formal daemon composition root. It
+  owns runtime-context materialization, HTTP projection, service initialization,
+  and process composition while preserving the accepted API and SQLite layout.
+- `src/openevo/daemon/contracts.py` owns the closed daemon/Web Layer v2 models.
+- `scripts/dev/live_agent_daemon.py` and
+  `scripts/dev/development_agent_v2_contract.py` are thin import/launch
+  compatibility adapters only; product authority must not move back into them.
+- `src/openevo/daemon` owns the complete remote daemon implementation. The
+  remaining Web Layer script is the next composition boundary available for
+  extraction, but its browser contract must remain unchanged.
 - `src/openevo/backend/evolution_runtime.py` and
   `src/openevo/backend/harness_adapter.py` are shared runtime helpers, not a
   second daemon product.

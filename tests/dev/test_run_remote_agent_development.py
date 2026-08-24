@@ -11,10 +11,7 @@ import pytest
 
 
 MODULE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "scripts"
-    / "dev"
-    / "run_remote_agent_development.py"
+    Path(__file__).resolve().parents[2] / "scripts" / "dev" / "run_remote_agent_development.py"
 )
 SPEC = importlib.util.spec_from_file_location("run_remote_agent_development", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -58,9 +55,7 @@ def test_resolves_direct_ssh_connection_without_config_alias() -> None:
 
 def test_web_layer_is_an_explicit_opt_in() -> None:
     regular = remote_launcher.parse_args(["--host", "example.com", "--user", "root"])
-    web = remote_launcher.parse_args(
-        ["--host", "example.com", "--user", "root", "--web-layer"]
-    )
+    web = remote_launcher.parse_args(["--host", "example.com", "--user", "root", "--web-layer"])
 
     assert regular.web_layer is False
     assert web.web_layer is True
@@ -110,9 +105,7 @@ def test_browser_e2e_is_an_explicit_self_hosted_acceptance_mode() -> None:
 
 @pytest.mark.parametrize("flag", ["--status", "--logs", "--stop"])
 def test_remote_lifecycle_actions_are_explicit_and_do_not_deploy(flag: str) -> None:
-    args = remote_launcher.parse_args(
-        ["--host", "example.com", "--user", "root", flag]
-    )
+    args = remote_launcher.parse_args(["--host", "example.com", "--user", "root", flag])
 
     assert getattr(args, flag.removeprefix("--")) is True
     assert args.deploy_only is False
@@ -128,6 +121,7 @@ def test_remote_lifecycle_scripts_are_bounded_and_shell_valid(action: str) -> No
 
     assert 'state_root="$HOME/.openevo/dev-agent"' in script
     if action != "logs":
+        assert "openevo.daemon.product_app" in script
         assert "scripts/dev/live_agent_daemon.py" in script
         assert "scripts/dev/development_agent_web_layer.py" in script
     if action == "logs":
@@ -184,9 +178,7 @@ def test_status_runs_without_checkout_validation_or_token_rotation(
 
     monkeypatch.setattr(remote_launcher, "_run_remote", run_remote)
 
-    result = remote_launcher.main(
-        ["--host", "example.com", "--user", "root", "--status"]
-    )
+    result = remote_launcher.main(["--host", "example.com", "--user", "root", "--status"])
 
     assert result == 0
     assert captured["ssh_binary"] == "ssh"
@@ -237,9 +229,7 @@ def test_web_layer_allows_only_local_development_changes(
         ),
     )
 
-    assert remote_launcher.validate_checkout_for_deployment(
-        web_layer=True, deploy_only=False
-    )
+    assert remote_launcher.validate_checkout_for_deployment(web_layer=True, deploy_only=False)
 
 
 @pytest.mark.parametrize(
@@ -254,14 +244,10 @@ def test_web_layer_rejects_uncommitted_remote_runtime_changes(
     monkeypatch: pytest.MonkeyPatch,
     changed_path: str,
 ) -> None:
-    monkeypatch.setattr(
-        remote_launcher, "changed_checkout_paths", lambda: (changed_path,)
-    )
+    monkeypatch.setattr(remote_launcher, "changed_checkout_paths", lambda: (changed_path,))
 
     with pytest.raises(remote_launcher.LauncherError, match="remote daemon"):
-        remote_launcher.validate_checkout_for_deployment(
-            web_layer=True, deploy_only=False
-        )
+        remote_launcher.validate_checkout_for_deployment(web_layer=True, deploy_only=False)
 
 
 def test_direct_launcher_still_requires_a_clean_checkout(
@@ -274,9 +260,7 @@ def test_direct_launcher_still_requires_a_clean_checkout(
     )
 
     with pytest.raises(remote_launcher.LauncherError, match="remote daemon"):
-        remote_launcher.validate_checkout_for_deployment(
-            web_layer=False, deploy_only=False
-        )
+        remote_launcher.validate_checkout_for_deployment(web_layer=False, deploy_only=False)
 
 
 def test_tunnel_enables_keepalive_so_dead_forwarding_does_not_hang(
@@ -344,15 +328,15 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
         evolution_model="gpt-5.5",
     )
 
-    assert "state_root=\"$HOME/.openevo/dev-agent\"" in script
-    assert "source_marker=\"$state_root/managed-source-v1\"" in script
+    assert 'state_root="$HOME/.openevo/dev-agent"' in script
+    assert 'source_marker="$state_root/managed-source-v1"' in script
     assert 'source_bundle="$state_root/incoming/source-$expected_commit.bundle"' in script
     assert 'bundle verify "$source_bundle"' in script
     assert 'verify_root="$state_root/incoming/bundle-verifier.git"' in script
     assert 'git init --quiet --bare "$verify_root"' in script
     assert 'install_parent="$(mktemp -d "$state_root/incoming/install.XXXXXX")"' in script
     assert "refs/remotes/openevo-local/$branch" in script
-    assert "git -C \"$source_root\" merge --ff-only" in script
+    assert 'git -C "$source_root" merge --ff-only' in script
     assert 'git -C "$source_root" remote remove origin' in script
     assert "refusing to run non-committed source" in script
     assert script.index("status --porcelain") < script.index(
@@ -375,7 +359,8 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
     assert '"$HOME"/.nvm/versions/node/*/bin/codex' in script
     assert '"PATH=$codex_dir:$PATH"' in script
     assert '--codex-binary "$codex_bin"' in script
-    assert "scripts/dev/live_agent_daemon.py" in script
+    assert "-m openevo.daemon.product_app" in script
+    assert "*scripts/dev/live_agent_daemon.py*" in script
     assert "Refusing to modify an unrecognized path" in script
     assert "'\"'\"'" in script
 
@@ -424,7 +409,7 @@ def test_remote_script_can_start_the_unchanged_desktop_ui_beside_daemon() -> Non
 def test_remote_source_probe_never_accesses_a_git_remote() -> None:
     script = remote_launcher.build_remote_source_probe_script()
 
-    assert "git -C \"$source_root\" rev-parse HEAD" in script
+    assert 'git -C "$source_root" rev-parse HEAD' in script
     assert "fetch" not in script
     assert "github.com" not in script
 

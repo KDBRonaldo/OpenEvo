@@ -9,15 +9,15 @@ restore the removed release sidecar or managed deployment stack.
 browser
   -> unchanged local SSH tunnel
   -> development_agent_web_layer.py compatibility composition
-  -> live_agent_daemon.py compatibility composition
-  -> capabilities progressively extracted into openevo.daemon
+  -> openevo.daemon.product_app formal composition
+  -> extracted daemon capabilities
 ```
 
 There is no parallel cutover daemon.  The working remote WebUI command is the
 acceptance path throughout the rebuild.  `openevo.daemon` begins as a library
 and lifecycle shell behind that path and gradually becomes its implementation.
 
-The first implementation owns only:
+The initial lifecycle implementation owned only:
 
 - one loopback FastAPI process;
 - public `/health` and authenticated `/v1/daemon/status` routes;
@@ -26,12 +26,11 @@ The first implementation owns only:
 - `start`, `status`, `logs`, `restart`, and `stop` lifecycle commands;
 - stale-PID protection before process termination.
 
-Session, task, transcript, workspace, artifact, and evolution behavior remains
-in the proven development daemon until each API is migrated with regression
-tests.  Project catalog persistence has moved behind the compatibility
-composition into `src/openevo/daemon/project_catalog.py` without changing its
-SQLite tables.  The existing remote WebUI command remains unchanged during
-this phase.
+Project, event, task, Session, workspace, artifact, Agent Runner, Evolution,
+closed Web Layer contracts, and final HTTP/process composition have now moved
+under `src/openevo/daemon`. The accepted SQLite tables, HTTP payloads, ports,
+SSH tunnel, and browser command did not change. The former development daemon
+script remains only as a thin import and launch adapter.
 
 ## Slice acceptance rule
 
@@ -55,12 +54,10 @@ The planned order is:
 9. evolution orchestration;
 10. final single-process composition.
 
-The lifecycle shell, Web Layer lifespan migration, project catalog, recoverable
-state events, and task journal extraction are complete.  Task logs and timeline
-still use `development_task_logs_v2` and `development_task_timeline_v2`, share
-the same state transaction, and backfill historical session rows at startup.
-No remote data migration is required.  The session lifecycle row and its
-running/completed/failed/cancelled transitions are the next authority boundary.
+All ten daemon migration slices are locally complete. Real SSH-hosted browser
+acceptance remains the cutover gate before the compatibility launcher can be
+removed. The remote Web Layer remains a separate process and future migration
+boundary.
 
 The lifecycle layout is adapted from the MIT-licensed HKUDS/nanobot gateway.
 Nanobot source may be copied for lifecycle, authentication, atomic persistence,

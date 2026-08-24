@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Sequence
 
-import uvicorn
-
-from openevo.daemon.app import create_daemon_app
+from openevo.daemon.errors import EvolutionRunError
+from openevo.daemon.product_app import create_product_daemon, serve_product_daemon
 from openevo.daemon.runtime import (
     DaemonProcessResult,
     DaemonProcessStatus,
@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
     serve.add_argument("--token-file", type=Path, required=True)
+    serve.add_argument("--timeout-seconds", type=int, default=300)
+    serve.add_argument("--codex-binary", default="codex")
 
     status = subparsers.add_parser("status")
     status.add_argument("--state-root", type=Path, default=None)
@@ -55,12 +57,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.host not in {"127.0.0.1", "localhost", "::1"}:
             raise SystemExit("OpenEvo daemon must bind to loopback")
         token = read_token_file(args.token_file)
-        uvicorn.run(
-            create_daemon_app(token=token),
-            host=args.host,
-            port=args.port,
-            log_level="info",
+        model = os.environ.get("OPENEVO_DEV_CODEX_MODEL", "").strip() or None
+        evolution_model = (
+            os.environ.get("OPENEVO_DEV_EVOLUTION_MODEL", "").strip() or model or "gpt-5.5"
         )
+        try:
+            composition = create_product_daemon(
+                host=args.host,
+                port=args.port,
+                token=token,
+                codex_binary=args.codex_binary,
+                timeout_seconds=args.timeout_seconds,
+                state_path=paths.state_root / "state.sqlite3",
+                model=model,
+                evolution_model=evolution_model,
+            )
+        except (EvolutionRunError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        serve_product_daemon(composition)
         return 0
 
     runtime = DaemonRuntime(paths=paths)

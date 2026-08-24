@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
 import json
 from pathlib import Path
@@ -16,11 +15,16 @@ import zipfile
 import pytest
 
 
-SCRIPT = Path(__file__).parents[2] / "scripts" / "dev" / "live_agent_daemon.py"
-SPEC = importlib.util.spec_from_file_location("live_agent_daemon", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-MODULE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODULE)
+from openevo.daemon import product_app as MODULE
+
+
+def test_legacy_daemon_script_is_only_a_thin_compatibility_launcher() -> None:
+    script = (
+        Path(__file__).parents[2] / "scripts" / "dev" / "live_agent_daemon.py"
+    ).read_text(encoding="utf-8")
+
+    assert "from openevo.daemon.product_app import" in script
+    assert len(script.splitlines()) < 30
 
 
 def test_validate_request_accepts_the_closed_development_contract() -> None:
@@ -67,25 +71,33 @@ def test_task_presentation_v2_is_paginated_and_restart_safe(tmp_path: Path) -> N
     project_id = "development-project-presentations"
     task_id = "development-task-presentation-1"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": project_id,
-        "display_name": "Presentation project",
-        "config": {},
-    })
-    store.start_session(task_id, {
-        "project_id": project_id,
-        "project_name": "Presentation project",
-        "task_title": "Read the answer",
-        "instruction": "Reply with the durable answer.",
-    })
-    store.complete_session(task_id, {
-        "response": "The durable answer.",
-        "model": "codex-test",
-        "duration_ms": 12,
-        "logs": ["Harness completed."],
-        "workspace_changes": [],
-        "runtime_activation": None,
-    })
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Presentation project",
+            "config": {},
+        }
+    )
+    store.start_session(
+        task_id,
+        {
+            "project_id": project_id,
+            "project_name": "Presentation project",
+            "task_title": "Read the answer",
+            "instruction": "Reply with the durable answer.",
+        },
+    )
+    store.complete_session(
+        task_id,
+        {
+            "response": "The durable answer.",
+            "model": "codex-test",
+            "duration_ms": 12,
+            "logs": ["Harness completed."],
+            "workspace_changes": [],
+            "runtime_activation": None,
+        },
+    )
 
     page = MODULE.DevelopmentStateStore(database).task_presentations_v2(
         project_id=project_id, limit=25
@@ -177,7 +189,9 @@ def test_workspace_snapshot_projects_docx_text_and_zip_listing(tmp_path: Path) -
     assert "src/main.py" in entries["sources.zip"]["content"]
 
 
-def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_readiness_accepts_login_status_written_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -205,83 +219,87 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
         captured["args"] = args
         captured["env"] = kwargs["env"]
         runtime_workspace = Path(args[args.index("--cd") + 1])
-        captured["agents_md"] = (runtime_workspace / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
+        captured["agents_md"] = (runtime_workspace / "AGENTS.md").read_text(encoding="utf-8")
         captured["skill_md"] = next(
             (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
         ).read_text(encoding="utf-8")
         output_path = Path(args[args.index("--output-last-message") + 1])
         output_path.write_text(
-            json.dumps({
-                "answer": "The next answer used prior memory.",
-                "file_writes": [{"path": "answer.py", "content": "print(4)\n"}],
-                "delete_paths": [],
-            }),
+            json.dumps(
+                {
+                    "answer": "The next answer used prior memory.",
+                    "file_writes": [{"path": "answer.py", "content": "print(4)\n"}],
+                    "delete_paths": [],
+                }
+            ),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
-    result = MODULE.CodexRunner("codex", 30, "test-model").run({
-        "project_name": "Memory project",
-        "task_title": "Second question",
-        "instruction": "Answer the next question.",
-        "workspace_path": workspace,
-        "workspace_snapshot": {"entries": []},
-        "evolved_contexts": [
-            {
-                "artifact_id": "memory-artifact-1",
-                "artifact_type": "text_memory",
-                "target_id": "text_memory",
-                "manifest": {"content_path": "memory.md"},
-                "documents": [{
-                    "path": "memory.md",
-                    "media_type": "text/markdown",
-                    "content": "# Evolved memory\n\n- Verify the answer before responding.",
-                }],
-            },
-            {
-                "artifact_id": "skill-artifact-1",
-                "artifact_type": "skill_bundle",
-                "target_id": "skill_bundle",
-                "manifest": {"content_path": "SKILL.md"},
-                "documents": [{
-                    "path": "SKILL.md",
-                    "media_type": "text/markdown",
-                    "content": "# Native evolved skill\n\nUse this workflow when relevant.",
-                }],
-            },
-            {
-                "artifact_id": "agent-system-artifact-1",
-                "artifact_type": "agent_system",
-                "target_id": "agent_system",
-                "manifest": {"content_path": "AGENTS.md", "target_path": "AGENTS.md"},
-                "documents": [{
-                    "path": "AGENTS.md",
-                    "media_type": "text/markdown",
-                    "content": "# Native evolved agent system\n\nFollow the project policy.",
-                }],
-            },
-        ],
-    })
+    result = MODULE.CodexRunner("codex", 30, "test-model").run(
+        {
+            "project_name": "Memory project",
+            "task_title": "Second question",
+            "instruction": "Answer the next question.",
+            "workspace_path": workspace,
+            "workspace_snapshot": {"entries": []},
+            "evolved_contexts": [
+                {
+                    "artifact_id": "memory-artifact-1",
+                    "artifact_type": "text_memory",
+                    "target_id": "text_memory",
+                    "manifest": {"content_path": "memory.md"},
+                    "documents": [
+                        {
+                            "path": "memory.md",
+                            "media_type": "text/markdown",
+                            "content": "# Evolved memory\n\n- Verify the answer before responding.",
+                        }
+                    ],
+                },
+                {
+                    "artifact_id": "skill-artifact-1",
+                    "artifact_type": "skill_bundle",
+                    "target_id": "skill_bundle",
+                    "manifest": {"content_path": "SKILL.md"},
+                    "documents": [
+                        {
+                            "path": "SKILL.md",
+                            "media_type": "text/markdown",
+                            "content": "# Native evolved skill\n\nUse this workflow when relevant.",
+                        }
+                    ],
+                },
+                {
+                    "artifact_id": "agent-system-artifact-1",
+                    "artifact_type": "agent_system",
+                    "target_id": "agent_system",
+                    "manifest": {"content_path": "AGENTS.md", "target_path": "AGENTS.md"},
+                    "documents": [
+                        {
+                            "path": "AGENTS.md",
+                            "media_type": "text/markdown",
+                            "content": "# Native evolved agent system\n\nFollow the project policy.",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
 
     assert "Runtime instructions resolved by OpenEvo Core" in captured["prompt"]
     assert "Verify the answer before responding" in captured["prompt"]
     assert "Native evolved skill" not in captured["prompt"]
     assert "Native evolved agent system" not in captured["prompt"]
     assert captured["agents_md"] == "# Native evolved agent system\n\nFollow the project policy."
-    assert captured["skill_md"].startswith(
-        "---\nname: skill-artifact-1\ndescription: "
-    )
+    assert captured["skill_md"].startswith("---\nname: skill-artifact-1\ndescription: ")
     assert "\n---\n\n# Native evolved skill\n" in captured["skill_md"]
     assert "persistent OpenEvo project workspace" in captured["prompt"]
     assert "read-only" in captured["args"]
     assert "shell_tool" in captured["args"]
     assert "--image" in captured["args"]
-    assert captured["args"][captured["args"].index("--image") + 1].endswith(
-        "/reference.png"
-    )
+    assert captured["args"][captured["args"].index("--image") + 1].endswith("/reference.png")
     assert "daemon-extracted document projections" in captured["prompt"]
     assert "--ignore-rules" not in captured["args"]
     assert "--output-schema" in captured["args"]
@@ -322,11 +340,13 @@ def test_runtime_materializer_passes_explicit_memory_and_spawn_controls_to_harne
                         "write_timing": "manual",
                     },
                 },
-                "documents": [{
-                    "path": "memory.md",
-                    "media_type": "text/markdown",
-                    "content": "# On-demand memory",
-                }],
+                "documents": [
+                    {
+                        "path": "memory.md",
+                        "media_type": "text/markdown",
+                        "content": "# On-demand memory",
+                    }
+                ],
             },
             {
                 "artifact_id": "agent-policy-1",
@@ -338,19 +358,23 @@ def test_runtime_materializer_passes_explicit_memory_and_spawn_controls_to_harne
                     "runtime_control": {
                         "kind": "agent_system",
                         "spawn_plan": {
-                            "agents": [{
-                                "agent_id": "reviewer",
-                                "role": "Reviewer",
-                                "instructions": "Review the proposed result.",
-                            }],
+                            "agents": [
+                                {
+                                    "agent_id": "reviewer",
+                                    "role": "Reviewer",
+                                    "instructions": "Review the proposed result.",
+                                }
+                            ],
                         },
                     },
                 },
-                "documents": [{
-                    "path": "AGENTS.md",
-                    "media_type": "text/markdown",
-                    "content": "# Coordinator",
-                }],
+                "documents": [
+                    {
+                        "path": "AGENTS.md",
+                        "media_type": "text/markdown",
+                        "content": "# Coordinator",
+                    }
+                ],
             },
         ],
     )
@@ -415,11 +439,11 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "state": "completed",
         "duration_ms": 123,
         "logs": ["Remote development daemon admitted the session.", "admitted", "completed"],
-            "selected_evolution": [],
-            "evolution_errors": [],
-            "workspace_changes": [],
-            "context_artifact_ids": [],
-            "runtime_activation": {
+        "selected_evolution": [],
+        "evolution_errors": [],
+        "workspace_changes": [],
+        "context_artifact_ids": [],
+        "runtime_activation": {
             "schema_version": "1",
             "adapter_id": "codex-development-v1",
             "fully_supported": True,
@@ -434,9 +458,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert {
         "development_metadata",
@@ -517,15 +539,11 @@ def test_daemon_event_long_poll_wakes_after_committed_change(tmp_path: Path) -> 
             "config": {},
         }
     )
-    cursor = store.read_events(after_sequence=None, limit=100, wait_seconds=0)[
-        "latest_sequence"
-    ]
+    cursor = store.read_events(after_sequence=None, limit=100, wait_seconds=0)["latest_sequence"]
     result: dict[str, object] = {}
 
     def wait_for_event() -> None:
-        result.update(
-            store.read_events(after_sequence=cursor, limit=100, wait_seconds=2)
-        )
+        result.update(store.read_events(after_sequence=cursor, limit=100, wait_seconds=2))
 
     thread = threading.Thread(target=wait_for_event)
     thread.start()
@@ -571,35 +589,43 @@ def test_daemon_event_journal_rejects_an_evicted_cursor(
 def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: Path) -> None:
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
     project_id = "development-project-decoupled"
-    store.create_project({
-        "project_id": project_id,
-        "display_name": "Decoupled project",
-        "config": {
-            "evolution": {
-                "targets": {
-                    "text_memory": {
-                        "enabled": True,
-                        "method": "text_memory_reflector",
-                        "config": {},
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Decoupled project",
+            "config": {
+                "evolution": {
+                    "targets": {
+                        "text_memory": {
+                            "enabled": True,
+                            "method": "text_memory_reflector",
+                            "config": {},
+                        }
                     }
                 }
-            }
-        },
-    })
+            },
+        }
+    )
     for index in (1, 2):
         session_id = f"dev-session-evidence-{index}"
-        store.start_session(session_id, {
-            "project_id": project_id,
-            "project_name": "Decoupled project",
-            "task_title": f"Evidence {index}",
-            "instruction": f"Collect evidence {index}",
-        })
-        store.complete_session(session_id, {
-            "response": f"Observation {index}",
-            "model": "test-model",
-            "duration_ms": 1,
-            "logs": [],
-        })
+        store.start_session(
+            session_id,
+            {
+                "project_id": project_id,
+                "project_name": "Decoupled project",
+                "task_title": f"Evidence {index}",
+                "instruction": f"Collect evidence {index}",
+            },
+        )
+        store.complete_session(
+            session_id,
+            {
+                "response": f"Observation {index}",
+                "model": "test-model",
+                "duration_ms": 1,
+                "logs": [],
+            },
+        )
         dataset = tmp_path / f"dataset-{index}.json"
         dataset.write_text("{}", encoding="utf-8")
         store.record_dataset_artifact(
@@ -610,24 +636,22 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
             name=f"Evidence {index}",
         )
 
-    assert all(
-        session["selected_evolution"] == []
-        for session in store.snapshot()["sessions"]
+    assert all(session["selected_evolution"] == [] for session in store.snapshot()["sessions"])
+    assert all(session["evolution_evidence_ready"] for session in store.snapshot()["sessions"])
+    request = MODULE.validate_evolution_run_request(
+        {
+            "schema_version": "1",
+            "project_id": project_id,
+            "session_ids": ["dev-session-evidence-1", "dev-session-evidence-2"],
+            "selections": [
+                {
+                    "target_id": "text_memory",
+                    "method": "text_memory_reflector",
+                    "config": {},
+                }
+            ],
+        }
     )
-    assert all(
-        session["evolution_evidence_ready"]
-        for session in store.snapshot()["sessions"]
-    )
-    request = MODULE.validate_evolution_run_request({
-        "schema_version": "1",
-        "project_id": project_id,
-        "session_ids": ["dev-session-evidence-1", "dev-session-evidence-2"],
-        "selections": [{
-            "target_id": "text_memory",
-            "method": "text_memory_reflector",
-            "config": {},
-        }],
-    })
     run = store.start_evolution_run("evolution-run-1", request)
     attempt = store.start_evolution_job(
         job_id="job-memory-evolution-run-1",
@@ -649,11 +673,13 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         artifact_type="text_memory",
         method_id="text_memory_reflector",
         renderer_kind="markdown",
-        documents=[{
-            "path": "memory.md",
-            "media_type": "text/markdown",
-            "content": "# Candidate memory",
-        }],
+        documents=[
+            {
+                "path": "memory.md",
+                "media_type": "text/markdown",
+                "content": "# Candidate memory",
+            }
+        ],
         manifest={"content_path": "memory.md"},
         previous_artifact_id=None,
         promoted=False,
@@ -676,12 +702,15 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
     assert [item["artifact_id"] for item in store.latest_context_artifacts(project_id)] == [
         "candidate-memory-1"
     ]
-    store.start_session("dev-session-uses-applied-context", {
-        "project_id": project_id,
-        "project_name": "Decoupled project",
-        "task_title": "Use applied context",
-        "instruction": "Use the current memory",
-    })
+    store.start_session(
+        "dev-session-uses-applied-context",
+        {
+            "project_id": project_id,
+            "project_name": "Decoupled project",
+            "task_title": "Use applied context",
+            "instruction": "Use the current memory",
+        },
+    )
     started_session = next(
         session
         for session in store.snapshot()["sessions"]
@@ -706,23 +735,31 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
 def test_completed_legacy_sessions_are_backfilled_as_evolution_evidence(tmp_path: Path) -> None:
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
     project_id = "development-project-legacy-evidence"
-    store.create_project({
-        "project_id": project_id,
-        "display_name": "Legacy evidence",
-        "config": {"evolution": {"targets": {}}},
-    })
-    store.start_session("dev-session-legacy-evidence", {
-        "project_id": project_id,
-        "project_name": "Legacy evidence",
-        "task_title": "Old completed Session",
-        "instruction": "Preserve this question",
-    })
-    store.complete_session("dev-session-legacy-evidence", {
-        "response": "Preserve this answer",
-        "model": "test-model",
-        "duration_ms": 1,
-        "logs": [],
-    })
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Legacy evidence",
+            "config": {"evolution": {"targets": {}}},
+        }
+    )
+    store.start_session(
+        "dev-session-legacy-evidence",
+        {
+            "project_id": project_id,
+            "project_name": "Legacy evidence",
+            "task_title": "Old completed Session",
+            "instruction": "Preserve this question",
+        },
+    )
+    store.complete_session(
+        "dev-session-legacy-evidence",
+        {
+            "response": "Preserve this answer",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        },
+    )
     assert store.snapshot()["sessions"][0]["evolution_evidence_ready"] is False
 
     runner = MODULE.DocumentEvolutionRunner(
@@ -792,9 +829,7 @@ def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> Non
             "AND name = 'development_evolution_jobs'"
         ).fetchone()[0]
         columns = {
-            row[1] for row in connection.execute(
-                "PRAGMA table_info(development_evolution_jobs)"
-            )
+            row[1] for row in connection.execute("PRAGMA table_info(development_evolution_jobs)")
         }
     assert "run_id" in columns
     assert "UNIQUE(run_id, target_id)" in job_sql
@@ -804,15 +839,20 @@ def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> Non
 def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": "development-project-files",
-        "display_name": "Coding project",
-        "config": {},
-    })
-    store.apply_workspace_mutations("development-project-files", {
-        "file_writes": [{"path": "src/main.py", "content": "print('hello')\n"}],
-        "delete_paths": [],
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-files",
+            "display_name": "Coding project",
+            "config": {},
+        }
+    )
+    store.apply_workspace_mutations(
+        "development-project-files",
+        {
+            "file_writes": [{"path": "src/main.py", "content": "print('hello')\n"}],
+            "delete_paths": [],
+        },
+    )
     workspace = store.workspace_path("development-project-files")
     (workspace / "binary.bin").write_bytes(b"\x00\x01")
 
@@ -828,28 +868,35 @@ def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path:
 
 def test_project_workspace_broker_rejects_paths_outside_the_project(tmp_path: Path) -> None:
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
-    store.create_project({
-        "project_id": "development-project-safe",
-        "display_name": "Safe project",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-safe",
+            "display_name": "Safe project",
+            "config": {},
+        }
+    )
 
     with pytest.raises(MODULE.AgentRunError, match="unsafe workspace path"):
-        store.apply_workspace_mutations("development-project-safe", {
-            "file_writes": [{"path": "../escaped.txt", "content": "no"}],
-            "delete_paths": [],
-        })
+        store.apply_workspace_mutations(
+            "development-project-safe",
+            {
+                "file_writes": [{"path": "../escaped.txt", "content": "no"}],
+                "delete_paths": [],
+            },
+        )
 
     assert not (tmp_path / "escaped.txt").exists()
 
 
 def test_project_workspace_upload_and_download_preserve_binary_bytes(tmp_path: Path) -> None:
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
-    store.create_project({
-        "project_id": "development-project-transfer",
-        "display_name": "Transfer project",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-transfer",
+            "display_name": "Transfer project",
+            "config": {},
+        }
+    )
     payload = b"\x00\x01OpenEvo\xff"
 
     entry = store.upload_workspace_file(
@@ -888,11 +935,13 @@ def test_project_workspace_upload_and_download_preserve_binary_bytes(tmp_path: P
 def test_http_workspace_file_upload_and_download_round_trip(tmp_path: Path) -> None:
     token = "t" * 32
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
-    store.create_project({
-        "project_id": "development-project-transfer",
-        "display_name": "Transfer project",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-transfer",
+            "display_name": "Transfer project",
+            "config": {},
+        }
+    )
     server = MODULE.DevelopmentAgentServer(
         ("127.0.0.1", 0),
         token,
@@ -940,11 +989,13 @@ def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
     token = "v" * 32
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": "development-project-v2-files",
-        "display_name": "V2 files",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-v2-files",
+            "display_name": "V2 files",
+            "config": {},
+        }
+    )
     server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -978,11 +1029,13 @@ def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
             first = json.loads(response.read())
         assert first["has_more"] is True
         assert first["next_cursor"] == first["items"][0]["path"]
-        second_query = urlencode({
-            "limit": "100",
-            "after": first["next_cursor"],
-            "manifest_sha256": first["manifest_sha256"],
-        })
+        second_query = urlencode(
+            {
+                "limit": "100",
+                "after": first["next_cursor"],
+                "manifest_sha256": first["manifest_sha256"],
+            }
+        )
         second_request = urllib.request.Request(
             f"{base}?{second_query}", headers={"Authorization": f"Bearer {token}"}
         )
@@ -990,7 +1043,9 @@ def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
             second = json.loads(response.read())
         assert second["manifest_sha256"] == first["manifest_sha256"]
         assert {entry["path"] for entry in first["items"] + second["items"]} == {
-            "notes", "notes/a.txt", "notes/b.txt"
+            "notes",
+            "notes/a.txt",
+            "notes/b.txt",
         }
 
         download = urllib.request.Request(
@@ -999,9 +1054,10 @@ def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
         )
         with urllib.request.urlopen(download, timeout=5) as response:
             assert response.read() == payloads["notes/a.txt"]
-            assert response.headers["X-OpenEvo-Content-SHA256"] == hashlib.sha256(
-                payloads["notes/a.txt"]
-            ).hexdigest()
+            assert (
+                response.headers["X-OpenEvo-Content-SHA256"]
+                == hashlib.sha256(payloads["notes/a.txt"]).hexdigest()
+            )
 
         bad_upload = urllib.request.Request(
             f"{base}/files?{urlencode({'path': 'bad.txt', 'overwrite': 'false'})}",
@@ -1055,17 +1111,22 @@ def test_daemon_v2_artifacts_are_paginated_bounded_and_restart_safe(tmp_path: Pa
     project_id = "development-project-v2-artifacts"
     task_id = "development-task-v2-artifacts"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": project_id,
-        "display_name": "V2 artifacts",
-        "config": {},
-    })
-    store.start_session(task_id, {
-        "project_id": project_id,
-        "project_name": "V2 artifacts",
-        "task_title": "Produce artifacts",
-        "instruction": "Produce two bounded artifacts",
-    })
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "V2 artifacts",
+            "config": {},
+        }
+    )
+    store.start_session(
+        task_id,
+        {
+            "project_id": project_id,
+            "project_name": "V2 artifacts",
+            "task_title": "Produce artifacts",
+            "instruction": "Produce two bounded artifacts",
+        },
+    )
     for index, artifact_type in enumerate(("skill_bundle", "report"), start=1):
         content = f"# Artifact {index}\n"
         store.record_evolution_artifact(
@@ -1075,12 +1136,16 @@ def test_daemon_v2_artifacts_are_paginated_bounded_and_restart_safe(tmp_path: Pa
             target_id="skill_bundle" if artifact_type == "skill_bundle" else "agent_system",
             artifact_type=artifact_type,
             method_id="artifact_reflector",
-            renderer_kind="file_bundle" if artifact_type == "skill_bundle" else "structured_summary",
-            documents=[{
-                "path": "SKILL.md" if artifact_type == "skill_bundle" else "report.md",
-                "media_type": "text/markdown",
-                "content": content,
-            }],
+            renderer_kind="file_bundle"
+            if artifact_type == "skill_bundle"
+            else "structured_summary",
+            documents=[
+                {
+                    "path": "SKILL.md" if artifact_type == "skill_bundle" else "report.md",
+                    "media_type": "text/markdown",
+                    "content": content,
+                }
+            ],
             manifest={"ordinal": index},
             previous_artifact_id=None,
             promoted=False,
@@ -1171,23 +1236,31 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
     task_id = "development-task-v2-evolution"
     action_id = "development-action-v2-evolution"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": project_id,
-        "display_name": "V2 Evolution",
-        "config": {},
-    })
-    store.start_session(task_id, {
-        "project_id": project_id,
-        "project_name": "V2 Evolution",
-        "task_title": "Evolution evidence",
-        "instruction": "Create reusable evidence",
-    })
-    store.complete_session(task_id, {
-        "response": "Reusable observation",
-        "model": "test-model",
-        "duration_ms": 1,
-        "logs": [],
-    })
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "V2 Evolution",
+            "config": {},
+        }
+    )
+    store.start_session(
+        task_id,
+        {
+            "project_id": project_id,
+            "project_name": "V2 Evolution",
+            "task_title": "Evolution evidence",
+            "instruction": "Create reusable evidence",
+        },
+    )
+    store.complete_session(
+        task_id,
+        {
+            "response": "Reusable observation",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        },
+    )
     dataset = tmp_path / "dataset.json"
     dataset.write_text("{}", encoding="utf-8")
     store.record_dataset_artifact(
@@ -1215,11 +1288,13 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
                 artifact_type="text_memory",
                 method_id="text_memory_reflector",
                 renderer_kind="markdown",
-                documents=[{
-                    "path": "memory.md",
-                    "media_type": "text/markdown",
-                    "content": content,
-                }],
+                documents=[
+                    {
+                        "path": "memory.md",
+                        "media_type": "text/markdown",
+                        "content": content,
+                    }
+                ],
                 manifest={"content_path": "memory.md"},
                 previous_artifact_id=None,
                 promoted=False,
@@ -1245,12 +1320,14 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
         "action_id": action_id,
         "project_id": project_id,
         "source_task_ids": [task_id],
-        "selections": [{
-            "schema_version": "2",
-            "target_id": "text_memory",
-            "method": "text_memory_reflector",
-            "config": {},
-        }],
+        "selections": [
+            {
+                "schema_version": "2",
+                "target_id": "text_memory",
+                "method": "text_memory_reflector",
+                "config": {},
+            }
+        ],
     }
     try:
         create = urllib.request.Request(
@@ -1328,14 +1405,18 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
     restored = MODULE.DevelopmentStateStore(database)
     restored_run = restored.evolution_run_v2(run_id)
     assert restored_run.state == "applied"
-    restored.start_session("development-task-after-v2-evolution", {
-        "project_id": project_id,
-        "project_name": "V2 Evolution",
-        "task_title": "Use applied context",
-        "instruction": "Use the newly applied memory",
-    })
+    restored.start_session(
+        "development-task-after-v2-evolution",
+        {
+            "project_id": project_id,
+            "project_name": "V2 Evolution",
+            "task_title": "Use applied context",
+            "instruction": "Use the newly applied memory",
+        },
+    )
     next_session = next(
-        session for session in restored.snapshot()["sessions"]
+        session
+        for session in restored.snapshot()["sessions"]
         if session["session_id"] == "development-task-after-v2-evolution"
     )
     assert next_session["context_artifact_ids"] == list(restored_run.artifact_ids)
@@ -1364,9 +1445,7 @@ def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Pat
         connection.execute(
             "UPDATE development_sessions SET selected_evolution_json = ? WHERE session_id = ?",
             (
-                json.dumps([
-                    {"target_id": "text_memory", "method": "text_memory_reflector"}
-                ]),
+                json.dumps([{"target_id": "text_memory", "method": "text_memory_reflector"}]),
                 "dev-session-legacy",
             ),
         )
@@ -1551,9 +1630,7 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
         contexts=store.latest_context_artifacts(project["project_id"]),
     )
     assert (runtime_workspace / "AGENTS.md").is_file()
-    skill_paths = list(
-        (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
-    )
+    skill_paths = list((runtime_workspace / ".agents" / "skills").glob("*/SKILL.md"))
     assert skill_paths
     assert skill_paths[0].read_text(encoding="utf-8").startswith("---\nname: ")
     assert (runtime_workspace / ".openevo" / "evolution" / "memory.md").is_file()
@@ -1648,9 +1725,10 @@ def test_development_capabilities_are_projected_from_the_core_catalog(tmp_path: 
         "skill_bundle",
         "agent_system",
     }
-    assert all(target["renderer_kind"] in {
-        "markdown", "file_bundle", "structured_summary", "adapter"
-    } for target in targets)
+    assert all(
+        target["renderer_kind"] in {"markdown", "file_bundle", "structured_summary", "adapter"}
+        for target in targets
+    )
     assert all(
         method["method_id"] != "text_memory_memevolve"
         for target in targets
@@ -1793,10 +1871,12 @@ def test_failed_evolution_method_can_retry_with_fixed_inputs_without_rerunning_a
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    retry_body = json.dumps({
-        "schema_version": "2",
-        "action_id": retry_action_id,
-    }).encode()
+    retry_body = json.dumps(
+        {
+            "schema_version": "2",
+            "action_id": retry_action_id,
+        }
+    ).encode()
     try:
         retry_request = urllib.request.Request(
             f"{root}/v2/development/evolution-jobs/{failed_job['job_id']}/retry",
@@ -1838,9 +1918,7 @@ def test_failed_evolution_method_can_retry_with_fixed_inputs_without_rerunning_a
         )
         with urllib.request.urlopen(inventory_request, timeout=5) as response:
             page_v2_payload = json.loads(response.read())
-        assert [item["job_id"] for item in page_v2_payload["items"]] == [
-            failed_job["job_id"]
-        ]
+        assert [item["job_id"] for item in page_v2_payload["items"]] == [failed_job["job_id"]]
     finally:
         server.shutdown()
         server.server_close()
@@ -1989,10 +2067,12 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
                 "schema_version": "1",
                 "response": f"Answer to: {request['instruction']}",
                 "file_mutations": {
-                    "file_writes": [{
-                        "path": "hello.py",
-                        "content": "print('hello')\n",
-                    }],
+                    "file_writes": [
+                        {
+                            "path": "hello.py",
+                            "content": "print('hello')\n",
+                        }
+                    ],
                     "delete_paths": [],
                 },
                 "model": "fake-model",
@@ -2094,11 +2174,13 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
 ) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
-    store.create_project({
-        "project_id": "development-project-1",
-        "display_name": "Persistent project",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-1",
+            "display_name": "Persistent project",
+            "config": {},
+        }
+    )
     request = {
         "project_id": "development-project-1",
         "project_name": "Persistent project",
@@ -2107,14 +2189,17 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
     }
     store.start_session("development-session-1", request)
     store.append_session_log("development-session-1", "Harness started.")
-    store.complete_session("development-session-1", {
-        "response": "Persistent answer.",
-        "model": "codex",
-        "duration_ms": 10,
-        "logs": ["Harness started.", "Harness completed."],
-        "workspace_changes": [],
-        "runtime_activation": None,
-    })
+    store.complete_session(
+        "development-session-1",
+        {
+            "response": "Persistent answer.",
+            "model": "codex",
+            "duration_ms": 10,
+            "logs": ["Harness started.", "Harness completed."],
+            "workspace_changes": [],
+            "runtime_activation": None,
+        },
+    )
     store.record_dataset_artifact(
         artifact_id="dataset-development-session-1",
         project_id="development-project-1",
@@ -2124,9 +2209,7 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
         manifest_sha256="1" * 64,
     )
 
-    first_logs = store.task_logs_v2(
-        "development-session-1", after_sequence=0, limit=2
-    )
+    first_logs = store.task_logs_v2("development-session-1", after_sequence=0, limit=2)
     assert first_logs.has_more is True
     assert first_logs.next_cursor == "2"
     second_logs = store.task_logs_v2(
@@ -2139,14 +2222,10 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
     assert all_logs[-1].stream == "transcript"
     assert all_logs[-1].message == "Persistent answer."
 
-    first_timeline = store.task_timeline_v2(
-        "development-session-1", after_sequence=0, limit=1
-    )
+    first_timeline = store.task_timeline_v2("development-session-1", after_sequence=0, limit=1)
     assert first_timeline.has_more is True
     assert first_timeline.next_cursor == "1"
-    later_timeline = store.task_timeline_v2(
-        "development-session-1", after_sequence=1, limit=100
-    )
+    later_timeline = store.task_timeline_v2("development-session-1", after_sequence=1, limit=100)
     timeline = [*first_timeline.items, *later_timeline.items]
     assert [item.event_type for item in timeline] == [
         "task_admitted",
@@ -2155,9 +2234,7 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
     ]
 
     restored = MODULE.DevelopmentStateStore(database)
-    restored_logs = restored.task_logs_v2(
-        "development-session-1", after_sequence=0, limit=100
-    )
+    restored_logs = restored.task_logs_v2("development-session-1", after_sequence=0, limit=100)
     restored_timeline = restored.task_timeline_v2(
         "development-session-1", after_sequence=0, limit=100
     )
@@ -2167,13 +2244,9 @@ def test_task_v2_logs_and_timeline_are_stable_across_pages_and_restart(
     assert restored_timeline.items == timeline
 
     with pytest.raises(MODULE.RequestError, match="beyond"):
-        restored.task_logs_v2(
-            "development-session-1", after_sequence=999, limit=100
-        )
+        restored.task_logs_v2("development-session-1", after_sequence=999, limit=100)
     with pytest.raises(MODULE.RequestError, match="beyond"):
-        restored.task_timeline_v2(
-            "development-session-1", after_sequence=999, limit=100
-        )
+        restored.task_timeline_v2("development-session-1", after_sequence=999, limit=100)
 
 
 def test_session_coordinator_cancels_a_running_harness(tmp_path: Path) -> None:
@@ -2190,22 +2263,26 @@ def test_session_coordinator_cancels_a_running_harness(tmp_path: Path) -> None:
             raise MODULE.HarnessRunCancelled("Session cancelled by user")
 
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
-    store.create_project({
-        "project_id": "development-project-1",
-        "display_name": "Persistent project",
-        "config": {},
-    })
+    store.create_project(
+        {
+            "project_id": "development-project-1",
+            "display_name": "Persistent project",
+            "config": {},
+        }
+    )
     coordinator = MODULE.DevelopmentSessionCoordinator(
         runner=BlockingRunner(),
         store=store,
         evolution_runner=None,
     )
-    session_id = coordinator.submit({
-        "project_id": "development-project-1",
-        "project_name": "Persistent project",
-        "task_title": "Cancel me",
-        "instruction": "Wait",
-    })
+    session_id = coordinator.submit(
+        {
+            "project_id": "development-project-1",
+            "project_name": "Persistent project",
+            "task_title": "Cancel me",
+            "instruction": "Wait",
+        }
+    )
     requested = coordinator.cancel(session_id)
     assert requested["state"] == "cancelling"
     deadline = time.monotonic() + 5

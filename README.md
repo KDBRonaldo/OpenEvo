@@ -6,7 +6,7 @@ remote Linux workspace and evolving reusable context between sessions.
 The current product path is intentionally small:
 
 ```text
-browser -> local WebUI gateway -> SSH tunnel -> remote lightweight daemon
+browser -> local SSH tunnel -> remote Web Layer -> remote OpenEvo daemon
         -> agent harness / OpenEvo Core
 ```
 
@@ -57,11 +57,12 @@ workflow. Source delivery requires a local commit, but it does not require a
 push. SSH connection, source transfer, remote command, dependency bootstrap,
 and health checks are bounded so a failed network phase reports an error.
 
-## New daemon rebuild
+## OpenEvo daemon
 
-The replacement daemon is now being built under `src/openevo/daemon/`. Its
-first milestone provides a loopback-only authenticated health/control process
-with managed `start`, `status`, `logs`, `restart`, and `stop` commands:
+The remote daemon is composed under `src/openevo/daemon/product_app.py`. It owns
+Project, Session, workspace, artifact, Agent Runner, and Evolution services
+behind the existing loopback-only API and SQLite state. Managed lifecycle
+commands remain available:
 
 ```bash
 openevo-daemon start
@@ -69,8 +70,10 @@ openevo-daemon status
 openevo-daemon stop
 ```
 
-It does not replace the working remote WebUI path yet. Project/session/task
-routes will migrate behind tests before the launcher switches over.
+The working remote WebUI launcher now starts this formal module directly. The
+former `scripts/dev/live_agent_daemon.py` path is retained only as a thin
+compatibility launcher, so existing persisted state and browser behavior do not
+change.
 
 Useful companion commands:
 
@@ -96,13 +99,12 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 ## Repository boundary
 
 - `desktop/`: React WebUI and the small static host used by the gateway.
-- `scripts/dev/`: local launcher, SSH tunnel orchestration, remote lightweight
-  daemon, and WebUI layer.
+- `scripts/dev/`: local launcher, SSH tunnel orchestration, remote WebUI layer,
+  and thin compatibility entry points.
 - `src/openevo/web_gateway/`: built WebUI assets and gateway package boundary.
-- `src/openevo/daemon/`: extracted process, project, event, task-journal,
-  Session lifecycle/execution, managed workspace, and artifact SQLite
-  ownership plus Agent harness and Evolution orchestration used by the retained
-  remote path.
+- `src/openevo/daemon/`: formal process composition, closed daemon contracts,
+  project/event/task/Session persistence, managed workspace and artifacts,
+  Agent harness execution, and Evolution orchestration.
 - `src/openevo/`: reusable agent, capture, evolution, runtime, and rollout code.
 - `benchmarks/`: standalone benchmark automation.
 

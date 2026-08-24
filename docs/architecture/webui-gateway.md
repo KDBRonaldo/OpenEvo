@@ -12,8 +12,10 @@ Layer and exposed through one local loopback SSH tunnel.
   bootstrap, and status/log/stop commands.
 - `scripts/dev/development_agent_web_layer.py`: browser authentication and
   Desktop v2 projection.
-- `scripts/dev/live_agent_daemon.py`: durable project/session/workspace and
-  evolution authority.
+- `src/openevo/daemon/product_app.py`: formal durable
+  project/session/workspace, Agent, and Evolution authority.
+- `scripts/dev/live_agent_daemon.py`: thin compatibility launcher for older
+  development commands and imports.
 
 ## Build
 

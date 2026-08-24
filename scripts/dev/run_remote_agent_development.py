@@ -404,6 +404,7 @@ process_status() {{
   pid_file=$2
   marker=$3
   log_file=$4
+  legacy_marker=${{5:-$marker}}
   if [ ! -f \"$pid_file\" ]; then
     printf '%s: stopped (no managed PID receipt)\\n' \"$label\"
     printf '  log: %s\\n' \"$log_file\"
@@ -424,7 +425,7 @@ process_status() {{
   fi
   command_line=\"$(tr '\\000' ' ' < \"/proc/$pid/cmdline\" 2>/dev/null || true)\"
   case \"$command_line\" in
-    *\"$marker\"*)
+    *\"$marker\"*|*\"$legacy_marker\"*)
       printf '%s: running\\n' \"$label\"
       printf '  pid: %s\\n' \"$pid\"
       printf '  log: %s\\n' \"$log_file\"
@@ -441,7 +442,7 @@ process_status() {{
         return common + """
 printf 'OpenEvo remote development stack\\n'
 printf 'state: %s\\n' "$state_root"
-process_status "daemon" "$daemon_pid_file" "scripts/dev/live_agent_daemon.py" "$daemon_log_file"
+process_status "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "$daemon_log_file" "scripts/dev/live_agent_daemon.py"
 process_status "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py" "$web_log_file"
 if [ -d "$state_root/source/.git" ]; then
   source_commit="$(git -C "$state_root/source" rev-parse --short=12 HEAD 2>/dev/null || true)"
@@ -463,6 +464,7 @@ stop_managed_process() {
   label=$1
   pid_file=$2
   marker=$3
+  legacy_marker=${4:-$marker}
   if [ ! -f "$pid_file" ]; then
     printf '%s: already stopped\\n' "$label"
     return
@@ -481,7 +483,7 @@ stop_managed_process() {
   fi
   command_line="$(tr '\\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
   case "$command_line" in
-    *"$marker"*) ;;
+    *"$marker"*|*"$legacy_marker"*) ;;
     *)
       printf '%s: refusing to signal PID %s because it is not the managed process\\n' "$label" "$pid" >&2
       exit 42
@@ -507,7 +509,7 @@ stop_managed_process() {
 
 # Stop the HTTP/WebUI edge before its daemon authority.
 stop_managed_process "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py"
-stop_managed_process "daemon" "$daemon_pid_file" "scripts/dev/live_agent_daemon.py"
+stop_managed_process "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "scripts/dev/live_agent_daemon.py"
 """
 
 
@@ -821,7 +823,7 @@ if [ -f "$pid_file" ]; then
   if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
     old_command="$(tr '\\000' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)"
     case "$old_command" in
-      *scripts/dev/live_agent_daemon.py*)
+      *openevo.daemon.product_app*|*scripts/dev/live_agent_daemon.py*)
         kill "$old_pid"
         wait_count=0
         while kill -0 "$old_pid" 2>/dev/null && [ "$wait_count" -lt 20 ]; do
@@ -842,7 +844,7 @@ nohup env \
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
   "$uv_bin" run --frozen --no-sync --python 3.11 python \
-  scripts/dev/live_agent_daemon.py \
+  -m openevo.daemon.product_app \
   --port "$remote_port" --codex-binary "$codex_bin" \
   >"$log_file" 2>&1 </dev/null &
 daemon_pid=$!

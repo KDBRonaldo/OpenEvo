@@ -1,5 +1,10 @@
 # Changelog
 
+- Moved the accepted daemon HTTP models, runtime-context projection, dependency
+  initialization, and final Project/Session/Workspace/Artifact/Agent/Evolution
+  process composition into `openevo.daemon.product_app`; the remote launcher
+  now starts that formal module while the former development daemon and
+  contract modules remain thin compatibility adapters.
 - Extracted transcript dataset sealing, capability-driven fixed-input Evolution
   jobs/retries, output validation, artifact publication, and explicit
   multi-Session candidate runs into `openevo.daemon` without changing the

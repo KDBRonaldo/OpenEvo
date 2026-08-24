@@ -9,7 +9,7 @@ React renderer
   -> X-OpenEvo-Desktop-Session authenticated /desktop/v2/*
   -> scripts/dev/development_agent_web_layer.py
   -> bearer-authenticated daemon /v2/*
-  -> scripts/dev/live_agent_daemon.py
+  -> openevo.daemon.product_app
 ```
 
 The browser bootstrap token is single-use.  It is exchanged for a browser
@@ -47,8 +47,10 @@ supplies its development runtime-context materializer and Evolution sealer to
 that runner. Transcript dataset sealing, development capability resolution,
 fixed-input Evolution jobs/retries, output validation, artifact publication,
 and explicit multi-Session candidate runs are owned by
-`src/openevo/daemon/evolution_orchestrator.py`. The compatibility daemon retains
-unchanged HTTP models, SQLite rows, and process composition.
+`src/openevo/daemon/evolution_orchestrator.py`. The formal composition root is
+`src/openevo/daemon/product_app.py`; it retains the unchanged HTTP models,
+SQLite rows, ports, and loopback-only behavior. The former
+`scripts/dev/live_agent_daemon.py` is now only a compatibility launcher.
 
 The renderer enters the Session conversation as soon as the user starts a
 task. It shows the submitted instruction during validation/admission, then
