@@ -57,6 +57,10 @@ from openevo.daemon.project_catalog import (  # noqa: E402
     ProjectCatalogConflictError,
     SqliteProjectCatalog,
 )
+from openevo.daemon.task_journal import (  # noqa: E402
+    SqliteTaskJournal,
+    TaskJournalCursorError,
+)
 try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
         DevelopmentArtifactPageV2,
@@ -1212,6 +1216,13 @@ class DevelopmentStateStore:
             retention_limit=lambda: MAX_DEVELOPMENT_STATE_EVENTS,
             clock=utc_now,
         )
+        self.task_journal = SqliteTaskJournal(
+            path,
+            lock=self._lock,
+            connection_factory=self._connection,
+            max_log_text=MAX_DAEMON_V2_LOG_TEXT,
+            clock=utc_now,
+        )
         self.project_catalog = SqliteProjectCatalog(
             path,
             lock=self._lock,
@@ -1252,36 +1263,6 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_sessions_project_created
                     ON development_sessions(project_id, created_at, session_id);
-                CREATE TABLE IF NOT EXISTS development_task_logs_v2 (
-                    task_id TEXT NOT NULL REFERENCES development_sessions(session_id),
-                    sequence INTEGER NOT NULL CHECK (sequence > 0),
-                    occurred_at TEXT NOT NULL,
-                    stream TEXT NOT NULL CHECK (
-                        stream IN ('system', 'stdout', 'stderr', 'transcript')
-                    ),
-                    message TEXT NOT NULL,
-                    PRIMARY KEY(task_id, sequence)
-                );
-                CREATE TABLE IF NOT EXISTS development_task_timeline_v2 (
-                    task_id TEXT NOT NULL REFERENCES development_sessions(session_id),
-                    sequence INTEGER NOT NULL CHECK (sequence > 0),
-                    event_id TEXT NOT NULL UNIQUE,
-                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
-                    event_type TEXT NOT NULL CHECK (
-                        event_type IN ('task_admitted', 'attempt_appended', 'dataset_sealed')
-                    ),
-                    dataset_id TEXT,
-                    dataset_sha256 TEXT,
-                    occurred_at TEXT NOT NULL,
-                    PRIMARY KEY(task_id, sequence),
-                    CHECK (
-                        (event_type = 'dataset_sealed' AND dataset_id IS NOT NULL
-                         AND dataset_sha256 IS NOT NULL)
-                        OR
-                        (event_type != 'dataset_sealed' AND dataset_id IS NULL
-                         AND dataset_sha256 IS NULL)
-                    )
-                );
                 CREATE TABLE IF NOT EXISTS development_artifacts (
                     artifact_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
@@ -1411,6 +1392,7 @@ class DevelopmentStateStore:
                     ON development_dataset_artifacts(project_id, created_at, artifact_id);
                 """
             )
+            self.task_journal.initialize_schema(connection)
             session_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(development_sessions)")
@@ -1959,8 +1941,8 @@ class DevelopmentStateStore:
     def activate_project(self, project_id: str) -> None:
         self.project_catalog.activate(project_id)
 
-    @staticmethod
     def _append_task_log_v2(
+        self,
         connection: sqlite3.Connection,
         *,
         task_id: str,
@@ -1968,30 +1950,16 @@ class DevelopmentStateStore:
         message: object,
         occurred_at: str | None = None,
     ) -> None:
-        if not isinstance(message, str) or not message:
-            return
-        timestamp = occurred_at or utc_now()
-        for offset in range(0, len(message), MAX_DAEMON_V2_LOG_TEXT):
-            sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
-                "FROM development_task_logs_v2 WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()["next_sequence"]
-            connection.execute(
-                "INSERT INTO development_task_logs_v2("
-                "task_id, sequence, occurred_at, stream, message"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (
-                    task_id,
-                    sequence,
-                    timestamp,
-                    stream,
-                    message[offset : offset + MAX_DAEMON_V2_LOG_TEXT],
-                ),
-            )
+        self.task_journal.append_log(
+            connection,
+            task_id=task_id,
+            stream=stream,
+            message=message,
+            occurred_at=occurred_at,
+        )
 
-    @staticmethod
     def _append_task_timeline_v2(
+        self,
         connection: sqlite3.Connection,
         *,
         task_id: str,
@@ -2001,107 +1969,18 @@ class DevelopmentStateStore:
         dataset_id: str | None = None,
         dataset_sha256: str | None = None,
     ) -> None:
-        existing = connection.execute(
-            "SELECT 1 FROM development_task_timeline_v2 "
-            "WHERE task_id = ? AND event_type = ?",
-            (task_id, event_type),
-        ).fetchone()
-        if existing is not None:
-            return
-        sequence = connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence "
-            "FROM development_task_timeline_v2 WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()["next_sequence"]
-        connection.execute(
-            "INSERT INTO development_task_timeline_v2("
-            "task_id, sequence, event_id, project_id, event_type, dataset_id, "
-            "dataset_sha256, occurred_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                task_id,
-                sequence,
-                f"development-task-event-{secrets.token_hex(16)}",
-                project_id,
-                event_type,
-                dataset_id,
-                dataset_sha256,
-                occurred_at,
-            ),
+        self.task_journal.append_timeline(
+            connection,
+            task_id=task_id,
+            project_id=project_id,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            dataset_id=dataset_id,
+            dataset_sha256=dataset_sha256,
         )
 
-    @classmethod
-    def _backfill_task_journals(cls, connection: sqlite3.Connection) -> None:
-        for row in connection.execute(
-            "SELECT * FROM development_sessions ORDER BY created_at, session_id"
-        ).fetchall():
-            task_id = row["session_id"]
-            if connection.execute(
-                "SELECT 1 FROM development_task_timeline_v2 WHERE task_id = ? LIMIT 1",
-                (task_id,),
-            ).fetchone() is None:
-                cls._append_task_timeline_v2(
-                    connection,
-                    task_id=task_id,
-                    project_id=row["project_id"],
-                    event_type="task_admitted",
-                    occurred_at=row["created_at"],
-                )
-                cls._append_task_timeline_v2(
-                    connection,
-                    task_id=task_id,
-                    project_id=row["project_id"],
-                    event_type="attempt_appended",
-                    occurred_at=row["created_at"],
-                )
-                dataset = connection.execute(
-                    "SELECT artifact_id, uri, name, created_at "
-                    "FROM development_dataset_artifacts WHERE session_id = ?",
-                    (task_id,),
-                ).fetchone()
-                if dataset is not None:
-                    dataset_sha256 = hashlib.sha256(
-                        canonical_json({
-                            "artifact_id": dataset["artifact_id"],
-                            "name": dataset["name"],
-                            "uri": dataset["uri"],
-                        }).encode("utf-8")
-                    ).hexdigest()
-                    cls._append_task_timeline_v2(
-                        connection,
-                        task_id=task_id,
-                        project_id=row["project_id"],
-                        event_type="dataset_sealed",
-                        occurred_at=dataset["created_at"],
-                        dataset_id=dataset["artifact_id"],
-                        dataset_sha256=dataset_sha256,
-                    )
-            if connection.execute(
-                "SELECT 1 FROM development_task_logs_v2 WHERE task_id = ? LIMIT 1",
-                (task_id,),
-            ).fetchone() is None:
-                for message in json.loads(row["logs_json"]):
-                    cls._append_task_log_v2(
-                        connection,
-                        task_id=task_id,
-                        stream="system",
-                        message=message,
-                        occurred_at=row["updated_at"],
-                    )
-                cls._append_task_log_v2(
-                    connection,
-                    task_id=task_id,
-                    stream="transcript",
-                    message=row["response"],
-                    occurred_at=row["updated_at"],
-                )
-                cls._append_task_log_v2(
-                    connection,
-                    task_id=task_id,
-                    stream="system",
-                    message=row["error"],
-                    occurred_at=row["updated_at"],
-                )
+    def _backfill_task_journals(self, connection: sqlite3.Connection) -> None:
+        self.task_journal.backfill(connection)
 
     def start_session(self, session_id: str, request: dict[str, str]) -> None:
         now = utc_now()
@@ -2389,26 +2268,15 @@ class DevelopmentStateStore:
         after_sequence: int,
         limit: int,
     ) -> core_v2.LogPageV2:
-        with self._lock, self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM development_sessions WHERE session_id = ?", (task_id,)
-            ).fetchone() is None:
-                raise KeyError(task_id)
-            latest_sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) AS latest_sequence "
-                "FROM development_task_logs_v2 WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()["latest_sequence"]
-            if after_sequence > latest_sequence:
-                raise RequestError("log cursor is beyond the authoritative journal")
-            rows = connection.execute(
-                "SELECT sequence, occurred_at, stream, message "
-                "FROM development_task_logs_v2 "
-                "WHERE task_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
-                (task_id, after_sequence, limit + 1),
-            ).fetchall()
-        has_more = len(rows) > limit
-        page = [core_v2.LogEntryV2.model_validate(dict(row)) for row in rows[:limit]]
+        try:
+            rows, has_more = self.task_journal.read_logs(
+                task_id,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        except TaskJournalCursorError as exc:
+            raise RequestError(str(exc)) from exc
+        page = [core_v2.LogEntryV2.model_validate(row) for row in rows]
         return core_v2.LogPageV2(
             items=page,
             next_cursor=str(page[-1].sequence) if has_more and page else None,
@@ -2422,32 +2290,15 @@ class DevelopmentStateStore:
         after_sequence: int,
         limit: int,
     ) -> DevelopmentTaskTimelinePageV2:
-        with self._lock, self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM development_sessions WHERE session_id = ?", (task_id,)
-            ).fetchone() is None:
-                raise KeyError(task_id)
-            latest_sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) AS latest_sequence "
-                "FROM development_task_timeline_v2 WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()["latest_sequence"]
-            if after_sequence > latest_sequence:
-                raise RequestError("timeline cursor is beyond the authoritative journal")
-            rows = connection.execute(
-                "SELECT sequence, event_id, occurred_at, project_id, task_id, event_type, "
-                "dataset_id, dataset_sha256 FROM development_task_timeline_v2 "
-                "WHERE task_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
-                (task_id, after_sequence, limit + 1),
-            ).fetchall()
-        has_more = len(rows) > limit
-        items: list[dict[str, Any]] = []
-        for row in rows[:limit]:
-            item = dict(row)
-            if item["event_type"] != "dataset_sealed":
-                item.pop("dataset_id")
-                item.pop("dataset_sha256")
-            items.append({"schema_version": "2", **item})
+        try:
+            rows, has_more = self.task_journal.read_timeline(
+                task_id,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        except TaskJournalCursorError as exc:
+            raise RequestError(str(exc)) from exc
+        items = [{"schema_version": "2", **row} for row in rows]
         next_cursor = str(items[-1]["sequence"]) if has_more and items else None
         return DevelopmentTaskTimelinePageV2.model_validate({
             "schema_version": "2",

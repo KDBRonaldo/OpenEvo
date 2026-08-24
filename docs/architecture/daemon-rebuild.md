@@ -48,19 +48,19 @@ The planned order is:
 2. Web Layer startup/shutdown lifecycle;
 3. project catalog and SQLite persistence;
 4. recoverable state events;
-5. sessions and tasks;
-6. workspace files and artifacts;
-7. Codex runner and transcript capture;
-8. evolution orchestration;
-9. final single-process composition.
+5. task logs and typed timeline;
+6. session lifecycle;
+7. workspace files and artifacts;
+8. Codex runner and transcript capture;
+9. evolution orchestration;
+10. final single-process composition.
 
-The lifecycle shell, Web Layer lifespan migration, project catalog extraction,
-and recoverable state event extraction are complete.  The catalog continues to
-use `development_projects` and `development_metadata`; the event journal keeps
-`development_state_events`, commit-time append, bounded replay, and long-poll
-wakeups.  Both reuse the shared transaction connection and existing database
-location, so no remote data migration is required.  Session/task persistence
-is the next authority boundary.
+The lifecycle shell, Web Layer lifespan migration, project catalog, recoverable
+state events, and task journal extraction are complete.  Task logs and timeline
+still use `development_task_logs_v2` and `development_task_timeline_v2`, share
+the same state transaction, and backfill historical session rows at startup.
+No remote data migration is required.  The session lifecycle row and its
+running/completed/failed/cancelled transitions are the next authority boundary.
 
 The lifecycle layout is adapted from the MIT-licensed HKUDS/nanobot gateway.
 Nanobot source may be copied for lifecycle, authentication, atomic persistence,

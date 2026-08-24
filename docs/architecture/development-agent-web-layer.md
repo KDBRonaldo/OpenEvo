@@ -27,6 +27,11 @@ commit-time long-poll notification are owned by
 `src/openevo/daemon/event_journal.py`; browser payloads and reconnect behavior
 did not change during that extraction.
 
+Task log and timeline endpoints also retain their v2 payload and cursor
+contracts.  Their SQLite append, chunking, pagination, and restart backfill are
+owned by `src/openevo/daemon/task_journal.py`; session lifecycle transitions
+remain in the compatibility daemon for the next migration slice.
+
 Start from `desktop/`:
 
 ```bash

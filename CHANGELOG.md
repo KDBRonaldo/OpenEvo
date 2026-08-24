@@ -1,5 +1,8 @@
 # Changelog
 
+- Extracted durable task logs and typed task timeline persistence into
+  `openevo.daemon` while retaining existing SQLite tables, pagination cursors,
+  historical backfill, and Web Layer payloads.
 - Extracted the recoverable SQLite state event journal into `openevo.daemon`
   without changing event routes, payloads, sequence continuity, bounded replay,
   or commit-time long-poll wakeups.
