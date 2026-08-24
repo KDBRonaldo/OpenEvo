@@ -33,7 +33,7 @@ pre.json {
   font-size: 12px;
 }
 
-/* OpenEvo Desktop product renderer */
+/* OpenEvo self-hosted product renderer */
 .product-shell,
 .product-boot {
   --focus-ring: #7abca5;

@@ -11,11 +11,17 @@ from fastapi.staticfiles import StaticFiles
 
 
 class DesktopStaticAssetsMissingError(FileNotFoundError):
-    """Raised when packaged OpenEvo Desktop web assets are unavailable."""
+    """Raised when the built OpenEvo WebUI assets are unavailable."""
 
 
 def packaged_desktop_static_root() -> Path:
-    return Path(__file__).resolve().parents[1] / "packaging" / "web"
+    return (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "openevo"
+        / "web_gateway"
+        / "static"
+    )
 
 
 def resolve_desktop_static_root(static_root: Path | str | None = None) -> Path:
@@ -27,9 +33,8 @@ def resolve_desktop_static_root(static_root: Path | str | None = None) -> Path:
     index_path = root / "index.html"
     if not index_path.is_file():
         raise DesktopStaticAssetsMissingError(
-            "OpenEvo Desktop static assets were not found. Run `cd desktop && npm run "
-            "build:openevo` and copy `desktop/dist` into `desktop/packaging/web` "
-            "before packaging, or pass `--static-root`."
+            "OpenEvo WebUI static assets were not found. Run `cd desktop && npm run "
+            "build:webui-gateway`, or pass `--static-root`."
         )
     _validate_desktop_static_assets(root, index_path)
     return root
@@ -53,17 +58,15 @@ def _validate_desktop_static_assets(root: Path, index_path: Path) -> None:
     assets_path = root / "assets"
     if not assets_path.is_dir():
         raise DesktopStaticAssetsMissingError(
-            "OpenEvo Desktop static assets were not found: assets directory is "
-            "missing. Run `cd desktop && npm run build:openevo` and copy `desktop/dist` "
-            "into `desktop/packaging/web` before packaging, or pass "
-            "`--static-root`."
+            "OpenEvo WebUI static assets were not found: assets directory is "
+            "missing. Run `cd desktop && npm run build:webui-gateway` "
+            "or pass `--static-root`."
         )
     if not any(path.is_file() for path in assets_path.rglob("*")):
         raise DesktopStaticAssetsMissingError(
-            "OpenEvo Desktop static assets were not found: assets directory is "
-            "empty. Run `cd desktop && npm run build:openevo` and copy `desktop/dist` "
-            "into `desktop/packaging/web` before packaging, or pass "
-            "`--static-root`."
+            "OpenEvo WebUI static assets were not found: assets directory is "
+            "empty. Run `cd desktop && npm run build:webui-gateway` "
+            "or pass `--static-root`."
         )
 
     parser = _IndexAssetParser()
@@ -71,11 +74,9 @@ def _validate_desktop_static_assets(root: Path, index_path: Path) -> None:
     for asset in parser.assets:
         if not (root / asset).is_file():
             raise DesktopStaticAssetsMissingError(
-                "OpenEvo Desktop static assets were not found: referenced asset "
+                "OpenEvo WebUI static assets were not found: referenced asset "
                 f"`{asset.as_posix()}` is missing. Run `cd desktop && npm run "
-                "build:openevo` and copy `desktop/dist` into "
-                "`desktop/packaging/web` before packaging, or pass "
-                "`--static-root`."
+                "build:webui-gateway`, or pass `--static-root`."
             )
 
 
@@ -91,7 +92,7 @@ def _asset_reference(value: str) -> Path | None:
     normalized = posixpath.normpath(path)
     if normalized == "assets" or not normalized.startswith("assets/"):
         raise DesktopStaticAssetsMissingError(
-            f"OpenEvo Desktop static asset reference is invalid: `{value}`."
+            f"OpenEvo WebUI static asset reference is invalid: `{value}`."
         )
     return Path(*normalized.split("/"))
 

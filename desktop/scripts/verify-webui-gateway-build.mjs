@@ -29,8 +29,8 @@ for (const required of [
   "openevo-dev-agent/v1",
 ]) {
   if (!bundle.includes(required)) {
-    throw new Error(`The self-hosted WebUI is missing the preserved Desktop surface: ${required}`);
+    throw new Error(`The self-hosted WebUI is missing a required product surface: ${required}`);
   }
 }
 
-console.log(`Verified preserved Desktop WebUI entry: ${javascriptAssets[0]}`);
+console.log(`Verified OpenEvo WebUI entry: ${javascriptAssets[0]}`);

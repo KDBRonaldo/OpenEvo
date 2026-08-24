@@ -1822,6 +1822,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "fastapi" },
+    { name = "filelock" },
     { name = "httpx" },
     { name = "idna" },
     { name = "pydantic" },
@@ -1866,6 +1867,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.3.3" },
     { name = "datasets", marker = "extra == 'swebench'" },
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "filelock", specifier = ">=3.25.2" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "idna", specifier = ">=3.15" },
     { name = "peft", marker = "extra == 'parametric-memory'", specifier = ">=0.13,<1" },

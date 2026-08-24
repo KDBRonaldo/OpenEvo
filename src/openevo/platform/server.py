@@ -141,7 +141,7 @@ def _mount_static(app: FastAPI) -> None:
         placeholder = (
             "<!doctype html><title>OpenEvo platform</title>"
             "<main>OpenEvo platform service running. Frontend not built yet. "
-            "Build with <code>cd desktop && npm install && npm run build:openevo</code>. "
+            "Build with <code>cd desktop && npm install && npm run build</code>. "
             "API docs: <a href=\"/docs\">/docs</a>.</main>"
         )
 

@@ -1242,7 +1242,7 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_job_authority() -> No
         assert detail.json()["project_id"] == project_id
 
 
-def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:
+def test_self_hosted_layer_serves_the_preserved_webui_renderer() -> None:
     import scripts.dev.development_agent_web_layer as web
 
     fake = FakeDaemonClient()
@@ -1276,7 +1276,7 @@ def test_self_hosted_layer_serves_the_existing_desktop_renderer() -> None:
         asset_statuses = [client.get(path).status_code for path in asset_paths]
 
     assert page.status_code == 200
-    assert "<title>OpenEvo Desktop</title>" in page.text
+    assert "<title>OpenEvo</title>" in page.text
     assert asset_paths
     assert asset_statuses == [200] * len(asset_paths)
     assert bootstrap.status_code == 200

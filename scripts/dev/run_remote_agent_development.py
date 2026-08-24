@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the development agent bridge over SSH and start the Vite UI.
-
-This is deliberately a development-only convenience launcher.  The packaged
-Desktop uses its authenticated native sidecar and sealed release assets.
-"""
+"""Deploy the remote agent bridge over SSH and start the self-hosted WebUI."""
 
 from __future__ import annotations
 
@@ -460,7 +456,7 @@ if [ "$web_ready" -ne 1 ]; then
   tail -n 40 "$web_log_file" >&2 || true
   exit 30
 fi
-echo "Remote Desktop Web Layer is ready on loopback port $remote_web_port."
+echo "Remote OpenEvo Web Layer is ready on loopback port $remote_web_port."
 """
     return f"""\
 set -eu
@@ -723,13 +719,13 @@ def _wait_for_local_webui(local_port: int) -> None:
         try:
             with urllib.request.urlopen(url, timeout=1) as response:
                 body = response.read(4096).decode("utf-8", errors="replace")
-            if response.status == 200 and "OpenEvo Desktop" in body:
+            if response.status == 200 and "<title>OpenEvo</title>" in body:
                 return
             last_error = f"unexpected response status/body from {url}"
         except (OSError, urllib.error.URLError) as exc:
             last_error = str(exc)
         time.sleep(0.2)
-    raise LauncherError(f"local Desktop Web Layer health check failed: {last_error}")
+    raise LauncherError(f"local OpenEvo WebUI health check failed: {last_error}")
 
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
@@ -779,13 +775,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--web-layer",
         action="store_true",
-        help="run the development-only Desktop Local API v2 bridge in front of the daemon",
+        help="run the local WebUI API bridge in front of the daemon",
     )
     parser.add_argument(
         "--self-hosted-webui",
         action="store_true",
         help=(
-            "serve the unchanged Desktop renderer and v2 Web Layer beside the remote "
+            "serve the OpenEvo WebUI and v2 Web Layer beside the remote "
             "daemon, using one local SSH tunnel"
         ),
     )
@@ -879,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if local_only_changes:
         print(
-            "Using uncommitted local Desktop/Web Layer changes; the remote daemon will "
+            "Using uncommitted local WebUI/Web Layer changes; the remote daemon will "
             "remain pinned to the committed branch head."
         )
     expected_commit = _git_output("rev-parse", "HEAD")
@@ -932,22 +928,22 @@ def main(argv: list[str] | None = None) -> int:
                 f"http://127.0.0.1:{args.local_port}/openevo"
                 f"#browser-bootstrap={web_bootstrap_token}"
             )
-            print("Remote daemon, Web Layer, unchanged Desktop UI, and SSH tunnel are ready.")
-            print(f"OpenEvo Desktop URL: {browser_url}")
+            print("Remote daemon, Web Layer, WebUI, and SSH tunnel are ready.")
+            print(f"OpenEvo WebUI URL: {browser_url}")
             if args.browser_e2e:
                 npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
                 if not npm_binary:
                     raise LauncherError("npm was not found for the browser acceptance test")
                 environment = os.environ.copy()
                 environment["OPENEVO_E2E_BASE_URL"] = browser_url
-                command = [npm_binary, "run", "test:formal:webui:e2e"]
+                command = [npm_binary, "run", "test:webui:e2e"]
                 if os.name != "nt" and npm_binary.lower().endswith((".cmd", ".bat")):
                     command_interpreter = shutil.which("cmd.exe")
                     if not command_interpreter:
                         raise LauncherError("Windows npm was found from WSL, but cmd.exe was unavailable")
                     command = [
                         command_interpreter, "/d", "/c", "npm.cmd", "run",
-                        "test:formal:webui:e2e",
+                        "test:webui:e2e",
                     ]
                 print("Running the real browser acceptance path; the tunnel will close afterward.")
                 return subprocess.run(
@@ -1004,10 +1000,10 @@ def main(argv: list[str] | None = None) -> int:
             npm_script = "dev:agent:web"
             npm_arguments = []
             print(
-                "OpenEvo Desktop URL: "
+                "OpenEvo WebUI URL: "
                 f"http://127.0.0.1:5173/product-preview.html#browser-bootstrap={bootstrap_token}"
             )
-            print("Desktop Local API v2 bridge is ready; the browser will use only the web-layer session token.")
+            print("Local WebUI API bridge is ready; the browser will use only the web-layer session token.")
         print("Remote daemon and tunnel are ready. Starting the real product UI...")
         npm_command = [npm_binary, "run", npm_script, *npm_arguments]
         if os.name != "nt" and npm_binary.lower().endswith((".cmd", ".bat")):

@@ -1,48 +1,34 @@
-# OpenEvo Desktop User Guide
+# OpenEvo self-hosted WebUI
 
-OpenEvo Preview has two applications:
+This branch is a source-development preview. It does not provide the old DMG or
+packaged Desktop application.
 
-- **OpenEvo Desktop Client** runs on macOS.
-- **OpenEvo Daemon** runs as an internal service under the selected SSH account
-  on a remote Linux server. Ordinary users manage it through Desktop and do not
-  operate it directly.
+## Start
 
-Version `0.1.10` is the immutable Preview described by these guides. Its exact
-DMG and `SHA256SUMS` are available from the immutable
-[OpenEvo Desktop 0.1.10 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2).
-The Preview DMG is unsigned and not notarized. Open it only after checking the
-exact checksum in the quickstart. Use the current release unless a maintainer
-has asked you to reproduce an older version.
+Prepare SSH access to a Linux server, then run from WSL:
 
-## Start Here
+```bash
+cd /mnt/c/Users/18083/Desktop/OpenEvo/desktop
+npm run dev:agent:webui:remote -- \
+  --host <host> \
+  --user <user> \
+  --ssh-port <port>
+```
 
-1. [Check host prerequisites](remote-server-setup.md).
-2. [Install Desktop and run two Tasks](desktop-quickstart.md).
-3. [Configure a restricted network](proxy-and-network.md), if needed.
-4. [Resolve typed errors](troubleshooting.md).
+The command prints the loopback URL to open in your browser. Project and session
+state is authoritative on the remote host; the browser is only a client.
 
-## Preview Scope
+## Requirements
 
-This Preview packages:
+- local WSL with Git, Node/npm, Python, `uv`, and OpenSSH;
+- a reachable Linux SSH account;
+- GitHub access from the remote host for the configured OpenEvo repository and
+  branch;
+- Codex CLI installed and authenticated for that remote account.
 
-- one Apple Silicon macOS 12+ asset and matching Linux x86-64 Daemon Bundle;
-- two built-in, read-only science project tours, each showing three
-  Tasks and the three textual evolution targets without contacting a
-  server;
-- system OpenSSH aliases, including configured identity, agent/Keychain,
-  proxy-jump/command, prompt, and known-host policy;
-- a host whose remote Codex CLI is already installed and signed in for the
-  selected SSH user;
-- the intended Codex subscription transcript path and textual memory, skill
-  bundle, and agent-system targets.
+If the remote deploy reports `couldn't find remote ref`, push the current branch
+to the configured repository first. If the browser shows state from an older
+build, stop the launcher, restart it, and hard-refresh the browser.
 
-It does not support Self-Deployed execution, parameter or adapter evolution,
-other agent harnesses, a public CLI or PyPI installation, in-session evolution,
-or automatic Codex login. It supports only the documented exhibition host
-profile and should not be treated as a general Linux deployment or a
-production-critical research service.
-
-Desktop uploads and installs the version-matched OpenEvo Daemon and managed
-science runtime, starts the remote services, and maintains the private tunnel.
-You do not install an `openevo` Python package, upload a runtime image, or
-operate the remote Daemon manually.
+For development and diagnostics, see the repository `README.md` and
+`docs/maintainer/testing.md`.

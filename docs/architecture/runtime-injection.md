@@ -212,7 +212,7 @@ Core and Desktop.
 
 ### Science Consumers
 
-OpenEvo Desktop lets ordinary users inspect text memory, skill bundle, and
-agent-system artifacts plus method-owned evidence. A follow-up product run uses
+The OpenEvo WebUI lets users inspect text memory, skill bundle, and agent-system
+artifacts plus method-owned evidence. A follow-up product run uses
 the artifact membership committed in the pinned successor revision; Core performs
 the final ordered compatibility, payload, rendering, and runtime-readback checks.

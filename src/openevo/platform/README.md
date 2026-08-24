@@ -45,7 +45,7 @@ The source checkout serves a real UI only if `desktop/dist/` is built; without
 it the service serves a small HTML placeholder.
 
 ```bash
-cd desktop && npm install && npm run build:openevo  # writes desktop/dist/
+cd desktop && npm install && npm run build  # writes desktop/dist/
 ```
 
 Dev loop with hot reload (runs at <http://127.0.0.1:5173/>, proxies `/api/*` to

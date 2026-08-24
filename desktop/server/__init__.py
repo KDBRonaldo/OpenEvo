@@ -1,4 +1,4 @@
-"""OpenEvo Desktop packaged app helpers."""
+"""OpenEvo WebUI static-host helpers."""
 
 from __future__ import annotations
 

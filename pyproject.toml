@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "openevo"
 version = "0.1.10"
-description = "OpenEvo Desktop and agent evolution orchestration."
+description = "OpenEvo self-hosted WebUI and agent evolution runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -14,6 +14,7 @@ authors = [
 
 dependencies = [
     "fastapi>=0.115.0",
+    "filelock>=3.25.2",
     "click>=8.3.3",
     "idna>=3.15",
     "starlette>=1.3.1",
@@ -23,6 +24,9 @@ dependencies = [
     "pydantic>=2.9.0",
     "pyyaml>=6.0",
 ]
+
+[project.scripts]
+openevo-daemon = "openevo.daemon.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/CompLifeLab-ZJU/OpenEvo"
@@ -42,10 +46,6 @@ parametric-memory = [
     "torch>=2.4,<3",
     "transformers>=4.45,<5",
 ]
-
-[project.scripts]
-openevo-backend = "openevo.backend.launcher:main"
-openevo-core-service = "openevo.backend.service:main"
 
 [dependency-groups]
 dev = [
@@ -73,8 +73,6 @@ include = ["openevo*", "slime_bridge*"]
 
 [tool.setuptools.package-data]
 openevo = [
-    "backend/contracts/v1/*.json",
-    "backend/contracts/v2/*.json",
     "web_gateway/static/*.html",
     "web_gateway/static/assets/*",
     "wheels/*.whl",

@@ -117,6 +117,7 @@ tmp/
 **/buffer_stats/
 
 # Local third-party source checkouts
+nanobot/
 slime/
 Megatron-LM/
 glm/

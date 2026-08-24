@@ -67,14 +67,11 @@ def test_core_and_desktop_do_not_import_benchmark_package() -> None:
 
 def test_core_package_configuration_cannot_discover_benchmarks() -> None:
     pyproject = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    sidecar_builder = (
-        REPOSITORY_ROOT / "desktop" / "packaging" / "build_sidecar.py"
-    ).read_text(encoding="utf-8")
 
     assert 'where = ["src"]' in pyproject
     assert 'include = ["openevo*", "slime_bridge*"]' in pyproject
-    assert 'repo / "src"' in sidecar_builder
-    assert 'repo / "benchmarks"' not in sidecar_builder
+    package_data = pyproject.split("[tool.setuptools.package-data]", 1)[1]
+    assert "benchmarks" not in package_data
 
 
 def test_package_smoke_rejects_exact_removed_core_modules(tmp_path: Path) -> None:

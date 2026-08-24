@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Development-only loopback daemon for real Codex turns and document evolution.
+"""Loopback remote daemon for real Codex turns and document evolution.
 
-This is intentionally not the release OpenEvo Daemon and must never be exposed directly to a
-network. It reuses the real document-reflector implementations without claiming the sealed
-release orchestration contract. Bind it to loopback and reach it only through an SSH tunnel.
+It must never be exposed directly to a network. Bind it to loopback and reach it only through
+an SSH tunnel.
 """
 
 from __future__ import annotations
@@ -1196,7 +1195,7 @@ class ProjectWorkspaceStore:
 
 
 class DevelopmentStateStore:
-    """Small SQLite authority for the development-only Project/Session loop."""
+    """Small SQLite authority for the self-hosted Project/Session loop."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -6722,7 +6721,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the development-only OpenEvo Codex bridge")
+    parser = argparse.ArgumentParser(description="Run the OpenEvo loopback Codex bridge")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--codex-binary", default="codex")

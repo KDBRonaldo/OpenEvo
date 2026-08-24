@@ -1,1 +1,1 @@
-"""OpenEvo Desktop control-plane package."""
+"""OpenEvo self-hosted WebUI package."""

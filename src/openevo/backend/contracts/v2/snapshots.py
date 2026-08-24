@@ -1,19 +1,13 @@
-"""Deterministic v2 contract serialization and schema builders."""
+"""Deterministic serialization for shared WebUI wire models."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
-from .app import create_core_control_v2_contract_app
-from .models import ContractModel, SseFrameV2
+from .models import ContractModel
 
-
-CONTRACT_DIRECTORY = Path(__file__).resolve().parent
-OPENAPI_SNAPSHOT_PATH = CONTRACT_DIRECTORY / "openapi.json"
-EVENTS_SCHEMA_SNAPSHOT_PATH = CONTRACT_DIRECTORY / "events.schema.json"
 MAX_CONTRACT_JSON_BYTES = 1024 * 1024
 MAX_CONTRACT_JSON_DEPTH = 16
 MAX_CONTRACT_JSON_NODES = 8192
@@ -112,56 +106,11 @@ def parse_contract_json_bytes(
     return model.model_validate(decoded)
 
 
-def build_openapi_document() -> dict[str, Any]:
-    """Build the Core Control API v2 OpenAPI document from model source."""
-
-    return create_core_control_v2_contract_app().openapi()
-
-
-def build_events_schema_document() -> dict[str, Any]:
-    """Build the standalone closed schema for the v2 SSE wire frame."""
-
-    schema = SseFrameV2.model_json_schema(
-        mode="validation",
-        ref_template="#/$defs/{model}",
-    )
-    return {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://openevo.ai/contracts/core-control/v2/events.schema.json",
-        "x-openevo-contract-only": True,
-        **schema,
-    }
-
-
-def openapi_sha256() -> str:
-    return deterministic_sha256(build_openapi_document())
-
-
-def events_schema_sha256() -> str:
-    return deterministic_sha256(build_events_schema_document())
-
-
-def write_contract_snapshots() -> None:
-    """Mechanically regenerate both checked-in v2 schema snapshots."""
-
-    OPENAPI_SNAPSHOT_PATH.write_bytes(canonical_json_bytes(build_openapi_document()))
-    EVENTS_SCHEMA_SNAPSHOT_PATH.write_bytes(
-        canonical_json_bytes(build_events_schema_document())
-    )
-
-
 __all__ = [
-    "EVENTS_SCHEMA_SNAPSHOT_PATH",
     "MAX_CONTRACT_JSON_BYTES",
-    "OPENAPI_SNAPSHOT_PATH",
-    "build_events_schema_document",
-    "build_openapi_document",
     "canonical_contract_bytes",
     "canonical_contract_sha256",
     "canonical_json_bytes",
     "deterministic_sha256",
-    "events_schema_sha256",
-    "openapi_sha256",
     "parse_contract_json_bytes",
-    "write_contract_snapshots",
 ]

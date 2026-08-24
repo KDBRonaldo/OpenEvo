@@ -1,3 +1,3 @@
-from openevo.backend.api import create_backend_app
+"""Runtime helpers shared by the self-hosted OpenEvo agent process."""
 
-__all__ = ["create_backend_app"]
+__all__: list[str] = []

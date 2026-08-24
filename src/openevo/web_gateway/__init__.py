@@ -1,1 +1,1 @@
-"""Packaged copy of the unchanged Desktop renderer for the remote Web Layer."""
+"""Built self-hosted WebUI assets served through the OpenEvo Web Layer."""

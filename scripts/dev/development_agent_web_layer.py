@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Development-only Desktop Local API v2 adapter for ``live_agent_daemon.py``.
+"""Local WebUI API adapter for ``live_agent_daemon.py``.
 
 This module is intentionally kept under ``scripts/dev``.  It projects the small,
-working development daemon into renderer-safe Desktop v2 models; it is not a
-release Daemon implementation and is never packaged.
+working remote daemon into renderer-safe v2 models.
 """
+
+# ruff: noqa: E402 -- the source launcher adds the repository root before local imports.
 
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
@@ -27,7 +29,7 @@ from urllib.parse import quote
 
 
 # This development entry point is launched from ``desktop/``.  Keep repository-local
-# packages importable without requiring Desktop itself to become an installable product.
+# packages importable without making the WebUI an installable Python package.
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -1063,15 +1065,19 @@ def create_development_agent_web_app(*, daemon_endpoint: str, daemon_token: str,
         provider=provider,
         broker=event_broker,
     )
-    app = create_desktop_local_v2_contract_app(provider)
 
-    @app.on_event("startup")
-    async def start_development_event_relay() -> None:
+    @asynccontextmanager
+    async def web_layer_lifespan(_: FastAPI):
         event_relay.start()
+        try:
+            yield
+        finally:
+            event_relay.stop()
 
-    @app.on_event("shutdown")
-    async def stop_development_event_relay() -> None:
-        event_relay.stop()
+    app = create_desktop_local_v2_contract_app(
+        provider,
+        _app_factory=lambda **kwargs: FastAPI(**kwargs, lifespan=web_layer_lifespan),
+    )
 
     @app.get(
         "/desktop/v2/development/presentation-state",
