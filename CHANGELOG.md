@@ -1,5 +1,9 @@
 # Changelog
 
+- Extracted normalized Codex harness execution and the full admitted Session
+  workspace/context/result transaction into `openevo.daemon`, preserving live
+  cancellation, failure semantics, file mutation capture, and optional
+  Evolution evidence sealing behind the existing API.
 - Extracted managed project workspaces and durable dataset/evolution artifact
   ownership into `openevo.daemon`, retaining safe file bounds, document
   projections, digest pagination, promoted-context selection, existing SQLite

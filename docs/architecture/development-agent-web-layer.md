@@ -39,9 +39,12 @@ bounded document projections, digest-complete inventories, uploads, downloads,
 and safe mutations are owned by `src/openevo/daemon/workspace_store.py`.
 Dataset/evolution artifact persistence, promoted-context selection, canonical
 records, and stable cursor pagination are owned by
-`src/openevo/daemon/artifact_store.py`. The compatibility daemon now composes
-those owners with the harness runner and evolution orchestration; its HTTP
-models and existing SQLite rows remain unchanged.
+`src/openevo/daemon/artifact_store.py`. Normalized Codex harness invocation and
+the admitted Session transaction across context loading, workspace mutation,
+terminal persistence, cancellation, failure, and optional evidence sealing are
+owned by `src/openevo/daemon/agent_runner.py`. The compatibility daemon now
+supplies its development runtime-context materializer and Evolution sealer to
+that runner while retaining unchanged HTTP models and SQLite rows.
 
 The renderer enters the Session conversation as soon as the user starts a
 task. It shows the submitted instruction during validation/admission, then

@@ -68,10 +68,14 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
 - `src/openevo/daemon/artifact_store.py` owns dataset/evolution artifact rows,
   promoted context selection, canonical records, and cursor pagination behind
   the unchanged v2 API.
+- `src/openevo/daemon/agent_runner.py` owns normalized Codex harness invocation
+  and the admitted Session transaction across context loading, workspace
+  mutation, result persistence, cancellation, failure, and optional evidence
+  sealing.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns evolution orchestration, harness/workspace execution adaptation,
-  HTTP model projection, and process composition until each remaining owner is
-  extracted behind the same API.
+  root and owns development runtime-context materialization, evolution
+  orchestration, HTTP model projection, and process composition until each
+  remaining owner is extracted behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.

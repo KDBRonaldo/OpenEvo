@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from pydantic import ValidationError
 
@@ -36,12 +36,14 @@ if os.fspath(SOURCE_ROOT) not in sys.path:
 
 from openevo.backend.evolution_runtime import codex_development_runtime_adapter  # noqa: E402
 from openevo.backend.harness_adapter import (  # noqa: E402
-    CodexHarnessAdapter,
     HarnessCancellation,
     HarnessRunCancelled,
-    HarnessRunError,
 )
 from openevo.backend.contracts.v2 import models as core_v2  # noqa: E402
+from openevo.daemon.agent_runner import (  # noqa: E402
+    AgentSessionExecutor,
+    CodexAgentRunner,
+)
 from openevo.daemon.artifact_store import SqliteArtifactStore  # noqa: E402
 from openevo.daemon.event_journal import (  # noqa: E402
     EventCursorExpiredError,
@@ -2742,9 +2744,11 @@ class DevelopmentRuntimeContextMaterializer:
         }
 
 
-class CodexRunner:
+class CodexRunner(CodexAgentRunner):
+    """Compatibility constructor for the extracted daemon Codex runner."""
+
     def __init__(self, codex_binary: str, timeout_seconds: int, model: str | None) -> None:
-        self._adapter = CodexHarnessAdapter(
+        super().__init__(
             codex_binary=codex_binary,
             timeout_seconds=timeout_seconds,
             model=model,
@@ -2755,37 +2759,6 @@ class CodexRunner:
             max_response_bytes=MAX_REQUEST_BYTES,
             max_workspace_context_bytes=MAX_AGENT_WORKSPACE_CONTEXT_BYTES,
         )
-
-    @property
-    def codex_binary(self) -> str:
-        return self._adapter.codex_binary
-
-    @property
-    def model(self) -> str | None:
-        return self._adapter.model
-
-    def runtime_capabilities(self) -> dict[str, Any]:
-        return self._adapter.runtime_capabilities()
-
-    def check_ready(self) -> None:
-        try:
-            self._adapter.check_ready()
-        except HarnessRunError as exc:
-            raise AgentRunError(str(exc)) from exc
-
-    def run(
-        self,
-        request: dict[str, Any],
-        *,
-        cancellation: HarnessCancellation | None = None,
-        log: Callable[[str], None] | None = None,
-    ) -> dict[str, Any]:
-        try:
-            return self._adapter.run(request, cancellation=cancellation, log=log)
-        except HarnessRunCancelled:
-            raise
-        except HarnessRunError as exc:
-            raise AgentRunError(str(exc)) from exc
 
 class DocumentEvolutionRunner:
     """Development adapter driven by Core framework descriptors instead of target switches."""
@@ -3392,13 +3365,21 @@ class DevelopmentSessionCoordinator:
         store: DevelopmentStateStore,
         evolution_runner: DocumentEvolutionRunner | None,
     ) -> None:
-        self._runner = runner
         self._store = store
         self._evolution_runner = evolution_runner
         self._turn_lock = threading.Lock()
+        self._agent_executor = AgentSessionExecutor(
+            store=store,
+            runner=runner,
+            evidence_sealer=(
+                self._seal_session_evidence
+                if evolution_runner is not None
+                else None
+            ),
+        )
         self._session_runtime = SessionExecutionManager(
             store=store,
-            executor=self._execute,
+            executor=self._agent_executor.execute,
             cancellation_factory=HarnessCancellation,
             execution_failed=self._record_unhandled_execution_failure,
             operation_lock=self._turn_lock,
@@ -3433,6 +3414,21 @@ class DevelopmentSessionCoordinator:
             # Startup recovery remains the final authority when persistence is
             # unavailable while a worker is already failing.
             pass
+
+    def _seal_session_evidence(
+        self,
+        session_id: str,
+        request: dict[str, str],
+        result: dict[str, Any],
+    ) -> None:
+        if self._evolution_runner is None:
+            return
+        self._evolution_runner.capture_session_dataset(
+            session_id=session_id,
+            request=request,
+            result=result,
+            store=self._store,
+        )
 
     def retry_evolution(self, job_id: str, *, action_id: str | None = None) -> dict[str, Any]:
         if self._evolution_runner is None:
@@ -3641,92 +3637,6 @@ class DevelopmentSessionCoordinator:
                 pass
         finally:
             self._turn_lock.release()
-
-    def _execute(
-        self,
-        session_id: str,
-        request: dict[str, str],
-        cancellation: HarnessCancellation,
-    ) -> None:
-        workspace_before: dict[str, Any] = {
-            "project_id": request["project_id"],
-            "entries": [],
-            "truncated": False,
-        }
-        try:
-            workspace_path = self._store.workspace_path(request["project_id"])
-            workspace_before = self._store.workspace_snapshot(request["project_id"])
-            execution_request = {
-                **request,
-                "workspace_path": workspace_path,
-                "workspace_snapshot": workspace_before,
-                "evolved_contexts": self._store.latest_context_artifacts(
-                    request["project_id"]
-                ),
-            }
-            result = self._runner.run(
-                execution_request,
-                cancellation=cancellation,
-                log=lambda message: self._store.append_session_log(session_id, message),
-            )
-            cancellation.raise_if_requested()
-            mutations = result.pop(
-                "file_mutations",
-                {"file_writes": [], "delete_paths": []},
-            )
-            self._store.apply_workspace_mutations(request["project_id"], mutations)
-            workspace_after = self._store.workspace_snapshot(request["project_id"])
-            result = {
-                **result,
-                "session_id": session_id,
-                "workspace_changes": ProjectWorkspaceStore.changes(
-                    workspace_before, workspace_after
-                ),
-                "workspace": workspace_after,
-            }
-            cancellation.raise_if_requested()
-            self._store.complete_session(session_id, result)
-            if self._evolution_runner is not None:
-                try:
-                    self._evolution_runner.capture_session_dataset(
-                        session_id=session_id,
-                        request=request,
-                        result=result,
-                        store=self._store,
-                    )
-                    self._store.append_session_log(
-                        session_id,
-                        "Session transcript sealed as reusable Evolution evidence.",
-                    )
-                except Exception as exc:
-                    self._store.append_session_log(
-                        session_id,
-                        f"Session completed, but Evolution evidence sealing failed: {exc}",
-                    )
-        except HarnessRunCancelled:
-            workspace_after = self._store.workspace_snapshot(request["project_id"])
-            self._store.cancel_session(
-                session_id,
-                ProjectWorkspaceStore.changes(workspace_before, workspace_after),
-            )
-        except (AgentRunError, HarnessRunError) as exc:
-            workspace_after = self._store.workspace_snapshot(request["project_id"])
-            self._store.fail_session(
-                session_id,
-                str(exc),
-                ProjectWorkspaceStore.changes(workspace_before, workspace_after),
-            )
-        except Exception as exc:
-            try:
-                workspace_after = self._store.workspace_snapshot(request["project_id"])
-                self._store.fail_session(
-                    session_id,
-                    f"unexpected development session failure: {exc}",
-                    ProjectWorkspaceStore.changes(workspace_before, workspace_after),
-                )
-            except Exception:
-                pass
-
 
 class DevelopmentAgentServer(ThreadingHTTPServer):
     daemon_threads = True
