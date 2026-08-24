@@ -462,8 +462,11 @@ export function DesktopProductApp({
       currentProject = validatedProject;
       setStartingSession({ projectId: currentProject.project_id, task, phase: "admitting" });
       const submittedTask = await provider.submitTask(currentProject.project_id, intentFor(currentSnapshot, "submit-task"));
+      const submittedSnapshot = await refresh();
+      if (submittedSnapshot === null || !submittedSnapshot.tasks.some((candidate) => candidate.task_id === submittedTask.task_id)) {
+        throw new Error("The admitted Session was not visible in the refreshed remote state.");
+      }
       setSelectedTaskId(submittedTask.task_id);
-      await refresh();
       setActionStatus(developmentAgentBridge
         ? "The remote Session started. Its transcript will become reusable evidence in Evolution."
         : "Task admitted with immutable Project Head and execution authority.");
@@ -641,7 +644,8 @@ export function DesktopProductApp({
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
               startingSession={startingSession?.projectId === displayedProject.project_id ? startingSession : null}
-              busy={busy || developmentEvolutionActive}
+              busy={busy}
+              sessionStartBlocked={developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
@@ -1500,6 +1504,7 @@ function ResearchWorkspaceV2({
   selectedTaskId,
   startingSession,
   busy,
+  sessionStartBlocked,
   sessionEvolutionAvailable,
   onSelectTask,
   onOpenSettings,
@@ -1523,6 +1528,7 @@ function ResearchWorkspaceV2({
   readonly selectedTaskId: string | null;
   readonly startingSession: StartingSessionV2 | null;
   readonly busy: boolean;
+  readonly sessionStartBlocked: boolean;
   readonly sessionEvolutionAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
   readonly onOpenSettings: () => void;
@@ -1542,9 +1548,11 @@ function ResearchWorkspaceV2({
   const selectedTask = projectTasks.find((task) => task.task_id === selectedTaskId) ?? null;
   const observedTask = selectedTask ?? projectTasks[0] ?? null;
   const activeTask = projectTasks.find((task) => ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)) ?? null;
+  const [optimisticStartingSession, setOptimisticStartingSession] = useState<StartingSessionV2 | null>(null);
+  const visibleStartingSession = startingSession ?? optimisticStartingSession;
   const autoOpenedActiveTaskId = useRef<string | null>(null);
   useEffect(() => {
-    if (startingSession !== null) return;
+    if (visibleStartingSession !== null) return;
     if (selectedTaskId !== null && !projectTasks.some((task) => task.task_id === selectedTaskId)) onSelectTask(null);
     if (activeTask !== null && selectedTaskId === activeTask.task_id) {
       autoOpenedActiveTaskId.current = activeTask.task_id;
@@ -1552,7 +1560,7 @@ function ResearchWorkspaceV2({
       autoOpenedActiveTaskId.current = activeTask.task_id;
       onSelectTask(activeTask.task_id);
     }
-  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, startingSession, tasks]);
+  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, tasks, visibleStartingSession]);
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
   const [taskTitle, setTaskTitle] = useState(project.config.task.title);
   const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
@@ -1596,8 +1604,17 @@ function ResearchWorkspaceV2({
     objective: taskObjective.trim(),
   };
   const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
-  if (startingSession !== null) {
-    return <StartingSessionChatV2 project={project} session={startingSession} />;
+  const startDraftSession = async (): Promise<void> => {
+    const optimistic = { projectId: project.project_id, task: normalizedTask, phase: "validating" as const };
+    setOptimisticStartingSession(optimistic);
+    try {
+      await onRun(normalizedTask, selectedEvolutionTargets);
+    } finally {
+      setOptimisticStartingSession(null);
+    }
+  };
+  if (visibleStartingSession !== null) {
+    return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
   }
   if (selectedTask) {
     const transition = selectedTask.successor_transition
@@ -1625,7 +1642,7 @@ function ResearchWorkspaceV2({
           timeline={timelines[selectedTask.task_id] ?? []}
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
-          canContinue={ready && activeTask === null}
+          canContinue={ready && activeTask === null && !sessionStartBlocked}
           onContinue={(task) => onRun(task, selectedEvolutionTargets)}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
@@ -1641,7 +1658,7 @@ function ResearchWorkspaceV2({
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
         <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task at a time against the current Project Head.</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => void onRun(normalizedTask, selectedEvolutionTargets)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" disabled={busy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || sessionStartBlocked || !ready || !taskValid} onClick={() => void startDraftSession()}><Play size={15} fill="currentColor" /> {sessionStartBlocked ? "Evolution running" : "Start session"}</button></div>
       </div>
       {!ready ? (
         <div className="disabled-reason">
@@ -1663,11 +1680,11 @@ function ResearchWorkspaceV2({
       <section className="product-panel task-panel">
         <div className="panel-heading"><div><span className="panel-kicker">Task draft</span><h2>What should the agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state.replaceAll("_", " ")}</span></div>
         <div className="next-task-fields">
-          <label>Task title<input maxLength={256} value={taskTitle} disabled={busy} onChange={(event) => setTaskTitle(event.target.value)} /></label>
-          <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={busy} onChange={(event) => setTaskObjective(event.target.value)} /></label>
+          <label>Task title<input maxLength={256} value={taskTitle} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
+          <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
           <p className="form-help">Starting the session saves these instructions and runs them as the next task.</p>
         </div>
-        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy}>
+        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy || sessionStartBlocked}>
           <legend>Evolution after this session <span>Optional · formal contract</span></legend>
           <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
           <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>

@@ -1358,6 +1358,37 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Enumerate claims");
   });
 
+  it("does not present background Evolution as a Session submission spinner", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        evolutionRuns: [{
+          runId: "evolution-run-active",
+          projectId: "project-1",
+          sourceTaskIds: ["task-1"],
+          selections: [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
+          state: "running",
+          artifactIds: [],
+          jobIds: [],
+          error: null,
+          createdAt: NOW,
+          updatedAt: NOW,
+        }],
+      },
+    };
+    const provider = {
+      ...providerFixture(snapshot),
+      featureFlags: ["system_openssh_profiles", "development_agent_bridge"],
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    const blocked = button("Evolution running");
+    expect(blocked.disabled).toBe(true);
+    expect(blocked.querySelector(".spin")).toBeNull();
+  });
+
   it("coalesces an SSE refresh with the Start session authority preflight", async () => {
     const snapshot = authoritySnapshot();
     const provider = providerFixture(snapshot);
