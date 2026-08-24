@@ -123,6 +123,7 @@ def test_remote_lifecycle_scripts_are_bounded_and_shell_valid(action: str) -> No
     if action != "logs":
         assert "openevo.daemon.product_app" in script
         assert "scripts/dev/live_agent_daemon.py" in script
+        assert "openevo.web_gateway.product_app" in script
         assert "scripts/dev/development_agent_web_layer.py" in script
     if action == "logs":
         assert "tail -n 37" in script
@@ -391,7 +392,8 @@ def test_remote_script_can_start_the_unchanged_desktop_ui_beside_daemon() -> Non
         browser_endpoint="http://127.0.0.1:8765",
     )
 
-    assert "scripts/dev/development_agent_web_layer.py" in script
+    assert "-m openevo.web_gateway.product_app" in script
+    assert "*scripts/dev/development_agent_web_layer.py*" in script
     assert '--static-root "$source_root/src/openevo/web_gateway/static"' in script
     assert '"OPENEVO_DEV_WEB_SESSION_TOKEN=$web_session_token"' in script
     assert '"OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN=$web_bootstrap_token"' in script

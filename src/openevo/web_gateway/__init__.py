@@ -1,1 +1,1 @@
-"""Built self-hosted WebUI assets served through the OpenEvo Web Layer."""
+"""Formal remote OpenEvo Web Layer and its version-matched WebUI assets."""

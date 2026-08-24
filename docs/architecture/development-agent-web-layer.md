@@ -7,7 +7,7 @@ one local SSH forward.
 ```text
 React renderer
   -> X-OpenEvo-Desktop-Session authenticated /desktop/v2/*
-  -> scripts/dev/development_agent_web_layer.py
+  -> openevo.web_gateway.product_app
   -> bearer-authenticated daemon /v2/*
   -> openevo.daemon.product_app
 ```
@@ -15,6 +15,11 @@ React renderer
 The browser bootstrap token is single-use.  It is exchanged for a browser
 session token; the daemon bearer token remains only in launcher/Web Layer
 process memory.
+
+The formal implementation lives in
+`src/openevo/web_gateway/product_app.py`. The former
+`scripts/dev/development_agent_web_layer.py` path remains only as a thin
+compatibility launcher for older commands and imports.
 
 The project catalog contains all persisted projects.  Task, workspace,
 artifact, capability, and evolution reads remain scoped to the active project.

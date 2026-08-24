@@ -37,7 +37,7 @@ BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 LOCAL_WEB_LAYER_PATH_PREFIXES = (
     "desktop/",
     "docs/",
-    "src/openevo/web_gateway/static/",
+    "src/openevo/web_gateway/",
     "tests/",
 )
 LOCAL_WEB_LAYER_PATHS = frozenset(
@@ -443,7 +443,7 @@ process_status() {{
 printf 'OpenEvo remote development stack\\n'
 printf 'state: %s\\n' "$state_root"
 process_status "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "$daemon_log_file" "scripts/dev/live_agent_daemon.py"
-process_status "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py" "$web_log_file"
+process_status "web-layer" "$web_pid_file" "openevo.web_gateway.product_app" "$web_log_file" "scripts/dev/development_agent_web_layer.py"
 if [ -d "$state_root/source/.git" ]; then
   source_commit="$(git -C "$state_root/source" rev-parse --short=12 HEAD 2>/dev/null || true)"
   if [ -n "$source_commit" ]; then printf 'source commit: %s\\n' "$source_commit"; fi
@@ -508,7 +508,7 @@ stop_managed_process() {
 }
 
 # Stop the HTTP/WebUI edge before its daemon authority.
-stop_managed_process "web-layer" "$web_pid_file" "scripts/dev/development_agent_web_layer.py"
+stop_managed_process "web-layer" "$web_pid_file" "openevo.web_gateway.product_app" "scripts/dev/development_agent_web_layer.py"
 stop_managed_process "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "scripts/dev/live_agent_daemon.py"
 """
 
@@ -562,7 +562,7 @@ if [ -f "$web_pid_file" ]; then
   if [ -n "$old_web_pid" ] && kill -0 "$old_web_pid" 2>/dev/null; then
     old_web_command="$(tr '\\000' ' ' < "/proc/$old_web_pid/cmdline" 2>/dev/null || true)"
     case "$old_web_command" in
-      *scripts/dev/development_agent_web_layer.py*)
+      *openevo.web_gateway.product_app*|*scripts/dev/development_agent_web_layer.py*)
         kill "$old_web_pid"
         web_wait_count=0
         while kill -0 "$old_web_pid" 2>/dev/null && [ "$web_wait_count" -lt 20 ]; do
@@ -580,7 +580,7 @@ nohup env \\
   "OPENEVO_DEV_WEB_SESSION_TOKEN=$web_session_token" \\
   "OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN=$web_bootstrap_token" \\
   "$uv_bin" run --frozen --no-sync --python 3.11 python \\
-  scripts/dev/development_agent_web_layer.py \\
+  -m openevo.web_gateway.product_app \\
   --daemon-endpoint "http://127.0.0.1:$remote_port" \\
   --browser-endpoint "$browser_endpoint" \\
   --source-commit "$expected_commit" \\
@@ -1318,12 +1318,12 @@ def main(argv: list[str] | None = None) -> int:
         npm_arguments: list[str] = []
         if args.web_layer:
             import uvicorn
-            from development_agent_web_layer import create_development_agent_web_app
+            from openevo.web_gateway.product_app import create_web_gateway_app
 
             session_token = secrets.token_hex(32)
             bootstrap_token = secrets.token_hex(32)
             browser_endpoint = f"http://127.0.0.1:{DEVELOPMENT_BROWSER_PORT}"
-            app = create_development_agent_web_app(
+            app = create_web_gateway_app(
                 daemon_endpoint=f"http://127.0.0.1:{args.local_port}",
                 daemon_token=token,
                 session_token=session_token,

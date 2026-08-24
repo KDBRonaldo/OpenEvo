@@ -11,7 +11,7 @@ The only supported product path is:
 ```text
 browser
   -> local SSH tunnel owned by scripts/dev/run_remote_agent_development.py
-  -> remote scripts/dev/development_agent_web_layer.py
+  -> remote src/openevo/web_gateway/product_app.py
   -> remote src/openevo/daemon/product_app.py
   -> Codex harness + OpenEvo evolution runtime
 ```
@@ -84,8 +84,13 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   `scripts/dev/development_agent_v2_contract.py` are thin import/launch
   compatibility adapters only; product authority must not move back into them.
 - `src/openevo/daemon` owns the complete remote daemon implementation. The
-  remaining Web Layer script is the next composition boundary available for
-  extraction, but its browser contract must remain unchanged.
+  daemon browser contract must remain unchanged.
+- `src/openevo/web_gateway/product_app.py` is the formal remote Web Layer
+  composition root. It owns browser bootstrap/session authentication, Desktop
+  v2 projection, daemon event relay, static bundle hosting, and HTTP process
+  startup.
+- `scripts/dev/development_agent_web_layer.py` is a thin import/launch
+  compatibility adapter only; Web Layer authority must not move back into it.
 - `src/openevo/backend/evolution_runtime.py` and
   `src/openevo/backend/harness_adapter.py` are shared runtime helpers, not a
   second daemon product.

@@ -1,5 +1,10 @@
 # Changelog
 
+- Moved browser authentication, Desktop v2 projection, daemon event relay,
+  static WebUI hosting, and Web Layer process startup into
+  `openevo.web_gateway.product_app`; the remote launcher now starts the formal
+  module while the former development Web Layer remains a thin compatibility
+  adapter.
 - Moved the accepted daemon HTTP models, runtime-context projection, dependency
   initialization, and final Project/Session/Workspace/Artifact/Agent/Evolution
   process composition into `openevo.daemon.product_app`; the remote launcher

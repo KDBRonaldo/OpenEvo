@@ -8,7 +8,7 @@ restore the removed release sidecar or managed deployment stack.
 ```text
 browser
   -> unchanged local SSH tunnel
-  -> development_agent_web_layer.py compatibility composition
+  -> openevo.web_gateway.product_app formal composition
   -> openevo.daemon.product_app formal composition
   -> extracted daemon capabilities
 ```
@@ -54,10 +54,10 @@ The planned order is:
 9. evolution orchestration;
 10. final single-process composition.
 
-All ten daemon migration slices are locally complete. Real SSH-hosted browser
-acceptance remains the cutover gate before the compatibility launcher can be
-removed. The remote Web Layer remains a separate process and future migration
-boundary.
+All ten daemon migration slices and the remote Web Layer composition migration
+are locally complete. The daemon has passed real SSH-hosted browser acceptance;
+the formal Web Layer must pass the same gate before its compatibility launcher
+can eventually be removed.
 
 The lifecycle layout is adapted from the MIT-licensed HKUDS/nanobot gateway.
 Nanobot source may be copied for lifecycle, authentication, atomic persistence,

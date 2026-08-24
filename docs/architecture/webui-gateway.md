@@ -10,8 +10,9 @@ Layer and exposed through one local loopback SSH tunnel.
 - `scripts/dev/run_remote_agent_development.py`: local Git-bundle source
   delivery, explicit install/update/start, lifecycle, SSH tunnel, browser
   bootstrap, and status/log/stop commands.
-- `scripts/dev/development_agent_web_layer.py`: browser authentication and
-  Desktop v2 projection.
+- `src/openevo/web_gateway/product_app.py`: formal browser authentication,
+  Desktop v2 projection, daemon event relay, static hosting, and process entry.
+- `scripts/dev/development_agent_web_layer.py`: thin compatibility launcher.
 - `src/openevo/daemon/product_app.py`: formal durable
   project/session/workspace, Agent, and Evolution authority.
 - `scripts/dev/live_agent_daemon.py`: thin compatibility launcher for older

@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi.testclient import TestClient
 
 from desktop.sidecar.contracts.v2 import models as m
-from scripts.dev.development_agent_web_layer import (
+from openevo.web_gateway.product_app import (
     DevelopmentDaemonClient,
     DevelopmentDaemonEventCursorExpired,
     DevelopmentAgentDesktopV2Provider,
@@ -825,7 +825,7 @@ def test_daemon_client_accepts_bounded_aggregate_state_larger_than_one_mib(
             return payload
 
     monkeypatch.setattr(
-        "scripts.dev.development_agent_web_layer.urllib.request.urlopen",
+        "openevo.web_gateway.product_app.urllib.request.urlopen",
         lambda request, timeout: Response(),
     )
 
@@ -855,9 +855,12 @@ def test_module_imports_when_launcher_is_started_from_desktop() -> None:
 
     assert completed.returncode == 0, completed.stderr
 
+    compatibility_script = scripts_root / "development_agent_web_layer.py"
+    assert len(compatibility_script.read_text(encoding="utf-8").splitlines()) < 20
+
 
 def test_http_layer_requires_exact_session_and_projects_empty_state() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     original = web.DevelopmentDaemonClient
@@ -903,7 +906,7 @@ def test_http_layer_requires_exact_session_and_projects_empty_state() -> None:
 
 
 def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     fake.state.update({
@@ -968,7 +971,7 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
 
 
 def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     project_id = "project-artifact-v2"
@@ -1058,7 +1061,7 @@ def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:
 
 
 def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     project_id = "project-evolution-v2"
@@ -1129,7 +1132,7 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> No
 
 
 def test_http_layer_uses_authenticated_daemon_v2_evolution_job_authority() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     project_id = "development-project-job-v2"
@@ -1243,7 +1246,7 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_job_authority() -> No
 
 
 def test_self_hosted_layer_serves_the_preserved_webui_renderer() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     original = web.DevelopmentDaemonClient
@@ -1497,7 +1500,7 @@ def test_state_and_profile_collection_publish_identical_authority() -> None:
 
 
 def test_development_api_proxy_requires_local_token_and_forwards_to_daemon() -> None:
-    import scripts.dev.development_agent_web_layer as web
+    import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
     calls: list[tuple[str, str, str, bytes, str | None]] = []

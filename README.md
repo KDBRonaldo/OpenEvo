@@ -75,6 +75,12 @@ former `scripts/dev/live_agent_daemon.py` path is retained only as a thin
 compatibility launcher, so existing persisted state and browser behavior do not
 change.
 
+The remote Web Layer is likewise composed under
+`src/openevo/web_gateway/product_app.py`; it serves the committed React bundle,
+authenticates browser sessions, relays daemon events, and projects the daemon
+into the existing Desktop v2 browser contract. Its former development script
+is also only a compatibility launcher.
+
 Useful companion commands:
 
 ```bash
@@ -101,7 +107,8 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 - `desktop/`: React WebUI and the small static host used by the gateway.
 - `scripts/dev/`: local launcher, SSH tunnel orchestration, remote WebUI layer,
   and thin compatibility entry points.
-- `src/openevo/web_gateway/`: built WebUI assets and gateway package boundary.
+- `src/openevo/web_gateway/`: formal Web Layer composition and built,
+  version-matched WebUI assets.
 - `src/openevo/daemon/`: formal process composition, closed daemon contracts,
   project/event/task/Session persistence, managed workspace and artifacts,
   Agent harness execution, and Evolution orchestration.
