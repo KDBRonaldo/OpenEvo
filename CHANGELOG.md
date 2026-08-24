@@ -1,5 +1,8 @@
 # Changelog
 
+- Promoted the proven SSH/Git-bundle/tunnel path into `openevo webui`, with
+  bounded `~/.ssh/config` host discovery, interactive selection, last-server
+  persistence, automatic browser opening, and a thin historical script adapter.
 - Moved browser authentication, Desktop v2 projection, daemon event relay,
   static WebUI hosting, and Web Layer process startup into
   `openevo.web_gateway.product_app`; the remote launcher now starts the formal

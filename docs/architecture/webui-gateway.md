@@ -7,9 +7,10 @@ Layer and exposed through one local loopback SSH tunnel.
 
 - `desktop/`: React source and v2 browser client.
 - `src/openevo/web_gateway/static/`: committed, version-matched WebUI bundle.
-- `scripts/dev/run_remote_agent_development.py`: local Git-bundle source
+- `src/openevo/launcher.py`: SSH-config discovery, local Git-bundle source
   delivery, explicit install/update/start, lifecycle, SSH tunnel, browser
-  bootstrap, and status/log/stop commands.
+  bootstrap, and status/log/stop commands behind `openevo webui`.
+- `scripts/dev/run_remote_agent_development.py`: thin compatibility launcher.
 - `src/openevo/web_gateway/product_app.py`: formal browser authentication,
   Desktop v2 projection, daemon event relay, static hosting, and process entry.
 - `scripts/dev/development_agent_web_layer.py`: thin compatibility launcher.

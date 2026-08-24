@@ -1,23 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import shutil
 import socket
 import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 
-
-MODULE_PATH = (
-    Path(__file__).resolve().parents[2] / "scripts" / "dev" / "run_remote_agent_development.py"
-)
-SPEC = importlib.util.spec_from_file_location("run_remote_agent_development", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-remote_launcher = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = remote_launcher
-SPEC.loader.exec_module(remote_launcher)
+from openevo import launcher as remote_launcher
 
 
 @pytest.mark.parametrize("alias", ["openevo-lab", "gpu_lab.2", "server_01"])

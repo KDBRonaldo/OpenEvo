@@ -21,6 +21,7 @@ runtime tests:
 ```bash
 uv run pytest \
   tests/daemon \
+  tests/dev/test_openevo_webui_cli.py \
   tests/dev/test_run_remote_agent_development.py \
   tests/dev/test_live_agent_daemon.py \
   tests/dev/test_development_agent_web_layer.py \
@@ -45,6 +46,14 @@ openevo-daemon stop --state-root ./tmp/daemon-smoke
 ```
 
 ## Manual remote smoke
+
+First verify SSH-config discovery and the formal entry:
+
+```bash
+uv run openevo webui
+```
+
+The explicit compatibility acceptance remains:
 
 ```bash
 cd desktop

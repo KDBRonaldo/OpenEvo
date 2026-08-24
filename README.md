@@ -16,7 +16,17 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Run the working remote WebUI
 
-From WSL:
+Configure one or more literal `Host` entries in `~/.ssh/config`, then run from
+the repository checkout:
+
+```bash
+uv run openevo webui
+```
+
+OpenEvo lists the configured hosts, remembers the last selection in
+`~/.openevo/launcher.json`, connects through system OpenSSH, and opens the
+loopback WebUI in the default browser. An explicit host remains available for
+development and automation:
 
 ```bash
 cd /mnt/c/Users/18083/Desktop/OpenEvo/desktop
@@ -27,9 +37,9 @@ npm run dev:agent:webui:remote -- \
   --ssh-port 27104
 ```
 
-The launcher compares the server's managed checkout with the current committed
-local branch head. If they differ, it creates a verified Git bundle locally and
-uploads it through SSH; the server never fetches OpenEvo source from GitHub.
+The formal launcher compares the server's managed checkout with the current
+committed local branch head. If they differ, it creates a verified Git bundle
+locally and uploads it through SSH; the server never fetches OpenEvo source from GitHub.
 When the commits already match, source delivery is skipped. The launcher then
 starts the remote processes, opens the SSH tunnel, and serves the React UI.
 
@@ -105,8 +115,9 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 ## Repository boundary
 
 - `desktop/`: React WebUI and the small static host used by the gateway.
-- `scripts/dev/`: local launcher, SSH tunnel orchestration, remote WebUI layer,
-  and thin compatibility entry points.
+- `scripts/dev/`: development automation and thin compatibility entry points.
+- `src/openevo/launcher.py`: formal SSH discovery, source delivery, tunnel,
+  browser bootstrap, and lifecycle launcher.
 - `src/openevo/web_gateway/`: formal Web Layer composition and built,
   version-matched WebUI assets.
 - `src/openevo/daemon/`: formal process composition, closed daemon contracts,

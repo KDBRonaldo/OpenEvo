@@ -74,6 +74,12 @@ npm run dev:agent:webui:remote -- \
   --ssh-port <port>
 ```
 
+The formal user entry is `uv run openevo webui`. With no explicit connection
+arguments it discovers literal aliases from `~/.ssh/config`, prompts for a
+server, remembers the last selection, and opens the browser. The npm command is
+retained as the source-development acceptance alias and delegates to the same
+formal launcher.
+
 The remote checkout is managed under `~/.openevo/dev-agent/source`; durable
 state is stored separately at `~/.openevo/dev-agent/state.sqlite3`, so source
 updates and process restarts do not erase projects. The launcher probes only

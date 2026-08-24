@@ -5,7 +5,24 @@ packaged Desktop application.
 
 ## Start
 
-Prepare SSH access to a Linux server, then run from WSL:
+Add a literal host alias to `~/.ssh/config`, for example:
+
+```sshconfig
+Host openevo-lab
+  HostName server.example.com
+  User researcher
+  Port 22
+```
+
+Then run from the repository checkout:
+
+```bash
+uv run openevo webui
+```
+
+The launcher discovers concrete aliases from the SSH config (including common
+`Include` files), asks which workspace to use, remembers the last selection,
+and opens the WebUI. The previous explicit development form remains valid:
 
 ```bash
 cd /mnt/c/Users/18083/Desktop/OpenEvo/desktop
@@ -15,7 +32,7 @@ npm run dev:agent:webui:remote -- \
   --ssh-port <port>
 ```
 
-The command prints the loopback URL to open in your browser. Project and session
+The command opens and prints the loopback URL. Project and session
 state is authoritative on the remote host; the browser is only a client. The
 default command uploads the current committed source over SSH only when the
 server has a different commit. It does not require `git push`.

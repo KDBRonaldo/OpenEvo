@@ -10,7 +10,7 @@ The only supported product path is:
 
 ```text
 browser
-  -> local SSH tunnel owned by scripts/dev/run_remote_agent_development.py
+  -> local SSH tunnel owned by src/openevo/launcher.py (`openevo webui`)
   -> remote src/openevo/web_gateway/product_app.py
   -> remote src/openevo/daemon/product_app.py
   -> Codex harness + OpenEvo evolution runtime
@@ -21,7 +21,8 @@ for implementation extracted from the two `scripts/dev` services; it is not a
 parallel product path.  The acceptance command, browser API, SSH topology, and
 remote persisted data must remain usable after every migration slice.
 
-The acceptance command is:
+The formal user command is `openevo webui`; it discovers literal hosts from the
+user's SSH config. The explicit development acceptance command remains:
 
 ```bash
 cd desktop

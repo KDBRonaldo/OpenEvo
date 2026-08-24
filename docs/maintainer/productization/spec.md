@@ -28,7 +28,8 @@ paths.
 ## User workflow
 
 1. The user has a working SSH configuration and remote Codex login.
-2. The user runs `npm run dev:agent:webui:remote -- ...`.
+2. The user runs `openevo webui`, selects a discovered `~/.ssh/config` host,
+   or supplies explicit SSH connection arguments.
 3. The launcher deploys the exact committed local branch head through SSH; the
    remote host does not need GitHub access and the branch does not need to be
    pushed before use.
