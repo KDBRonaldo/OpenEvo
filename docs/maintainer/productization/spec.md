@@ -6,9 +6,9 @@ Status: canonical for the experimental product branch.
 
 OpenEvo gives a researcher one browser UI for remote projects, agent sessions,
 workspace files, artifacts, and evolution.  The researcher supplies an
-ordinary OpenSSH target; OpenEvo installs or updates its own committed source
-checkout, starts the remote processes, opens one private tunnel, and launches
-the local browser.
+ordinary OpenSSH target; OpenEvo installs or updates the committed local source
+through SSH, starts the remote processes, opens one private tunnel, and
+launches the local browser.
 
 ## Supported topology
 
@@ -29,7 +29,9 @@ paths.
 
 1. The user has a working SSH configuration and remote Codex login.
 2. The user runs `npm run dev:agent:webui:remote -- ...`.
-3. The launcher deploys the exact committed branch head.
+3. The launcher deploys the exact committed local branch head through SSH; the
+   remote host does not need GitHub access and the branch does not need to be
+   pushed before use.
 4. The browser creates or selects a persistent project.
 5. Sessions run against that project's remote workspace.
 6. Completed session evidence can produce and apply evolution artifacts.
@@ -39,6 +41,11 @@ paths.
 ## Required behavior
 
 - WebUI, Web Layer, and daemon versions come from one exact commit.
+- A matching installed commit starts without source transfer.  Source install,
+  update, and start are independently invocable, while the default command may
+  compose them as one bounded operation.
+- Source bundles are integrity-checked before use.  SSH connection, transfer,
+  remote bootstrap, and readiness waits have finite timeouts.
 - The daemon persists authority in
   `~/.openevo/dev-agent/state.sqlite3` and project workspaces under the same
   managed state root.

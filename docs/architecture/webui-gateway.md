@@ -7,8 +7,9 @@ Layer and exposed through one local loopback SSH tunnel.
 
 - `desktop/`: React source and v2 browser client.
 - `src/openevo/web_gateway/static/`: committed, version-matched WebUI bundle.
-- `scripts/dev/run_remote_agent_development.py`: deploy, lifecycle, SSH
-  tunnel, browser bootstrap, status/log/stop commands.
+- `scripts/dev/run_remote_agent_development.py`: local Git-bundle source
+  delivery, explicit install/update/start, lifecycle, SSH tunnel, browser
+  bootstrap, and status/log/stop commands.
 - `scripts/dev/development_agent_web_layer.py`: browser authentication and
   Desktop v2 projection.
 - `scripts/dev/live_agent_daemon.py`: durable project/session/workspace and
@@ -22,8 +23,8 @@ npm run build:webui-gateway
 ```
 
 The build writes hashed assets into `src/openevo/web_gateway/static`.  The
-launcher deploys those exact committed bytes; it does not build a different
-frontend on the server.
+launcher delivers those exact committed bytes from the local checkout over
+SSH; it neither fetches source nor builds a different frontend on the server.
 
 ## Design direction
 

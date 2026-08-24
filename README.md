@@ -27,10 +27,35 @@ npm run dev:agent:webui:remote -- \
   --ssh-port 27104
 ```
 
-The launcher updates the managed remote checkout, starts the remote development
-daemon, opens a local SSH tunnel, starts the local WebUI gateway, and serves the
-React UI. The selected Git branch must already exist on the configured remote
-repository.
+The launcher compares the server's managed checkout with the current committed
+local branch head. If they differ, it creates a verified Git bundle locally and
+uploads it through SSH; the server never fetches OpenEvo source from GitHub.
+When the commits already match, source delivery is skipped. The launcher then
+starts the remote processes, opens the SSH tunnel, and serves the React UI.
+
+Installation, update, and start can also be run separately:
+
+```bash
+# First source and runtime installation; does not start services.
+npm run dev:agent:webui:remote -- \
+  --host <host> --user <user> --ssh-port <port> \
+  --source-action install
+
+# Deliver a newer commit and prepare its runtime; does not start services.
+npm run dev:agent:webui:remote -- \
+  --host <host> --user <user> --ssh-port <port> \
+  --source-action update
+
+# Start only when the installed and local commits already match.
+npm run dev:agent:webui:remote -- \
+  --host <host> --user <user> --ssh-port <port> \
+  --source-action start
+```
+
+The default command uses `--source-action auto`, preserving the one-command
+workflow. Source delivery requires a local commit, but it does not require a
+push. SSH connection, source transfer, remote command, dependency bootstrap,
+and health checks are bounded so a failed network phase reports an error.
 
 ## New daemon rebuild
 

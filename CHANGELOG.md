@@ -1,5 +1,9 @@
 # Changelog
 
+- Reworked remote source delivery so the server never fetches OpenEvo from
+  GitHub: matching commits start directly, changed commits travel as verified
+  local Git bundles over SSH, install/update/start are explicit actions, and
+  network-sensitive phases have finite timeouts.
 - Extracted durable task logs and typed task timeline persistence into
   `openevo.daemon` while retaining existing SQLite tables, pagination cursors,
   historical backfill, and Web Layer payloads.

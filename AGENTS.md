@@ -34,6 +34,11 @@ npm run dev:agent:webui:remote -- \
 The launcher must continue to use the user's normal OpenSSH configuration and
 must not expose daemon credentials to browser JavaScript.  The Web Layer and
 daemon bind to remote loopback; the browser reaches one local loopback port.
+Committed source is delivered from the local checkout as a verified Git bundle
+over SSH.  The remote host must not fetch product source from GitHub.  A matching
+installed commit skips delivery; explicit install, update, and start actions
+must remain available alongside the default one-command auto flow.  Every SSH,
+transfer, remote bootstrap, and health operation must have a finite timeout.
 
 ## Source boundaries
 
@@ -96,7 +101,8 @@ OpenEvo wire models and evolution semantics covered by OpenEvo tests.
 - Browser code never receives SSH commands, backend bearer tokens, host
   secrets, or unrestricted host paths.
 - Mutations are action-ID idempotent.  Reads are bounded and validated.
-- The remote checkout must equal the committed branch head before it runs.
+- The remote checkout must equal the committed local branch head before it
+  runs; pushing that branch to a Git remote is not a runtime prerequisite.
 - Existing `OPENEVO_*` runtime identities and Core evolution semantics remain
   unchanged unless the task explicitly changes them.
 

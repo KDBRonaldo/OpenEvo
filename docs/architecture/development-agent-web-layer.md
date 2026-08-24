@@ -43,4 +43,7 @@ npm run dev:agent:webui:remote -- \
 
 The remote checkout is managed under `~/.openevo/dev-agent/source`; durable
 state is stored separately at `~/.openevo/dev-agent/state.sqlite3`, so source
-updates and process restarts do not erase projects.
+updates and process restarts do not erase projects. The launcher probes only
+the installed commit. It skips source delivery when that commit matches, or
+uploads an integrity-checked local Git bundle through SSH when it differs. The
+remote server never fetches OpenEvo source from GitHub.
