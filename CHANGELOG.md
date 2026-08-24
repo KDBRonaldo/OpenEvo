@@ -1,5 +1,9 @@
 # Changelog
 
+- Extracted durable project catalog and active-project SQLite ownership into
+  `openevo.daemon` while preserving the working remote WebUI command, existing
+  database layout, event behavior, and multi-project visibility.
+
 ## Unreleased — self-hosted rebuild
 
 - Retain the working remote agent WebUI path driven by

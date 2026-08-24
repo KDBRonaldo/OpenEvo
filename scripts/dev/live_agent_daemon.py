@@ -50,6 +50,10 @@ from openevo.backend.harness_adapter import (  # noqa: E402
     HarnessRunError,
 )
 from openevo.backend.contracts.v2 import models as core_v2  # noqa: E402
+from openevo.daemon.project_catalog import (  # noqa: E402
+    ProjectCatalogConflictError,
+    SqliteProjectCatalog,
+)
 try:  # package import in tests; direct import when launched as a script
     from scripts.dev.development_agent_v2_contract import (  # noqa: E402
         DevelopmentArtifactPageV2,
@@ -1202,18 +1206,21 @@ class DevelopmentStateStore:
         self._lock = threading.RLock()
         self._event_condition = threading.Condition(self._lock)
         self.workspaces = ProjectWorkspaceStore(path.parent / "workspaces")
+        self.project_catalog = SqliteProjectCatalog(
+            path,
+            lock=self._lock,
+            connection_factory=self._connection,
+            clock=utc_now,
+        )
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             path.parent.chmod(0o700)
         except OSError:
             pass
         with self._connection() as connection:
+            self.project_catalog.initialize_schema(connection)
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS development_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS development_state_events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,
@@ -1224,13 +1231,6 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_state_events_project_sequence
                     ON development_state_events(project_id, sequence);
-                CREATE TABLE IF NOT EXISTS development_projects (
-                    project_id TEXT PRIMARY KEY,
-                    display_name TEXT NOT NULL,
-                    config_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS development_sessions (
                     session_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
@@ -1708,8 +1708,8 @@ class DevelopmentStateStore:
                     occurred_at=restarted_at,
                 )
             project_ids = [
-                row["project_id"]
-                for row in connection.execute("SELECT project_id FROM development_projects")
+                project.project_id
+                for project in self.project_catalog.read_state(connection).projects
             ]
         for project_id in project_ids:
             self.workspaces.ensure_project(project_id)
@@ -1849,18 +1849,8 @@ class DevelopmentStateStore:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
-            projects = [
-                {
-                    "project_id": row["project_id"],
-                    "display_name": row["display_name"],
-                    "config": json.loads(row["config_json"]),
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in connection.execute(
-                    "SELECT * FROM development_projects ORDER BY created_at, project_id"
-                )
-            ]
+            catalog_state = self.project_catalog.read_state(connection)
+            projects = [project.as_dict() for project in catalog_state.projects]
             evidence_session_ids = {
                 row["session_id"]
                 for row in connection.execute(
@@ -1899,12 +1889,7 @@ class DevelopmentStateStore:
                     "SELECT * FROM development_evolution_runs ORDER BY created_at, run_id"
                 )
             ]
-            active_row = connection.execute(
-                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
-            ).fetchone()
-        active_project_id = active_row["value"] if active_row else None
-        if active_project_id not in {project["project_id"] for project in projects}:
-            active_project_id = projects[-1]["project_id"] if projects else None
+        active_project_id = catalog_state.active_project_id
         return {
             "schema_version": "1",
             "active_project_id": active_project_id,
@@ -1921,73 +1906,33 @@ class DevelopmentStateStore:
 
     def state_v2(self) -> DevelopmentStateV2:
         with self._lock, self._connection() as connection:
+            catalog_state = self.project_catalog.read_state(connection)
             projects = [
                 DevelopmentProjectAuthorityV2(
-                    project_id=row["project_id"],
-                    display_name=row["display_name"],
-                    config=json.loads(row["config_json"]),
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
+                    project_id=project.project_id,
+                    display_name=project.display_name,
+                    config=project.config,
+                    created_at=project.created_at,
+                    updated_at=project.updated_at,
                 )
-                for row in connection.execute(
-                    "SELECT * FROM development_projects ORDER BY created_at, project_id"
-                )
+                for project in catalog_state.projects
             ]
-            active_row = connection.execute(
-                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
-            ).fetchone()
-        project_ids = {project.project_id for project in projects}
-        active_project_id = active_row["value"] if active_row else None
-        if active_project_id not in project_ids:
-            active_project_id = projects[-1].project_id if projects else None
         return DevelopmentStateV2(
-            active_project_id=active_project_id,
+            active_project_id=catalog_state.active_project_id,
             projects=projects,
         )
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            try:
-                connection.execute(
-                    "INSERT INTO development_projects VALUES (?, ?, ?, ?, ?)",
-                    (
-                        request["project_id"],
-                        request["display_name"],
-                        canonical_json(request["config"]),
-                        now,
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                existing = connection.execute(
-                    "SELECT * FROM development_projects WHERE project_id = ?",
-                    (request["project_id"],),
-                ).fetchone()
-                if (
-                    existing is None
-                    or existing["display_name"] != request["display_name"]
-                    or json.loads(existing["config_json"]) != request["config"]
-                ):
-                    raise StateConflictError("project_id already exists") from exc
-                self._set_active(connection, request["project_id"])
-                return {
-                    "project_id": existing["project_id"],
-                    "display_name": existing["display_name"],
-                    "config": json.loads(existing["config_json"]),
-                    "created_at": existing["created_at"],
-                    "updated_at": existing["updated_at"],
-                }
-            self._set_active(connection, request["project_id"])
-        self.workspaces.ensure_project(request["project_id"])
-        return {**request, "created_at": now, "updated_at": now}
+        try:
+            project, created = self.project_catalog.create(request)
+        except ProjectCatalogConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
+        if created:
+            self.workspaces.ensure_project(request["project_id"])
+        return project.as_dict()
 
     def workspace_path(self, project_id: str) -> Path:
-        with self._lock, self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
-            ).fetchone() is None:
-                raise KeyError(project_id)
+        self.project_catalog.require(project_id)
         return self.workspaces.project_path(project_id)
 
     def workspace_snapshot(self, project_id: str) -> dict[str, Any]:
@@ -2108,30 +2053,10 @@ class DevelopmentStateStore:
         })
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        now = utc_now()
-        with self._lock, self._connection() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE development_projects
-                SET display_name = ?, config_json = ?, updated_at = ?
-                WHERE project_id = ?
-                """,
-                (request["display_name"], canonical_json(request["config"]), now, project_id),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(project_id)
-            created = connection.execute(
-                "SELECT created_at FROM development_projects WHERE project_id = ?", (project_id,)
-            ).fetchone()
-        return {"project_id": project_id, **request, "created_at": created["created_at"], "updated_at": now}
+        return self.project_catalog.update(project_id, request).as_dict()
 
     def activate_project(self, project_id: str) -> None:
-        with self._lock, self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
-            ).fetchone() is None:
-                raise KeyError(project_id)
-            self._set_active(connection, project_id)
+        self.project_catalog.activate(project_id)
 
     @staticmethod
     def _append_task_log_v2(
@@ -2276,16 +2201,6 @@ class DevelopmentStateStore:
                     message=row["error"],
                     occurred_at=row["updated_at"],
                 )
-
-    @staticmethod
-    def _set_active(connection: sqlite3.Connection, project_id: str) -> None:
-        connection.execute(
-            """
-            INSERT INTO development_metadata(key, value) VALUES ('active_project_id', ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (project_id,),
-        )
 
     def start_session(self, session_id: str, request: dict[str, str]) -> None:
         now = utc_now()

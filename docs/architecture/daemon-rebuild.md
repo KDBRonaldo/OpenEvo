@@ -26,9 +26,12 @@ The first implementation owns only:
 - `start`, `status`, `logs`, `restart`, and `stop` lifecycle commands;
 - stale-PID protection before process termination.
 
-Project, session, task, transcript, artifact, and evolution behavior remains in
-the proven development daemon until each API is migrated with regression tests.
-The existing remote WebUI command remains unchanged during this phase.
+Session, task, transcript, workspace, artifact, and evolution behavior remains
+in the proven development daemon until each API is migrated with regression
+tests.  Project catalog persistence has moved behind the compatibility
+composition into `src/openevo/daemon/project_catalog.py` without changing its
+SQLite tables.  The existing remote WebUI command remains unchanged during
+this phase.
 
 ## Slice acceptance rule
 
@@ -50,9 +53,11 @@ The planned order is:
 7. evolution orchestration;
 8. final single-process composition.
 
-The first lifecycle shell and the Web Layer lifespan migration are complete.
-The project catalog is next because it is a durable authority boundary and has
-already exposed a user-visible multi-project regression.
+The lifecycle shell, Web Layer lifespan migration, and project catalog
+extraction are complete.  The catalog continues to use
+`development_projects`, `development_metadata`, the shared transaction/event
+connection, and the existing database location, so no remote data migration is
+required.  Sessions and recoverable events are the next authority boundary.
 
 The lifecycle layout is adapted from the MIT-licensed HKUDS/nanobot gateway.
 Nanobot source may be copied for lifecycle, authentication, atomic persistence,

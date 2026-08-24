@@ -41,9 +41,11 @@ daemon bind to remote loopback; the browser reaches one local loopback port.
   `desktop/src/product/DesktopProductApp.tsx` are the product renderer.
 - `desktop/src/api/v2`, `desktop/src/product/*V2*`, and the retained
   Desktop v2 contract modules are the current browser/Web Layer wire boundary.
-- `scripts/dev/live_agent_daemon.py` owns persistent project, task,
-  workspace, artifact, and evolution state in SQLite until each owner is
-  extracted behind the same API into `src/openevo/daemon`.
+- `src/openevo/daemon/project_catalog.py` owns the existing SQLite project
+  table and active-project metadata behind the unchanged development API.
+- `scripts/dev/live_agent_daemon.py` remains the compatibility composition
+  root and owns task, workspace, artifact, and evolution state in SQLite until
+  each remaining owner is extracted behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the
   complete working path has passed real remote acceptance.
