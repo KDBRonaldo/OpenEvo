@@ -62,9 +62,15 @@ transfer, remote bootstrap, and health operation must have a finite timeout.
   action identity, and fail-closed cleanup.  It shares the compatibility
   coordinator's operation lock so Session, Evolution, and workspace mutations
   retain the existing serialization contract.
+- `src/openevo/daemon/workspace_store.py` owns managed project directories,
+  bounded document projections, digest-complete inventories, uploads,
+  downloads, and safe agent mutations.
+- `src/openevo/daemon/artifact_store.py` owns dataset/evolution artifact rows,
+  promoted context selection, canonical records, and cursor pagination behind
+  the unchanged v2 API.
 - `scripts/dev/live_agent_daemon.py` remains the compatibility composition
-  root and owns workspace, artifact, evolution orchestration, harness/workspace
-  execution adaptation, and process composition until each remaining owner is
+  root and owns evolution orchestration, harness/workspace execution adaptation,
+  HTTP model projection, and process composition until each remaining owner is
   extracted behind the same API.
 - `src/openevo/daemon` owns already-extracted daemon capabilities.  The
   `scripts/dev` entry points remain compatibility composition roots until the

@@ -138,7 +138,9 @@ def test_workspace_snapshot_projects_bounded_pdf_text(
             assert strict is False
             self.pages = [FakePage("A reusable result from the uploaded paper.")]
 
-    monkeypatch.setattr(MODULE, "PdfReader", FakePdfReader)
+    monkeypatch.setitem(
+        MODULE.ProjectWorkspaceStore.snapshot.__globals__, "PdfReader", FakePdfReader
+    )
     store = MODULE.ProjectWorkspaceStore(tmp_path / "workspaces")
     project = store.ensure_project("project-1")
     (project / "paper.pdf").write_bytes(b"%PDF-1.7\nfixture")

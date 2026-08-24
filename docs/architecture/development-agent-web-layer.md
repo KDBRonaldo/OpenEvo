@@ -34,9 +34,14 @@ migrations, context artifact pinning, lifecycle transitions, cancellation, and
 interrupted-run recovery are owned by `src/openevo/daemon/session_store.py`.
 Exclusive Session admission, worker-thread lifetime, live cancellation signal
 lookup, and unconditional operation-lock cleanup are owned by
-`src/openevo/daemon/session_runtime.py`. The compatibility daemon still
-composes those owners with the harness runner, workspace, artifacts, and
-evolution orchestration.
+`src/openevo/daemon/session_runtime.py`. Persistent project directories,
+bounded document projections, digest-complete inventories, uploads, downloads,
+and safe mutations are owned by `src/openevo/daemon/workspace_store.py`.
+Dataset/evolution artifact persistence, promoted-context selection, canonical
+records, and stable cursor pagination are owned by
+`src/openevo/daemon/artifact_store.py`. The compatibility daemon now composes
+those owners with the harness runner and evolution orchestration; its HTTP
+models and existing SQLite rows remain unchanged.
 
 The renderer enters the Session conversation as soon as the user starts a
 task. It shows the submitted instruction during validation/admission, then

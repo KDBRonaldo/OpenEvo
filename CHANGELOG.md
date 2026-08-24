@@ -1,5 +1,9 @@
 # Changelog
 
+- Extracted managed project workspaces and durable dataset/evolution artifact
+  ownership into `openevo.daemon`, retaining safe file bounds, document
+  projections, digest pagination, promoted-context selection, existing SQLite
+  rows, and all current WebUI/API behavior.
 - Extracted asynchronous Session execution ownership into `openevo.daemon`,
   including exclusive admission, exact idempotency, live cancellation-signal
   delivery, worker failure handling, and unconditional operation-lock cleanup,
