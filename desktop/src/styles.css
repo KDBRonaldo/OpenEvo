@@ -3816,6 +3816,13 @@ pre.json {
   min-height: 330px;
 }
 
+.active-run-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .v2-authority-details {
   border-top: 1px solid var(--line);
   padding-top: 12px;
@@ -3872,6 +3879,35 @@ pre.json {
 
 .session-back-button:hover {
   color: var(--accent-strong);
+}
+
+.session-starting-label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.v2-starting-session-card {
+  display: flex;
+  min-height: min(720px, calc(100dvh - 132px));
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+
+.v2-starting-session-card .session-chat-canvas {
+  min-height: 0;
+  flex: 1;
+  margin: 0;
+  overflow-y: auto;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.v2-starting-session-card .v2-agent-activity {
+  width: min(820px, calc(100% - 68px));
+  margin: 0 auto 42px;
 }
 
 .session-detail-workspace > .v2-task-result-detail {

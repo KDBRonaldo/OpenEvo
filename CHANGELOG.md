@@ -1,5 +1,9 @@
 # Changelog
 
+- Open the Session conversation immediately after Start Session, show explicit
+  Agent startup/working states while the daemon is running, stream refreshed
+  replies into the chat, and expose Session cancellation in both the live chat
+  and project overview.
 - Extracted durable Session schema, migrations, context pinning, lifecycle
   transitions, cancellation, and restart recovery into `openevo.daemon` while
   retaining the existing SQLite data, API payloads, and task journal transaction.

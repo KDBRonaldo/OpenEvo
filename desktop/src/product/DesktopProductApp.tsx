@@ -64,6 +64,12 @@ import {
 
 type Workspace = "research" | "evolution" | "system";
 
+type StartingSessionV2 = {
+  readonly projectId: string;
+  readonly task: ScienceProjectConfigV2["task"];
+  readonly phase: "validating" | "admitting";
+};
+
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width";
@@ -197,6 +203,7 @@ export function DesktopProductApp({
   const [busy, setBusy] = useState(false);
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [startingSession, setStartingSession] = useState<StartingSessionV2 | null>(null);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
   const [projectPaneWidth, setProjectPaneWidth] = usePersistedPaneWidth(
     PROJECT_PANE_WIDTH_KEY,
@@ -394,6 +401,10 @@ export function DesktopProductApp({
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
   ): Promise<boolean> => {
     if (project.state !== "ready") return false;
+    setWorkspace("research");
+    setSelectedWorkspacePath(null);
+    setSelectedTaskId(null);
+    setStartingSession({ projectId: project.project_id, task, phase: "validating" });
     setBusy(true);
     setActionError(null);
     setActionStatus(null);
@@ -449,10 +460,10 @@ export function DesktopProductApp({
       }
       currentSnapshot = validatedSnapshot;
       currentProject = validatedProject;
+      setStartingSession({ projectId: currentProject.project_id, task, phase: "admitting" });
       const submittedTask = await provider.submitTask(currentProject.project_id, intentFor(currentSnapshot, "submit-task"));
-      await refresh();
-      setWorkspace("research");
       setSelectedTaskId(submittedTask.task_id);
+      await refresh();
       setActionStatus(developmentAgentBridge
         ? "The remote Session started. Its transcript will become reusable evidence in Evolution."
         : "Task admitted with immutable Project Head and execution authority.");
@@ -462,6 +473,7 @@ export function DesktopProductApp({
       await refresh();
       return false;
     } finally {
+      setStartingSession(null);
       setBusy(false);
     }
   };
@@ -570,7 +582,7 @@ export function DesktopProductApp({
 
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
+          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
           <div className="topbar-actions">
             {displayedProject === null && connectedProfiles.length > 0 ? (
               <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
@@ -628,6 +640,7 @@ export function DesktopProductApp({
               capability={snapshot.capability}
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
+              startingSession={startingSession?.projectId === displayedProject.project_id ? startingSession : null}
               busy={busy || developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
               onSelectTask={setSelectedTaskId}
@@ -1436,6 +1449,45 @@ function ProjectFileWorkspaceV2({
   );
 }
 
+function StartingSessionChatV2({
+  project,
+  session,
+}: {
+  readonly project: ProjectV2;
+  readonly session: StartingSessionV2;
+}) {
+  const phaseDetail = session.phase === "validating"
+    ? "Checking the current Project Head and remote execution authority."
+    : "The daemon is admitting this Session and starting the remote Agent.";
+  return (
+    <div className="workspace-stack session-detail-workspace" data-testid="starting-session-workspace">
+      <div className="session-detail-navigation">
+        <span className="session-starting-label">Starting a new Session in {project.display_name}</span>
+      </div>
+      <article className="product-panel v2-starting-session-card">
+        <section className="v2-conversation-section session-chat-canvas" aria-label="Starting Session conversation">
+          <div className="v2-transcript">
+            <article className="user" aria-label="You"><span aria-hidden="true">You</span><p>{session.task.objective}</p></article>
+          </div>
+          <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="starting-session-activity">
+            <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
+            <div className="v2-agent-activity-copy">
+              <strong>Agent is starting<span className="v2-thinking-dots"><span>.</span><span>.</span><span>.</span></span></strong>
+              <p>{phaseDetail}</p>
+            </div>
+          </div>
+        </section>
+        <div className="session-chat-composer" aria-label="Session is starting">
+          <div className="session-chat-composer-box">
+            <textarea aria-label="Message for the active Session" placeholder="Wait for this Session to finish before sending another message." rows={2} disabled />
+            <button type="button" aria-label="Send message" disabled><ArrowUp size={17} /></button>
+          </div>
+        </div>
+      </article>
+    </div>
+  );
+}
+
 function ResearchWorkspaceV2({
   project,
   tasks,
@@ -1446,6 +1498,7 @@ function ResearchWorkspaceV2({
   capability,
   runtimePresentation,
   selectedTaskId,
+  startingSession,
   busy,
   sessionEvolutionAvailable,
   onSelectTask,
@@ -1468,6 +1521,7 @@ function ResearchWorkspaceV2({
   readonly capability: DesktopProductSnapshotV2["capability"];
   readonly runtimePresentation: DesktopProductSnapshotV2["runtimePresentation"];
   readonly selectedTaskId: string | null;
+  readonly startingSession: StartingSessionV2 | null;
   readonly busy: boolean;
   readonly sessionEvolutionAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
@@ -1488,10 +1542,17 @@ function ResearchWorkspaceV2({
   const selectedTask = projectTasks.find((task) => task.task_id === selectedTaskId) ?? null;
   const observedTask = selectedTask ?? projectTasks[0] ?? null;
   const activeTask = projectTasks.find((task) => ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)) ?? null;
+  const autoOpenedActiveTaskId = useRef<string | null>(null);
   useEffect(() => {
+    if (startingSession !== null) return;
     if (selectedTaskId !== null && !projectTasks.some((task) => task.task_id === selectedTaskId)) onSelectTask(null);
-    if (selectedTaskId === null && activeTask !== null) onSelectTask(activeTask.task_id);
-  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, tasks]);
+    if (activeTask !== null && selectedTaskId === activeTask.task_id) {
+      autoOpenedActiveTaskId.current = activeTask.task_id;
+    } else if (selectedTaskId === null && activeTask !== null && autoOpenedActiveTaskId.current !== activeTask.task_id) {
+      autoOpenedActiveTaskId.current = activeTask.task_id;
+      onSelectTask(activeTask.task_id);
+    }
+  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, startingSession, tasks]);
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
   const [taskTitle, setTaskTitle] = useState(project.config.task.title);
   const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
@@ -1535,6 +1596,9 @@ function ResearchWorkspaceV2({
     objective: taskObjective.trim(),
   };
   const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
+  if (startingSession !== null) {
+    return <StartingSessionChatV2 project={project} session={startingSession} />;
+  }
   if (selectedTask) {
     const transition = selectedTask.successor_transition
       ? transitions[selectedTask.successor_transition.successor_transition_id] ?? null
@@ -1613,7 +1677,7 @@ function ResearchWorkspaceV2({
       </section>
       <section className="product-panel active-run-panel">
         <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
-        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
+        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "Open live session" : "Open session result"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>Cancel session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
       </section>
       </div>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
@@ -1921,6 +1985,9 @@ function TaskAuthorityCardV2({
       sequence: entry.sequence,
     })),
   ];
+  const visibleTranscript = presentation?.transcript.length
+    ? presentation.transcript
+    : fallbackTranscript;
   const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
@@ -1970,7 +2037,7 @@ function TaskAuthorityCardV2({
     >
       <div className="session-conversation-pane">
       <section className="v2-conversation-section session-chat-canvas" data-session-priority="conversation" aria-label="Session conversation">
-        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && transcriptLogs.length ? <div className="v2-transcript">{fallbackTranscript.map((entry, index) => <article key={("sequence" in entry ? entry.sequence : `${entry.speaker}-${index}`)} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
+        {visibleTranscript.length ? <div className="v2-transcript">{visibleTranscript.map((entry, index) => <article key={`${entry.speaker}-${"sequence" in entry ? String(entry.sequence) : index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
             <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
@@ -1978,7 +2045,7 @@ function TaskAuthorityCardV2({
               <strong>{task.state === "cancelling" ? "Stopping the agent" : "Agent is working"}<span className="v2-thinking-dots"><span>.</span><span>.</span><span>.</span></span></strong>
               <p>{activityStage}</p>
             </div>
-            {active ? <button type="button" className="secondary-button" disabled={busy || task.state === "cancelling"} onClick={onCancel}>{task.state === "cancelling" ? "Stopping" : "Stop session"}</button> : null}
+            {active ? <button type="button" className="danger-button" disabled={busy || task.state === "cancelling"} onClick={onCancel}>{task.state === "cancelling" ? "Cancelling" : "Cancel session"}</button> : null}
           </div>
         ) : null}
       </section>

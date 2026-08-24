@@ -1226,6 +1226,41 @@ describe("Desktop v2 product renderer", () => {
     ).toBeTruthy();
   });
 
+  it("opens a chat immediately while the remote Session is being admitted", async () => {
+    const snapshot = authoritySnapshot();
+    let releaseSubmission!: (task: DesktopProductSnapshotV2["tasks"][number]) => void;
+    const submission = new Promise<DesktopProductSnapshotV2["tasks"][number]>((resolve) => {
+      releaseSubmission = resolve;
+    });
+    const fixture = providerFixture(snapshot);
+    const provider = {
+      ...fixture,
+      submitTask: vi.fn(async () => submission),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await act(async () => {
+      button("Start session").click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeTruthy();
+    expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
+    expect(document.body.textContent).toContain("Agent is starting");
+
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      releaseSubmission(snapshot.tasks[0]!);
+      await submission;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeNull();
+      expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
+    });
+  });
+
   it("starts the next immutable Session from the conversation composer", async () => {
     const snapshot = authoritySnapshot();
     const provider = providerFixture(snapshot);
@@ -1604,9 +1639,45 @@ describe("Desktop v2 product renderer", () => {
       "Daemon started the managed Task attempt.",
     );
     expect(document.body.textContent).toContain("Agent is working");
-    expect(document.body.textContent).toContain("Stop session");
+    expect(document.body.textContent).toContain("Cancel session");
     expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Task state");
+  });
+
+  it("cancels an active Session from the chat and keeps the control on the project overview", async () => {
+    const snapshot = authoritySnapshot();
+    const runningTask = {
+      ...snapshot.tasks[0]!,
+      state: "running" as const,
+      successor_transition: null,
+    };
+    const runningSnapshot: DesktopProductSnapshotV2 = {
+      ...snapshot,
+      tasks: [runningTask],
+      transitions: {},
+    };
+    const cancelTask = vi.fn(async () => ({
+      schema_version: "2",
+      operation_id: "development-session-cancel-task-1",
+      kind: "task_cancel",
+      resource: { resource_kind: "task", resource_id: "task-1" },
+      status: "accepted",
+      created_at: NOW,
+      updated_at: NOW,
+    } as never));
+    const provider = {
+      ...providerFixture(runningSnapshot),
+      cancelTask,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    expect(document.body.textContent).toContain("Cancel session");
+    await click("Cancel session");
+    expect(cancelTask).toHaveBeenCalledWith("task-1", expect.objectContaining({ streamEpoch: 1 }));
+
+    await click("Back to Protein study");
+    expect(document.body.textContent).toContain("Open live session");
+    expect(document.body.textContent).toContain("Cancel session");
   });
 
   it("hides the transient Agent activity after the Session is complete", async () => {

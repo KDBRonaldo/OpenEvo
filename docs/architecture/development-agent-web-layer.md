@@ -35,6 +35,14 @@ interrupted-run recovery are owned by `src/openevo/daemon/session_store.py`.
 The compatibility daemon still composes those owners with the harness runner,
 workspace, artifacts, and evolution orchestration.
 
+The renderer enters the Session conversation as soon as the user starts a
+task. It shows the submitted instruction during validation/admission, then
+uses the development provider's 750 ms active-Session refresh loop to replace
+startup state with daemon transcript messages. Active Sessions expose the
+existing authenticated cancel endpoint from both the conversation and the
+project overview; cancelling state remains visible until daemon authority
+reports a terminal result.
+
 Start from `desktop/`:
 
 ```bash
