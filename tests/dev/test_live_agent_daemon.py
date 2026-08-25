@@ -1639,6 +1639,89 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
     assert runtime["runtime_controls"] == []
 
 
+def test_explicit_skill_evolution_combines_every_selected_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    prompts: list[str] = []
+
+    def reflect(prompt: str, *_args: object, **_kwargs: object) -> str:
+        prompts.append(prompt)
+        return "# Combined skill\n\n- Reuse lessons from every selected Session.\n"
+
+    monkeypatch.setattr(methods, "_generate_reflector_markdown", reflect)
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-selected-sessions",
+        "display_name": "Selected Session evidence",
+        "config": {},
+    }
+    store.create_project(project)
+    runner = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+    session_ids = ["dev-session-selected-1", "dev-session-selected-2"]
+    for ordinal, session_id in enumerate(session_ids, start=1):
+        request = {
+            "project_id": project["project_id"],
+            "project_name": project["display_name"],
+            "task_title": f"Selected question {ordinal}",
+            "instruction": f"Remember selected instruction {ordinal}.",
+        }
+        result = {
+            "response": f"Selected answer {ordinal}.",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        }
+        store.start_session(session_id, request)
+        store.complete_session(session_id, result)
+        runner.capture_session_dataset(
+            session_id=session_id,
+            request=request,
+            result=result,
+            store=store,
+        )
+
+    run = store.start_evolution_run(
+        "evolution-run-selected-sessions",
+        {
+            "project_id": project["project_id"],
+            "session_ids": session_ids,
+            "selections": [
+                {
+                    "target_id": "skill_bundle",
+                    "method": "skill_bundle_reflector",
+                    "config": {},
+                }
+            ],
+        },
+    )
+    batch = runner.evolve_run(run=run, store=store)
+
+    assert batch["errors"] == []
+    assert len(prompts) == 1
+    assert "record_count: 2" in prompts[0]
+    assert "Remember selected instruction 1." in prompts[0]
+    assert "Remember selected instruction 2." in prompts[0]
+    assert "Selected answer 1." in prompts[0]
+    assert "Selected answer 2." in prompts[0]
+    manifest = batch["artifacts"][0]["manifest"]
+    assert manifest["record_count"] == 2
+    assert manifest["reflected_record_count"] == 2
+    assert manifest["source_dataset_artifact_ids"] == [
+        "dataset-dev-session-selected-1",
+        "dataset-dev-session-selected-2",
+    ]
+    assert manifest["source_dataset_count"] == 2
+    assert manifest["aggregate_dataset_artifact_id"].startswith("dataset-selection-")
+
+
 def test_desktop_default_reflectors_receive_the_current_transcript_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

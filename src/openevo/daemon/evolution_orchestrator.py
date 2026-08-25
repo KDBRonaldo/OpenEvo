@@ -19,6 +19,7 @@ from openevo.daemon.errors import EvolutionRunError
 
 
 MAX_EVOLUTION_CAPTURE_BYTES = 2 * 1024 * 1024
+MAX_AGGREGATED_DATASET_BYTES = 128 * 1024 * 1024
 EVOLUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
@@ -258,6 +259,116 @@ class EvolutionOrchestrator:
                 }
             )
         return documents
+
+    @staticmethod
+    def _file_uri_path(uri: str) -> Path:
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(uri)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            raise EvolutionRunError("Evolution dataset must use a local file URI")
+        path_text = unquote(parsed.path)
+        if sys.platform == "win32" and re.match(r"^/[A-Za-z]:/", path_text):
+            path_text = path_text[1:]
+        return Path(path_text)
+
+    def _aggregate_selected_datasets(
+        self,
+        *,
+        attempt_id: str,
+        project_name: str,
+        datasets: list[Any],
+    ) -> Any:
+        """Present explicitly selected Session evidence as one legacy dataset input."""
+
+        from openevo.evolution.models import WorkerClaimInputArtifact
+
+        source_root = (self._artifact_root / "datasets").resolve()
+        source_ids = [dataset.artifact_id for dataset in datasets]
+        aggregate_digest = hashlib.sha256(canonical_json(source_ids).encode()).hexdigest()[:24]
+        aggregate_id = f"dataset-selection-{aggregate_digest}"
+        aggregate_dir = self._artifact_root / "attempt-datasets" / attempt_id
+        aggregate_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        records_path = aggregate_dir / "records.jsonl"
+
+        records: list[dict[str, Any]] = []
+        total_bytes = 0
+        for dataset in datasets:
+            manifest_path = self._file_uri_path(dataset.uri)
+            if manifest_path.is_symlink():
+                raise EvolutionRunError("Evolution dataset manifest cannot be a symlink")
+            manifest_path = manifest_path.resolve(strict=True)
+            try:
+                manifest_path.relative_to(source_root)
+            except ValueError as exc:
+                raise EvolutionRunError(
+                    "Evolution dataset is outside the daemon-managed dataset root"
+                ) from exc
+            if manifest_path.stat().st_size > MAX_EVOLUTION_CAPTURE_BYTES:
+                raise EvolutionRunError("Evolution dataset manifest exceeds the size limit")
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise EvolutionRunError("Evolution dataset manifest is invalid") from exc
+            records_name = manifest.get("records_path") if isinstance(manifest, dict) else None
+            if (
+                not isinstance(records_name, str)
+                or not records_name
+                or Path(records_name).name != records_name
+            ):
+                raise EvolutionRunError("Evolution dataset records path is invalid")
+            source_records_path = manifest_path.with_name(records_name)
+            if source_records_path.is_symlink():
+                raise EvolutionRunError("Evolution dataset records cannot be a symlink")
+            try:
+                source_records_path = source_records_path.resolve(strict=True)
+            except OSError as exc:
+                raise EvolutionRunError("Evolution dataset records are unavailable") from exc
+            if source_records_path.parent != manifest_path.parent:
+                raise EvolutionRunError("Evolution dataset records escaped their manifest")
+            try:
+                with source_records_path.open("rb") as source:
+                    for raw_line in source:
+                        if not raw_line.strip():
+                            continue
+                        total_bytes += len(raw_line)
+                        if total_bytes > MAX_AGGREGATED_DATASET_BYTES:
+                            raise EvolutionRunError(
+                                "Selected Session evidence exceeds the aggregate size limit"
+                            )
+                        record = json.loads(raw_line)
+                        if not isinstance(record, dict):
+                            raise ValueError("record is not an object")
+                        records.append(record)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                raise EvolutionRunError("Evolution dataset records are invalid") from exc
+
+        records_path.write_text(
+            "".join(canonical_json(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        manifest_path = aggregate_dir / "manifest.json"
+        manifest_path.write_text(
+            canonical_json(
+                {
+                    "dataset_id": aggregate_id,
+                    "name": f"{project_name} selected Session transcripts",
+                    "records_path": records_path.name,
+                    "records_uri": records_path.resolve().as_uri(),
+                    "event_count": len(records),
+                    "capture_mode": "transcript",
+                    "token_level_metrics_available": False,
+                    "source_dataset_artifact_ids": source_ids,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return WorkerClaimInputArtifact(
+            artifact_id=aggregate_id,
+            type="dataset",
+            uri=manifest_path.resolve().as_uri(),
+            name=f"{project_name} selected Session transcripts",
+        )
 
     def evolve(
         self,
@@ -572,10 +683,24 @@ class EvolutionOrchestrator:
                     name=f"previous evolved {target.display_name}",
                 )
             ordered_datasets = [*prior_datasets, current_dataset]
+            aggregate_source_dataset_ids: list[str] | None = None
+            current_binding_dataset = current_dataset
+            if job.get("run_id") is not None and len(ordered_datasets) > 1 and any(
+                binding.source is InputBindingSource.CURRENT_DATASET
+                for binding in method.input_bindings
+            ):
+                current_binding_dataset = self._aggregate_selected_datasets(
+                    attempt_id=attempt_id,
+                    project_name=request["project_name"],
+                    datasets=ordered_datasets,
+                )
+                aggregate_source_dataset_ids = [
+                    dataset.artifact_id for dataset in ordered_datasets
+                ]
             candidates: dict[str, list[Any]] = {}
             for binding in method.input_bindings:
                 if binding.source is InputBindingSource.CURRENT_DATASET:
-                    candidates[binding.binding_id] = [current_dataset]
+                    candidates[binding.binding_id] = [current_binding_dataset]
                 elif binding.source is InputBindingSource.HISTORY_DATASETS:
                     candidates[binding.binding_id] = prior_datasets
                 elif (
@@ -659,6 +784,15 @@ class EvolutionOrchestrator:
             artifact_ids: list[str] = []
             for artifact, artifact_type, documents, artifact_id in output_records:
                 artifact_ids.append(artifact_id)
+                manifest = dict(artifact.manifest)
+                if aggregate_source_dataset_ids is not None:
+                    manifest.update(
+                        {
+                            "source_dataset_artifact_ids": aggregate_source_dataset_ids,
+                            "source_dataset_count": len(aggregate_source_dataset_ids),
+                            "aggregate_dataset_artifact_id": current_binding_dataset.artifact_id,
+                        }
+                    )
                 persisted.append(
                     store.record_evolution_artifact(
                         artifact_id=artifact_id,
@@ -674,7 +808,7 @@ class EvolutionOrchestrator:
                             else handler.renderer_kind.value
                         ),
                         documents=documents,
-                        manifest=artifact.manifest,
+                        manifest=manifest,
                         previous_artifact_id=(
                             previous["artifact_id"]
                             if previous is not None and artifact_type == target.artifact_type
