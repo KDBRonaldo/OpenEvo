@@ -29,8 +29,9 @@ paths.
 ## User workflow
 
 1. The user has a working SSH configuration and remote Codex login.
-2. The user runs `openevo webui`, selects a discovered `~/.ssh/config` host,
-   or supplies explicit SSH connection arguments.
+2. The user installs a versioned launcher distribution without cloning the
+   repository, then runs `openevo webui`, selects a discovered
+   `~/.ssh/config` host, or supplies explicit SSH connection arguments.
 3. The launcher verifies and deploys a versioned Release Bundle through SSH.
    During source development it may instead deploy the exact committed local
    branch head. The remote host does not need GitHub access and a development
@@ -45,6 +46,11 @@ paths.
 
 - WebUI, Web Layer, daemon, server contract code, and dependency lock come from
   one exact committed release payload and share one content-derived release ID.
+- The local launcher archive binds one standard-library launcher to that exact
+  server Release Bundle. Ordinary-user startup does not require a source
+  checkout, Git, uv, Node, or npm on the local computer.
+- The per-user installer publishes immutable version directories, changes an
+  atomic active receipt for upgrades, and never overwrites an unmanaged command.
 - A matching installed release (or development commit) starts without source
   transfer. Install, update, and start are independently invocable, while the
   default command may compose them as one bounded operation.
@@ -69,10 +75,11 @@ paths.
 
 ## Acceptance
 
-A candidate is usable only when its Release Bundle is built from an exact
-commit, installed on a real remote host without a server-side GitHub checkout,
-and the browser can create two projects, switch between them, run a session,
-reload history, upload/download a file, produce an evolution artifact, apply
-it, and observe it in the next session.
+A candidate is usable only when its launcher archive is installed and invoked
+from a machine without an OpenEvo checkout, its Release Bundle is installed on
+a real remote host without a server-side GitHub checkout, and the browser can
+create two projects, switch between them, run a session, reload history,
+upload/download a file, produce an evolution artifact, apply it, and observe it
+in the next session.
 
 Unit tests and simulator-only results do not replace this real end-to-end gate.

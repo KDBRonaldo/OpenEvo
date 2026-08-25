@@ -1582,8 +1582,8 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Deploy the real development Codex bridge through a system OpenSSH "
-            "alias, create a local tunnel, and start the Vite product UI"
+            "Install or update self-hosted OpenEvo through system OpenSSH, "
+            "open a private local tunnel, and launch the WebUI"
         )
     )
     parser.add_argument(
@@ -1636,7 +1636,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="auto",
         help=(
             "auto installs or updates then starts; install/update prepare source and "
-            "runtime without starting; start requires that exact commit to be prepared"
+            "runtime without starting; start requires that exact release to be prepared"
         ),
     )
     parser.add_argument("--local-port", type=_checked_port, default=8765)

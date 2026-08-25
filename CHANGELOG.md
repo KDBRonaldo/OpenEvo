@@ -1,5 +1,9 @@
 # Changelog
 
+- Added a deterministic repository-free launcher archive containing a
+  standard-library Python launcher and its exact server Release Bundle, plus a
+  verified idempotent per-user installer and atomic version activation; users
+  no longer need the source tree, Git, uv, Node, or npm on their computer.
 - Added deterministic, versioned self-hosted Release Bundles containing the
   built WebUI, Web Layer, daemon, server contract code, and dependency lock;
   the formal launcher now verifies and installs these bundles by immutable

@@ -12,6 +12,8 @@ Layer and exposed through one local loopback SSH tunnel.
   status/log/stop commands behind `openevo webui`.
 - `src/openevo/release_bundle.py`: deterministic runtime-only release builder
   and strict manifest/archive verifier.
+- `scripts/release/launcher_distribution.py`: deterministic local launcher
+  archive, closed manifest verifier, and repository-free per-user installer.
 - `scripts/dev/run_remote_agent_development.py`: thin compatibility launcher.
 - `src/openevo/web_gateway/product_app.py`: formal browser authentication,
   Desktop v2 projection, daemon event relay, static hosting, and process entry.
@@ -47,6 +49,21 @@ and the release-specific Python environment under
 `~/.openevo/dev-agent/runtimes/<release-id>` remain outside that immutable
 directory. The original Git-bundle path remains available for source
 development.
+
+## Ordinary-user launcher distribution
+
+The local distribution is a deterministic `tar.gz` containing a pure-standard-
+library `openevo.pyz`, the exact matching `.oevobundle`, license, instructions,
+and a generated installer. The zipapp contains only the CLI, SSH launcher, and
+bundle verifier; it does not contain the server implementation twice or depend
+on a local Python package environment.
+
+The installer verifies the closed manifest and every file, publishes the
+distribution below `<prefix>/share/openevo/releases/<distribution-id>`, writes
+an atomic active receipt, and installs a small managed command under
+`<prefix>/bin/openevo`. It is idempotent and refuses to overwrite an unmanaged
+command. A later distribution is installed beside the old one, so updating the
+active receipt does not modify prior release bytes.
 
 ## Design direction
 

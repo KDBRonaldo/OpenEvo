@@ -14,6 +14,32 @@ The previous packaged macOS/Tauri application, release sidecar, Core Control
 service, and managed deployment stack have been removed from the experimental
 `nanobot-formal-rebuild` branch. They are not compatibility targets.
 
+## Install without the repository
+
+The ordinary-user candidate is one versioned launcher archive. A maintainer
+builds it from an exact commit:
+
+```bash
+uv run python scripts/release/build_launcher_distribution.py \
+  --output dist/openevo-launcher.tar.gz
+```
+
+The user only needs Python 3.11+, POSIX `sh`/`tar`, system OpenSSH, and a
+configured SSH host:
+
+```bash
+tar -xzf openevo-launcher.tar.gz
+sh openevo-launcher/install.sh
+~/.local/bin/openevo webui
+```
+
+The archive contains a standard-library Python launcher and the matching
+server Release Bundle. The user's computer does not need the OpenEvo source
+tree, Git, uv, Node, or npm. Reinstalling the same archive is idempotent; a
+newer archive installs beside the previous version and atomically changes the
+active launcher receipt. The installer refuses to overwrite an unrelated
+`openevo` command.
+
 ## Run the working remote WebUI
 
 Configure one or more literal `Host` entries in `~/.ssh/config`, then run from
@@ -142,6 +168,8 @@ Python tests for the retained product path live mainly under `tests/dev/`,
 
 - `desktop/`: React WebUI and the small static host used by the gateway.
 - `scripts/dev/`: development automation and thin compatibility entry points.
+- `scripts/release/launcher_distribution.py`: deterministic repository-free
+  launcher archive, verifier, and generated per-user installer.
 - `src/openevo/launcher.py`: formal SSH discovery, source delivery, tunnel,
   browser bootstrap, and lifecycle launcher.
 - `src/openevo/release_bundle.py`: deterministic server release construction
