@@ -16,8 +16,23 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Install without the repository
 
-The ordinary-user candidate is one versioned launcher archive. A maintainer
-builds it from an exact commit:
+The ordinary-user release is installed and integrity-checked with one command:
+
+```bash
+curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh | sh
+~/.local/bin/openevo webui
+```
+
+The bootstrap downloads `openevo-launcher.tar.gz` and its published SHA-256
+file before running the archive's own verified installer. To install an exact
+release, pass `--version`, for example:
+
+```bash
+curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh \
+  | sh -s -- --version v0.1.10
+```
+
+A maintainer can still build the same archive locally from an exact commit:
 
 ```bash
 uv run python scripts/release/build_launcher_distribution.py \
@@ -39,6 +54,11 @@ tree, Git, uv, Node, or npm. Reinstalling the same archive is idempotent; a
 newer archive installs beside the previous version and atomically changes the
 active launcher receipt. The installer refuses to overwrite an unrelated
 `openevo` command.
+
+Pushing a tag that exactly matches `v<pyproject version>` runs the launcher
+release workflow. It verifies the committed WebUI and release tests, then
+publishes `install.sh`, `openevo-launcher.tar.gz`, and
+`openevo-launcher.tar.gz.sha256` as immutable GitHub Release assets.
 
 ## Run the working remote WebUI
 

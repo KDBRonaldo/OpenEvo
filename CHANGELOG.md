@@ -1,5 +1,8 @@
 # Changelog
 
+- Added the tag-driven GitHub Release workflow and online installer bootstrap;
+  ordinary users can download a launcher, verify its separately published
+  SHA-256 digest, and install OpenEvo without a repository checkout.
 - Added a deterministic repository-free launcher archive containing a
   standard-library Python launcher and its exact server Release Bundle, plus a
   verified idempotent per-user installer and atomic version activation; users

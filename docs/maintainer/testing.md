@@ -53,7 +53,9 @@ The builder packages committed files, not dirty working-tree bytes.
 The repository-free local launcher and its per-user installer are covered by:
 
 ```bash
-uv run pytest tests/release/test_launcher_distribution.py
+uv run pytest \
+  tests/release/test_launcher_distribution.py \
+  tests/release/test_online_installer.py
 uv run python scripts/release/build_launcher_distribution.py \
   --output dist/openevo-launcher.tar.gz
 ```
@@ -65,6 +67,13 @@ confirm they work without `PYTHONPATH` or access to the checkout:
 sh openevo-launcher/install.sh --prefix <temporary-prefix>
 <temporary-prefix>/bin/openevo webui --help
 ```
+
+The online bootstrap is tested against a local HTTP release fixture, including
+checksum rejection. To publish a real release, update `project.version`, commit
+the exact tree, and push the matching `v<version>` tag. The
+`openevo-launcher-release.yml` workflow refuses mismatched tags and existing
+GitHub Releases, and publishes the launcher archive, SHA-256 file, and online
+installer together.
 
 The new daemon lifecycle can also be smoke-tested independently without
 switching the product path:

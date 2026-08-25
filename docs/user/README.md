@@ -12,9 +12,22 @@ Requirements on the user's computer:
 - system OpenSSH (`ssh`);
 - a literal host alias in `~/.ssh/config`.
 
-After downloading `openevo-launcher.tar.gz`:
+Install the latest published version:
 
 ```bash
+curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh | sh
+~/.local/bin/openevo webui
+```
+
+The online installer verifies the archive against the separately published
+SHA-256 file before installation. An exact version can be selected with
+`sh -s -- --version v0.1.10`.
+
+For an offline installation, download `openevo-launcher.tar.gz` and its
+`.sha256` file from the same GitHub Release, verify it, then run:
+
+```bash
+sha256sum --check openevo-launcher.tar.gz.sha256
 tar -xzf openevo-launcher.tar.gz
 sh openevo-launcher/install.sh
 ~/.local/bin/openevo webui
