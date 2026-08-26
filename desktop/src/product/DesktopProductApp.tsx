@@ -116,15 +116,15 @@ function preferredTaskIdV2(
 
 function taskStateLabelV2(state: TaskV2["state"]): string {
   const labels: Record<TaskV2["state"], string> = {
-    admitted: "已接收",
-    preparing: "准备中",
-    running: "运行中",
-    cancelling: "取消中",
-    completed: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
-    closed: "已关闭",
-    waiting_for_successor: "等待进化",
+    admitted: "Admitted",
+    preparing: "Preparing",
+    running: "Running",
+    cancelling: "Cancelling",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    closed: "Closed",
+    waiting_for_successor: "Waiting for evolution",
   };
   return labels[state];
 }
@@ -591,7 +591,7 @@ export function DesktopProductApp({
       }
       setSelectedTaskId(submittedTask.task_id);
       rememberSelectedSession(project.project_id, submittedTask.task_id);
-      setActionStatus("Session 已启动，完成后的对话记录可用于后续进化。");
+      setActionStatus("Session started. Its completed transcript can be used in future Evolution runs.");
       return true;
     } catch (error) {
       setActionError(userMessageV2(error));
@@ -624,7 +624,7 @@ export function DesktopProductApp({
         await provider.activateProject(project.project_id, intentFor(snapshot, "activate-project"));
         const refreshed = await refresh();
         if (refreshed === null || refreshed.state.active_project_id !== projectId) {
-          throw new Error("切换后的 Project 状态尚未同步，请重试。");
+          throw new Error("The selected Project has not synchronized yet. Please try again.");
         }
         resolvedSelectionProjectId.current = projectId;
         setSelectedTaskId(preferredTaskIdV2(
@@ -686,16 +686,16 @@ export function DesktopProductApp({
         "--session-pane-width": `${sessionPaneWidth}px`,
       } as CSSProperties}
     >
-      <aside className="product-activitybar" aria-label="主导航">
+      <aside className="product-activitybar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop" title="OpenEvo Desktop">
           <span className="product-mark"><OpenEvoMark /></span>
         </div>
-        <nav className="product-nav" aria-label="工作区视图">
-          <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>研究</WorkspaceButton>
-          <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>进化</WorkspaceButton>
-          <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>系统</WorkspaceButton>
+        <nav className="product-nav" aria-label="Workspace views">
+          <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>Research</WorkspaceButton>
+          <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
+          <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>System</WorkspaceButton>
         </nav>
-        <button type="button" className="activitybar-settings" aria-label="远程工作区设置" title="远程工作区设置" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
+        <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
       </aside>
 
       <ProjectExplorerV2
@@ -733,38 +733,38 @@ export function DesktopProductApp({
 
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "文件" : "Session" : workspace === "evolution" ? "进化" : "系统"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
+          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
           <div className="topbar-actions">
             {displayedProject === null && connectedProfiles.length > 0 ? (
               <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
-                <FolderOpen size={15} /> 新建项目
+                <FolderOpen size={15} /> New project
               </button>
             ) : null}
             {activeProfile && activeProfile.profile_kind === "system_openssh" ? (
               <>
                 <div className={`connection-badge ${activeProfile.connection_state === "connected" ? "success" : "neutral"}`} title={`${activeProfile.display_name}: ${connectionLabel(activeProfile.connection_state)}`}><span className="status-dot" /><span>{activeProfile.display_name}</span><strong>{connectionLabel(activeProfile.connection_state)}</strong></div>
-                <button type="button" className="icon-button" aria-label="远程工作区设置" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
+                <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
               </>
             ) : (
-              <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> 添加远程工作区</button>
+              <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> Add remote workspace</button>
             )}
           </div>
         </header>
 
         <main className="product-main">
-          {loadError ? <Notice tone="error" title="刷新失败" detail={loadError} /> : null}
-          {actionError ? <Notice tone="error" title="操作未完成" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
+          {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
+          {actionError ? <Notice tone="error" title="Action not completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
           {developmentAgentBridge ? (
             <Notice
               tone="info"
-              title="远程 Agent 模式"
-              detail="回复来自远程 Codex CLI，Project 与 Session 历史由远程 daemon 持久化。"
+              title="Remote Agent mode"
+              detail="Replies come from the remote Codex CLI. Project and Session history are persisted by the remote daemon."
               compact
             />
           ) : null}
-          {actionStatus ? <Notice tone="success" title="操作成功" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
+          {actionStatus ? <Notice tone="success" title="Action completed" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
           {snapshot.stream.status !== "fresh" ? (
-            <Notice tone="warning" title="正在同步远程状态" detail="同步完成前，写入操作将暂时停用。" compact />
+            <Notice tone="warning" title="Synchronizing remote state" detail="Write actions remain paused until synchronization completes." compact />
           ) : null}
 
           {displayedProject === null ? (
@@ -807,18 +807,18 @@ export function DesktopProductApp({
               )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
-                "已提交 Session 取消请求。",
+                "Session cancellation requested.",
               )}
               onRetryTask={(task) => void act(
                 () => provider.retryTask(task.task_id, intentFor(snapshot, "retry-task")),
-                "已在同一 Session 记录下请求新的运行尝试。",
+                "A new run attempt was requested for the same Session admission.",
               )}
               onRetryEvolutionJob={(jobId) => void act(
                 async () => {
                   if (!provider.retryEvolutionJob) throw new Error("This backend does not support retrying an individual Evolution method.");
                   await provider.retryEvolutionJob(jobId, intentFor(snapshot, "retry-evolution-job"));
                 },
-                "失败的进化方法正在使用原始 Session 输入重新运行。",
+                "The failed Evolution method is running again with the original Session inputs.",
               )}
               onLoadTaskLogs={async (taskId) => {
                 setBusy(true);
@@ -834,11 +834,11 @@ export function DesktopProductApp({
               }}
               onRetryTransition={(transition) => void act(
                 () => provider.retryTransition(transition.transition.successor_transition_id, intentFor(snapshot, "retry-transition")),
-                "已提交后继版本重试请求。",
+                "Successor transition retry requested.",
               )}
               onAbandonTransition={(transition) => void act(
                 () => provider.abandonTransition(transition.transition.successor_transition_id, intentFor(snapshot, "abandon-transition")),
-                "已放弃该后继进化结果。",
+                "The successor Evolution result was abandoned.",
               )}
             />
           ) : workspace === "evolution" ? (
@@ -1515,15 +1515,15 @@ function ProjectExplorerV2({
   });
   return (
     <aside className="project-explorer" aria-label="Project explorer">
-      <div className="explorer-heading"><span>项目</span><button type="button" aria-label="新建项目" title="新建项目" disabled={busy || switching} onClick={onCreateProject}><Plus size={15} /></button></div>
+      <div className="explorer-heading"><span>Project</span><button type="button" aria-label="Create project" title="Create project" disabled={busy || switching} onClick={onCreateProject}><Plus size={15} /></button></div>
       <div className={`project-switcher-shell${switching ? " switching" : ""}`}>
-        <select id="v2-project-switcher" aria-label="选择项目" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || switching || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
-          {projects.length === 0 ? <option value="">暂无项目</option> : null}
+        <select id="v2-project-switcher" aria-label="Select project" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || switching || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
+          {projects.length === 0 ? <option value="">No projects</option> : null}
           {projects.map((project) => <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>)}
         </select>
-        {switching ? <span className="project-switching-indicator" role="status"><LoaderCircle className="spin" size={14} /> 正在切换</span> : null}
+        {switching ? <span className="project-switching-indicator" role="status"><LoaderCircle className="spin" size={14} /> Switching</span> : null}
       </div>
-      <div className="explorer-section-heading"><span>文件</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="选择要上传的文件" onChange={(event) => {
+      <div className="explorer-section-heading"><span>Files</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
         if (selectedFiles.length === 0) return;
@@ -1532,7 +1532,7 @@ function ProjectExplorerV2({
         if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
         onUpload(selectedFiles, hasCollision);
       }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={14} /></button></> : null}</div></div>
-      <div className="explorer-file-tree" role="tree" aria-label="项目工作区文件">
+      <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
         {visibleEntries.length ? visibleEntries.map((entry) => {
           const depth = Math.max(0, entry.path.split("/").length - 1);
           const name = entry.path.split("/").at(-1) ?? entry.path;
@@ -1551,11 +1551,11 @@ function ProjectExplorerV2({
             {entry.kind === "directory" ? <FolderOpen size={14} /> : <FileText size={14} />}
             <span title={entry.path}>{name}</span>
           </button>;
-        }) : <div className="explorer-empty">暂无文件</div>}
+        }) : <div className="explorer-empty">No files yet</div>}
       </div>
-      {workspace?.truncated ? <div className="explorer-warning">文件预览已截断。</div> : null}
-      <div className="explorer-foot"><CircleDot size={13} /><span>当前 Project Head {generation}</span></div>
-      <VerticalResizeHandle label="调整项目栏宽度" value={paneWidth} defaultValue={248} minimum={180} maximum={440} onChange={onResizePane} />
+      {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
+      <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
+      <VerticalResizeHandle label="Resize Project pane" value={paneWidth} defaultValue={248} minimum={180} maximum={440} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1614,25 +1614,25 @@ function SessionExplorerV2({
   };
   return (
     <aside className="session-explorer" aria-label="Project sessions">
-      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="新建 Session" title="新建 Session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
-      <div className="session-explorer-project" title={project?.display_name}>{project?.display_name ?? "未选择项目"}</div>
+      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="New Session" title="New Session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
+      <div className="session-explorer-project" title={project?.display_name}>{project?.display_name ?? "No Project selected"}</div>
       <div className="session-explorer-tools">
-        <label className="session-search"><Search size={13} /><input type="search" aria-label="搜索 Session" placeholder="搜索 Session" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-        <select aria-label="筛选 Session 状态" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
-          <option value="all">全部</option>
-          <option value="active">进行中</option>
-          <option value="completed">已完成</option>
-          <option value="failed">失败/取消</option>
+        <label className="session-search"><Search size={13} /><input type="search" aria-label="Search Sessions" placeholder="Search Sessions" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+        <select aria-label="Filter Sessions by status" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
+          <option value="all">All</option>
+          <option value="active">Active</option>
+          <option value="completed">Completed</option>
+          <option value="failed">Failed / cancelled</option>
         </select>
       </div>
-      <div className="session-result-count">显示 {visibleTasks.length} / {tasks.length}</div>
+      <div className="session-result-count">Showing {visibleTasks.length} of {tasks.length}</div>
       <div ref={listRef} className="session-explorer-list" onScroll={rememberScroll}>
         {visibleTasks.length ? visibleTasks.map((task, index) => {
           const title = presentation?.[task.task_id]?.instruction?.title ?? `Session ${sortedTasks.length - index}`;
           return <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)} title={title}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{taskStateLabelV2(task.state)}</em></button>;
-        }) : <div className="explorer-empty">{tasks.length ? "没有符合条件的 Session" : "暂无 Session，点击右上角 + 创建。"}</div>}
+        }) : <div className="explorer-empty">{tasks.length ? "No Sessions match the current filters" : "No Sessions yet. Use + to create one."}</div>}
       </div>
-      <VerticalResizeHandle label="调整 Session 栏宽度" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />
+      <VerticalResizeHandle label="Resize Session pane" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1855,7 +1855,7 @@ function ResearchWorkspaceV2({
         <div className="session-detail-navigation">
           <button type="button" className="session-back-button" onClick={() => onSelectTask(null)}>
             <ArrowLeft size={16} />
-            返回 {project.display_name}
+            Back to {project.display_name}
           </button>
         </div>
         <TaskAuthorityCardV2
@@ -1885,62 +1885,62 @@ function ResearchWorkspaceV2({
   return (
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
-        <div><p className="eyebrow">研究工作区</p><h1>{project.display_name}</h1><p>填写任务并选择要应用的 Project Head，随后启动新的 Session。</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> 编辑项目</button></div>
+        <div><p className="eyebrow">Research workspace</p><h1>{project.display_name}</h1><p>Define a task, choose the Project Head to apply, and start a new Session.</p></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button></div>
       </div>
       {visibleStartingSession ? (
         <div className="session-submit-progress" role="status">
           <LoaderCircle className="spin" size={17} />
-          <div><strong>{visibleStartingSession.phase === "validating" ? "正在校验 Session" : "正在启动 Session"}</strong><span>表单内容已保留，你仍可查看其他区域。</span></div>
+          <div><strong>{visibleStartingSession.phase === "validating" ? "Validating Session" : "Starting Session"}</strong><span>Your draft is preserved while you continue browsing.</span></div>
         </div>
       ) : null}
       {!ready ? (
         <div className="disabled-reason">
           <AlertCircle size={14} />
           <span>
-            <strong>暂时无法启动下一个任务。</strong>{" "}
+            <strong>The next task cannot start yet.</strong>{" "}
             {project.state === "not_ready" && project.active_project_head === null
-              ? "OpenEvo 正在准备远程服务和初始 Project Head，本页面会自动重试。"
-              : "请等待当前进化、设置、工作区或运行时变更完成。"}
+              ? "OpenEvo is preparing the remote service and initial Project Head. This page will retry automatically."
+              : "Wait for the current Evolution, settings, workspace, or runtime change to finish."}
           </span>
           {project.state === "not_ready" && project.active_project_head === null ? (
             <button type="button" className="text-button" disabled={formBusy} onClick={onRetryInitialization}>
-              立即重试
+              Retry now
             </button>
           ) : null}
         </div>
       ) : null}
       <div className="research-grid">
       <section className="product-panel task-panel" aria-busy={visibleStartingSession !== null}>
-        <div className="panel-heading"><div><span className="panel-kicker">Session 草稿</span><h2>希望 Agent 接下来做什么？</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "可启动" : "准备中"}</span></div>
+        <div className="panel-heading"><div><span className="panel-kicker">Session draft</span><h2>What should the Agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "Ready" : "Preparing"}</span></div>
         <div className="next-task-fields">
-          <label>任务标题<input maxLength={256} value={taskTitle} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
-          <label>任务说明<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
-          <label>进化上下文
+          <label>Task title<input maxLength={256} value={taskTitle} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
+          <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
+          <label>Evolution context
             <select value={selectedProjectHeadId} disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
-              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · 当前推荐" : " · 历史版本"}</option>)}
+              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}</option>)}
             </select>
           </label>
-          <p className="form-help">本次 Session 会固定使用所选 Project Head 的进化产物；选择历史版本不会改变已有 Session。</p>
+          <p className="form-help">This Session pins the selected Project Head and applies its evolved artifacts. Choosing a historical version does not change existing Sessions.</p>
         </div>
         {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
           <legend>Evolution after this session <span>Optional · formal contract</span></legend>
           <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
           <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
         </fieldset> : null}
-        {!taskValid ? <p className="form-error" role="status">请填写任务标题和任务说明。</p> : null}
-        <div className="brief-footer"><div><span>运行模式</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex 订阅" : "自部署"}</strong></div><div><span>记录</span><strong>Session 对话</strong></div><div><span>进化</span><strong>{sessionEvolutionAvailable ? `已选 ${selectedEvolutionCount} 项` : "单独运行"}</strong></div></div>
+        {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
+        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex subscription" : "Self-hosted"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? `${selectedEvolutionCount} selected` : "Run separately"}</strong></div></div>
         <div className="session-draft-actions">
-          <div><strong>{selectedProjectHead ? `Project Head ${selectedProjectHead.generation}` : "未选择 Project Head"}</strong><span>{sessionStartBlocked ? "进化运行期间暂不能启动" : "启动失败时将保留当前表单"}</span></div>
-          <button type="button" className="primary-button" disabled={formBusy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}>{formBusy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} {sessionStartBlocked ? "进化运行中" : visibleStartingSession ? "正在启动" : "启动 Session"}</button>
+          <div><strong>{selectedProjectHead ? `Project Head ${selectedProjectHead.generation}` : "No Project Head selected"}</strong><span>{sessionStartBlocked ? "Unavailable while Evolution is running" : "Your draft is preserved if startup fails"}</span></div>
+          <button type="button" className="primary-button" disabled={formBusy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}>{formBusy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} {sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting" : "Start session"}</button>
         </div>
       </section>
       <section className="product-panel active-run-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "最近的 Session" : "Session 状态"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "尚未选择 Session"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">就绪</span>}</div>
-        {observedTask ? <><div className="revision-pin"><div><span>固定上下文</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>接收方式</span><strong>不可变 Session 记录</strong></div><span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "该历史 Session 暂无任务说明。"}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "打开实时 Session" : "查看 Session 结果"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>取消 Session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>远程工作区就绪后即可启动 Session。</p></div>}
+        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected Session" : "Session status"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No Session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">Ready</span>}</div>
+        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Session admission</strong></div><span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "No task instructions are available for this historical Session."}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "Open live Session" : "Open Session result"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>Cancel Session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>Start a Session when the remote workspace is ready.</p></div>}
       </section>
       </div>
-      {project.active_project_head ? <details className="v2-authority-details"><summary>查看不可变 Project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
+      {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable Project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );
 }
@@ -2876,7 +2876,7 @@ function WorkspaceButton({ active, onClick, icon: Icon, children }: { readonly a
 }
 
 function Notice({ tone, title, detail, action, compact = false, onDismiss }: { readonly tone: "error" | "warning" | "success" | "info"; readonly title: string; readonly detail: string; readonly action?: React.ReactNode; readonly compact?: boolean; readonly onDismiss?: () => void }) {
-  return <div className={`v2-notice ${tone}${compact ? " compact" : ""}`} role={tone === "error" ? "alert" : "status"}>{tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}<div><strong>{title}</strong><span>{detail}</span></div>{action}{onDismiss ? <button type="button" className="icon-button" aria-label="关闭提示" onClick={onDismiss}><X size={15} /></button> : null}</div>;
+  return <div className={`v2-notice ${tone}${compact ? " compact" : ""}`} role={tone === "error" ? "alert" : "status"}>{tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}<div><strong>{title}</strong><span>{detail}</span></div>{action}{onDismiss ? <button type="button" className="icon-button" aria-label="Dismiss notice" onClick={onDismiss}><X size={15} /></button> : null}</div>;
 }
 
 function useDialogBoundary(onClose: () => void) {
@@ -2960,7 +2960,7 @@ function userMessageV2(error: unknown): string {
   if (error instanceof DesktopApiErrorV2) return error.apiError.summary;
   if (isDesktopErrorV2(error)) return error.summary;
   if (error instanceof Error && error.message.length > 0 && error.message.length <= 768) return error.message;
-  return "OpenEvo 未能完成该操作，请刷新远程状态后重试。";
+  return "OpenEvo could not complete this action. Refresh the remote state and try again.";
 }
 
 function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
@@ -2977,15 +2977,15 @@ function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
 
 function connectionLabel(state: RemoteWorkspaceProfileV2["connection_state"]): string {
   const labels: Record<RemoteWorkspaceProfileV2["connection_state"], string> = {
-    disconnected: "未连接",
-    connecting: "正在连接 OpenSSH",
-    prompt_pending: "等待本机认证",
-    host_key_review: "需要确认主机身份",
-    bootstrapping: "正在检查 OpenEvo Daemon",
-    negotiating: "正在协商 Core authority",
-    connected: "已连接",
-    disconnecting: "正在断开",
-    failed: "连接失败",
+    disconnected: "Disconnected",
+    connecting: "Connecting with OpenSSH",
+    prompt_pending: "Waiting for local authentication",
+    host_key_review: "Host identity review required",
+    bootstrapping: "Checking the OpenEvo daemon",
+    negotiating: "Negotiating Core authority",
+    connected: "Connected",
+    disconnecting: "Disconnecting",
+    failed: "Connection failed",
   };
   return labels[state];
 }

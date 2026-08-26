@@ -729,7 +729,7 @@ describe("Desktop v2 product renderer", () => {
   it("shows an explicit empty project state without demo authority", async () => {
     root = await render(providerFixture(baseSnapshot()));
 
-    expect(document.body.textContent).toContain("当前 Project Head");
+    expect(document.body.textContent).toContain("Active Project Head");
     expect(document.body.textContent).toContain("No project yet");
     expect(document.body.textContent).not.toContain("Demo Project Head");
   });
@@ -772,7 +772,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-activitybar")).toBeTruthy();
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
-    const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="调整项目栏宽度"]');
+    const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize Project pane"]');
     expect(projectResizer).toBeTruthy();
     await act(async () => projectResizer!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
     expect(document.querySelector<HTMLElement>(".product-v2-shell")?.style.getPropertyValue("--project-pane-width")).toBe("260px");
@@ -1135,7 +1135,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Unsupported conclusions are marked as hypotheses",
     );
-    expect(document.body.textContent).not.toContain("Session 草稿");
+    expect(document.body.textContent).not.toContain("Session draft");
     expect(document.querySelector(".session-explorer")).toBeTruthy();
 
     await click("Back to Protein study");
@@ -1143,7 +1143,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
-    expect(document.body.textContent).toContain("Session 草稿");
+    expect(document.body.textContent).toContain("Session draft");
     expect(document.querySelector(".session-explorer-list")).toBeTruthy();
   });
 
@@ -1305,7 +1305,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".session-submit-progress")).toBeTruthy();
     expect(document.querySelector('[data-testid="research-workspace"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
-    expect(document.body.textContent).toContain("正在启动 Session");
+    expect(document.body.textContent).toContain("Starting Session");
 
     await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1495,7 +1495,7 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     const createProject = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="新建项目"]',
+      'button[aria-label="Create project"]',
     );
     expect(createProject).toBeTruthy();
     await act(async () => createProject!.click());
@@ -1674,7 +1674,7 @@ describe("Desktop v2 product renderer", () => {
     const sessionButtons = () => [...document.querySelectorAll<HTMLButtonElement>(".session-explorer-list > button")];
     expect(sessionButtons()[0]?.title).toBe("Newest running session");
 
-    const search = document.querySelector<HTMLInputElement>('input[aria-label="搜索 Session"]')!;
+    const search = document.querySelector<HTMLInputElement>('input[aria-label="Search Sessions"]')!;
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
       setter?.call(search, "failed");
@@ -1686,7 +1686,7 @@ describe("Desktop v2 product renderer", () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
       setter?.call(search, "");
       search.dispatchEvent(new Event("input", { bubbles: true }));
-      const filter = document.querySelector<HTMLSelectElement>('select[aria-label="筛选 Session 状态"]')!;
+      const filter = document.querySelector<HTMLSelectElement>('select[aria-label="Filter Sessions by status"]')!;
       filter.value = "active";
       filter.dispatchEvent(new Event("change", { bubbles: true }));
     });
@@ -1760,7 +1760,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
-    expect(document.body.textContent).not.toContain("Session 草稿");
+    expect(document.body.textContent).not.toContain("Session draft");
     expect(
       [...document.querySelectorAll("button")].some((candidate) =>
         candidate.textContent?.includes("Start session"),
@@ -1796,7 +1796,7 @@ describe("Desktop v2 product renderer", () => {
 
     expect(button("Start session").disabled).toBe(true);
     expect(document.body.textContent).toContain(
-      "OpenEvo 正在准备远程服务和初始 Project Head",
+      "OpenEvo is preparing the remote service and initial Project Head",
     );
 
     const refreshCalls = provider.refresh.mock.calls.length;
@@ -1884,8 +1884,8 @@ describe("Desktop v2 product renderer", () => {
     expect(cancelTask).toHaveBeenCalledWith("task-1", expect.objectContaining({ streamEpoch: 1 }));
 
     await click("Back to Protein study");
-    expect(document.body.textContent).toContain("打开实时 Session");
-    expect(document.body.textContent).toContain("取消 Session");
+    expect(document.body.textContent).toContain("Open live Session");
+    expect(document.body.textContent).toContain("Cancel Session");
   });
 
   it("hides the transient Agent activity after the Session is complete", async () => {
@@ -2459,23 +2459,12 @@ async function render(provider: DesktopProductProviderV2): Promise<Root> {
   return root;
 }
 
-const TEST_LABEL_ALIASES: Readonly<Record<string, string>> = {
-  "Add remote workspace": "添加远程工作区",
-  Evolution: "进化",
-  System: "系统",
-  "Task title": "任务标题",
-  "Task instructions": "任务说明",
-  "Start session": "启动 Session",
-  "Evolution running": "进化运行中",
-  "Retry now": "立即重试",
-  "Back to Protein study": "返回 Protein study",
-};
+const TEST_LABEL_ALIASES: Readonly<Record<string, string>> = {};
 
 function button(label: string): HTMLButtonElement {
-  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const match = [
     ...document.querySelectorAll<HTMLButtonElement>("button"),
-  ].find((candidate) => candidate.textContent?.trim().includes(localized));
+  ].find((candidate) => candidate.textContent?.trim().includes(label));
   if (!match) throw new Error(`button not found: ${label}`);
   return match;
 }
