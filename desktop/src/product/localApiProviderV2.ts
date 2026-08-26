@@ -72,6 +72,29 @@ const MAX_REFRESH_RESOURCES = 20_000;
 const MAX_SSE_BUFFER_BYTES = 1_048_580;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 const RESOURCE_POLL_DELAYS_MS = [500, 1_000, 2_000, 4_000] as const;
+const TASK_DETAIL_LOAD_CONCURRENCY = 4;
+
+async function mapWithConcurrencyV2<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const runners = Array.from(
+    { length: Math.min(Math.max(1, concurrency), items.length) },
+    async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index]!, index);
+      }
+    },
+  );
+  await Promise.all(runners);
+  return results;
+}
 
 export interface LocalApiNativeBridgeV2 {
   selectProjectSource(intent: NativeWorkspaceSelectionIntentV2): Promise<unknown>;
@@ -1114,10 +1137,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       return this.localOnlySnapshot(state, catalog, profiles);
     }
     activeConnectedProfile({ state, profiles });
-    // All remote reads share one generation-bound system-OpenSSH tunnel.  Keep
-    // one ordered read stream here, matching the proven development daemon's
-    // single-state-snapshot behavior.  Parallel HTTP reads caused intermittent
-    // 503s from an otherwise healthy tunnel immediately after Task admission.
+    // Top-level authority reads remain ordered across the generation-bound
+    // system-OpenSSH tunnel. Per-Task detail projections use a small bounded
+    // worker pool below so a Project with many Sessions does not pay every SSH
+    // round trip serially or create an unbounded request burst.
     const projects = await collectPages((options) => this.client.listProjects(options));
     const tasks = await collectPages((options) => this.client.listTasks({
       ...options,
@@ -1127,15 +1150,18 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const activeProject = projects.find((project) => project.project_id === state.active_project_id);
     if (!activeProject) throw new DesktopContractErrorV2("Active project is absent from the remote project collection");
     const capability = await this.client.projectCapabilities(activeProject.project_id);
-    const taskDetails = [];
-    for (const task of tasks) {
-      const timeline = await collectPages((options) => this.client.taskTimeline(task.task_id, options));
-      const artifacts = await collectPages((options) => this.client.taskArtifacts(task.task_id, options));
-      const transition = task.successor_transition === null
-        ? null
-        : await this.client.getTransition(task.successor_transition.successor_transition_id);
-      taskDetails.push({ task, timeline, artifacts, transition });
-    }
+    const taskDetails = await mapWithConcurrencyV2(
+      tasks,
+      TASK_DETAIL_LOAD_CONCURRENCY,
+      async (task) => {
+        const timeline = await collectPages((options) => this.client.taskTimeline(task.task_id, options));
+        const artifacts = await collectPages((options) => this.client.taskArtifacts(task.task_id, options));
+        const transition = task.successor_transition === null
+          ? null
+          : await this.client.getTransition(task.successor_transition.successor_transition_id);
+        return { task, timeline, artifacts, transition };
+      },
+    );
     const timelines: Record<string, readonly CoreEventEnvelopeV2[]> = {};
     const transitions: Record<string, SuccessorTransitionV2> = {};
     const artifactsById = new Map<string, ArtifactV2>();

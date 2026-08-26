@@ -760,6 +760,86 @@ describe("Desktop v2 product provider", () => {
     expect(client.taskArtifacts).toHaveBeenCalledWith("task-1", { limit: 100 });
   });
 
+  it("loads Session details with bounded concurrency", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-1",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-1",
+    });
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        project_id: "project-1",
+        config: { execution: { mode: "codex_subscription_transcript" } },
+      }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    const tasks = Array.from({ length: 9 }, (_, index) => ({
+      task_id: `task-${index + 1}`,
+      project_id: "project-1",
+      state: "completed",
+      successor_transition: null,
+    }));
+    vi.mocked(client.listTasks).mockResolvedValue({
+      schema_version: "2",
+      items: tasks,
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listServices).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.projectCapabilities).mockResolvedValue({
+      project_id: "project-1",
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+    } as never);
+    let activeRequests = 0;
+    let maximumActiveRequests = 0;
+    const delayedPage = async () => {
+      activeRequests += 1;
+      maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      activeRequests -= 1;
+      return {
+        schema_version: "2" as const,
+        items: [],
+        next_cursor: null,
+        has_more: false,
+      };
+    };
+    vi.mocked(client.taskTimeline).mockImplementation(delayedPage);
+    vi.mocked(client.taskArtifacts).mockImplementation(delayedPage);
+
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+    expect(result.snapshot.tasks.map((task) => task.task_id)).toEqual(
+      tasks.map((task) => task.task_id),
+    );
+    expect(maximumActiveRequests).toBe(4);
+  });
+
   it("creates a profile from an alias only and uses catalog generation authority", async () => {
     const client = clientFixture();
     const created = profile();

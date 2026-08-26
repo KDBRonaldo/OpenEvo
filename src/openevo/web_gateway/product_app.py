@@ -511,9 +511,12 @@ class DevelopmentAgentDesktopV2Provider:
             }
         )
 
-    def _project_models(self, state: Mapping[str, object]) -> list[core.ProjectV2]:
+    def _project_models(
+        self,
+        state: Mapping[str, object],
+        observations: list[DevelopmentTaskObservationV2],
+    ) -> list[core.ProjectV2]:
         result = []
-        observations = self._task_observations_v2()
         for raw in state.get("projects", []):
             config = core.ScienceProjectConfigV2.model_validate(raw["config"])
             sessions = [
@@ -537,13 +540,29 @@ class DevelopmentAgentDesktopV2Provider:
             )
         return result
 
+    def _project_projection(
+        self, state: Mapping[str, object] | None = None
+    ) -> tuple[
+        list[core.ProjectV2],
+        list[DevelopmentTaskObservationV2],
+        dict[str, list[core.ProjectHeadRefV2]],
+    ]:
+        effective_state = state if state is not None else self._remote_state()
+        observations = self._task_observations_v2()
+        projects = self._project_models(effective_state, observations)
+        heads = {
+            project.project_id: self._available_project_heads(project, observations)
+            for project in projects
+        }
+        return projects, observations, heads
+
     def _projects(self, _: Mapping[str, object]) -> core.ProjectPageV2:
-        state = self._remote_state()
-        projects = self._project_models(state)
+        projects, _, _ = self._project_projection(self._remote_state())
         return core.ProjectPageV2(items=projects, next_cursor=None, has_more=False)
 
     def _find_project(self, project_id: object) -> core.ProjectV2:
-        for project in self._project_models(self._remote_state()):
+        projects, _, _ = self._project_projection(self._remote_state())
+        for project in projects:
             if project.project_id == project_id:
                 return project
         raise HTTPException(status_code=404, detail="project not found")
@@ -553,18 +572,23 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _project_head(self, arguments: Mapping[str, object]) -> core.ProjectHeadRefV2:
         project_head_id = str(arguments.get("project_head_id"))
-        for project in self._project_models(self._remote_state()):
-            for head in self._available_project_heads(project):
+        projects, _, heads_by_project = self._project_projection(self._remote_state())
+        for project in projects:
+            for head in heads_by_project[project.project_id]:
                 if head.project_head_id == project_head_id:
                     return head
         raise HTTPException(status_code=404, detail="project head not found")
 
-    def _available_project_heads(self, project: core.ProjectV2) -> list[core.ProjectHeadRefV2]:
+    def _available_project_heads(
+        self,
+        project: core.ProjectV2,
+        observations: list[DevelopmentTaskObservationV2],
+    ) -> list[core.ProjectHeadRefV2]:
         active = project.active_project_head
         assert active is not None
         generation_by_id = {active.project_head_id: active.generation}
         legacy_generation = 0
-        for observation in self._task_observations_v2():
+        for observation in observations:
             if observation.project_id != project.project_id:
                 continue
             head_id = observation.project_head_id or (
@@ -706,6 +730,7 @@ class DevelopmentAgentDesktopV2Provider:
         project: core.ProjectV2,
         ordinal: int,
         legacy_generation: int,
+        available_heads: list[core.ProjectHeadRefV2],
     ) -> core.TaskV2:
         task_id = observation.task_id
         selected_head_id = observation.project_head_id or (
@@ -714,7 +739,7 @@ class DevelopmentAgentDesktopV2Provider:
         head = next(
             (
                 candidate
-                for candidate in self._available_project_heads(project)
+                for candidate in available_heads
                 if candidate.project_head_id == selected_head_id
             ),
             None,
@@ -796,8 +821,8 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _all_tasks(self) -> list[core.TaskV2]:
         state = self._remote_state()
-        projects = {p.project_id: p for p in self._project_models(state)}
-        observations = self._task_observations_v2()
+        projected_projects, observations, heads_by_project = self._project_projection(state)
+        projects = {project.project_id: project for project in projected_projects}
         tasks = []
         project_ordinals: dict[str, int] = {}
         project_legacy_generations: dict[str, int] = {}
@@ -811,7 +836,13 @@ class DevelopmentAgentDesktopV2Provider:
             project_ordinals[observation.project_id] = ordinal
             legacy_generation = project_legacy_generations.get(observation.project_id, 0)
             tasks.append(
-                self._task_model(observation, project, ordinal, legacy_generation)
+                self._task_model(
+                    observation,
+                    project,
+                    ordinal,
+                    legacy_generation,
+                    heads_by_project[project.project_id],
+                )
             )
             if observation.state == "closed":
                 project_legacy_generations[observation.project_id] = legacy_generation + 1
@@ -835,11 +866,17 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _submit_task(self, arguments: Mapping[str, object]) -> core.TaskV2:
         request = arguments["request"]
-        project = self._find_project(request.project_id)
+        projects, _, heads_by_project = self._project_projection(self._remote_state())
+        project = next(
+            (candidate for candidate in projects if candidate.project_id == request.project_id),
+            None,
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
         selected_head = next(
             (
                 head
-                for head in self._available_project_heads(project)
+                for head in heads_by_project[project.project_id]
                 if head.project_head_id == request.expected_project_head_id
             ),
             None,

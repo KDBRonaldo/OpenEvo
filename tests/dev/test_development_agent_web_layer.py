@@ -29,6 +29,7 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 class FakeDaemonClient:
     def __init__(self) -> None:
         self.state_requests = 0
+        self.task_observation_requests = 0
         self.state = {
             "schema_version": "1",
             "active_project_id": None,
@@ -199,6 +200,7 @@ class FakeDaemonClient:
             session["updated_at"] = "2026-08-23T00:00:02Z"
             return self._task_presentation(session)
         if parsed.path == "/tasks":
+            self.task_observation_requests += 1
             items = []
             for session in self.state["sessions"]:
                 state = "closed" if session["state"] == "completed" else session["state"]
@@ -1320,12 +1322,15 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
 
     projects = provider.invoke("listDesktopProjectsV2", {})
+    assert fake.task_observation_requests == 1
+    fake.task_observation_requests = 0
     tasks = provider.invoke("listDesktopTasksV2", {"project_id": "project-1"})
 
     assert projects.items[0].active_project_head.project_id == "project-1"
     assert tasks.items[0].task_id == "session-1"
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
+    assert fake.task_observation_requests == 1
 
 
 def test_provider_submits_session_against_selected_historical_project_head() -> None:
