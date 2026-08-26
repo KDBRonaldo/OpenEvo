@@ -32,6 +32,9 @@ class _Store:
         assert project_id == "project-1"
         return self.contexts
 
+    def artifact(self, artifact_id: str) -> dict[str, Any]:
+        return next(item for item in self.contexts if item["artifact_id"] == artifact_id)
+
     def append_session_log(self, session_id: str, message: str) -> None:
         assert session_id == "session-1"
         self.logs.append(message)
@@ -100,6 +103,43 @@ def test_agent_session_executor_commits_workspace_and_result(tmp_path: Path) -> 
     assert (store.workspace_path("project-1") / "answer.txt").read_text(
         encoding="utf-8"
     ) == "persistent answer\n"
+
+
+def test_agent_session_executor_uses_project_head_pinned_context(tmp_path: Path) -> None:
+    store = _Store(tmp_path)
+    store.contexts = [
+        {
+            "artifact_id": "memory-old",
+            "project_id": "project-1",
+            "artifact_type": "text_memory",
+        },
+        {
+            "artifact_id": "memory-current",
+            "project_id": "project-1",
+            "artifact_type": "text_memory",
+        },
+    ]
+    captured: dict[str, Any] = {}
+
+    class Runner:
+        def run(self, request: dict[str, Any], **_: Any) -> dict[str, Any]:
+            captured.update(request)
+            return {
+                "response": "Done",
+                "model": "test-model",
+                "duration_ms": 5,
+                "logs": [],
+            }
+
+    AgentSessionExecutor(store=store, runner=Runner()).execute(
+        "session-1",
+        {**REQUEST, "context_artifact_ids": ["memory-old"]},
+        HarnessCancellation(),
+    )
+
+    assert [item["artifact_id"] for item in captured["evolved_contexts"]] == [
+        "memory-old"
+    ]
 
 
 def test_agent_session_executor_records_cancellation_and_agent_failure(

@@ -65,6 +65,7 @@ class SqliteSessionStore:
             CREATE TABLE IF NOT EXISTS development_sessions (
                 session_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                project_head_id TEXT,
                 task_title TEXT NOT NULL,
                 instruction TEXT NOT NULL,
                 response TEXT,
@@ -95,6 +96,7 @@ class SqliteSessionStore:
             for row in connection.execute("PRAGMA table_info(development_sessions)")
         }
         additions = (
+            ("project_head_id", "TEXT"),
             ("selected_evolution_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("evolution_errors_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("workspace_changes_json", "TEXT NOT NULL DEFAULT '[]'"),
@@ -114,6 +116,19 @@ class SqliteSessionStore:
                 connection.execute(
                     f"ALTER TABLE development_sessions ADD COLUMN {name} {declaration}"
                 )
+        generation_by_project: dict[str, int] = {}
+        for row in connection.execute(
+            "SELECT session_id, project_id, project_head_id, state "
+            "FROM development_sessions ORDER BY created_at, session_id"
+        ).fetchall():
+            generation = generation_by_project.get(row["project_id"], 0)
+            if row["project_head_id"] is None:
+                connection.execute(
+                    "UPDATE development_sessions SET project_head_id = ? WHERE session_id = ?",
+                    (f"{row['project_id']}-head-{generation}", row["session_id"]),
+                )
+            if row["state"] == "completed":
+                generation_by_project[row["project_id"]] = generation + 1
         connection.execute(
             "UPDATE development_sessions SET runtime_activation_json = 'null' "
             "WHERE runtime_activation_json = '{}'"
@@ -171,7 +186,7 @@ class SqliteSessionStore:
                 occurred_at=occurred_at,
             )
 
-    def start(self, session_id: str, request: dict[str, str]) -> None:
+    def start(self, session_id: str, request: dict[str, Any]) -> None:
         now = self._clock()
         with self._lock, self._connection_factory() as connection:
             project = connection.execute(
@@ -184,36 +199,32 @@ class SqliteSessionStore:
                 raise SessionConflictError(
                     "project_name does not match the persisted project"
                 )
-            context_rows = connection.execute(
-                """
-                SELECT artifact.artifact_id
-                FROM development_evolution_artifacts_v2 AS artifact
-                JOIN (
-                    SELECT target_id, MAX(created_at || artifact_id) AS latest
-                    FROM development_evolution_artifacts_v2
-                    WHERE project_id = ? AND artifact_type != 'report' AND promoted = 1
-                    GROUP BY target_id
-                ) AS selected
-                  ON selected.target_id = artifact.target_id
-                 AND selected.latest = artifact.created_at || artifact.artifact_id
-                WHERE artifact.project_id = ?
-                ORDER BY artifact.target_id
-                """,
-                (request["project_id"], request["project_id"]),
-            ).fetchall()
-            context_artifact_ids = [row["artifact_id"] for row in context_rows]
+            project_head_id = request.get("project_head_id")
+            if project_head_id is None:
+                completed_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM development_sessions "
+                    "WHERE project_id = ? AND state = 'completed'",
+                    (request["project_id"],),
+                ).fetchone()["count"]
+                project_head_id = f"{request['project_id']}-head-{completed_count}"
+            context_artifact_ids = self._context_artifact_ids_for_head(
+                connection,
+                project_id=request["project_id"],
+                project_head_id=project_head_id,
+            )
             connection.execute(
                 """
                 INSERT INTO development_sessions(
-                    session_id, project_id, task_title, instruction, response, model,
+                    session_id, project_id, project_head_id, task_title, instruction, response, model,
                     state, duration_ms, logs_json, selected_evolution_json,
                     evolution_errors_json, workspace_changes_json,
                     context_artifact_ids_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', ?, NULL, ?, ?)
                 """,
                 (
                     session_id,
                     request["project_id"],
+                    project_head_id,
                     request["task_title"],
                     request["instruction"],
                     _canonical_json(["Remote development daemon admitted the session."]),
@@ -244,6 +255,68 @@ class SqliteSessionStore:
                 event_type="attempt_appended",
                 occurred_at=now,
             )
+
+    @staticmethod
+    def _context_artifact_ids_for_head(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        project_head_id: str | None,
+    ) -> list[str]:
+        """Resolve an immutable historical context snapshot for one Project Head.
+
+        A head already used by a Session reuses that Session's pinned artifact
+        inventory. The current synthetic bridge head resolves to the promoted
+        context at admission time. Legacy callers without a head retain the
+        previous current-context behavior.
+        """
+
+        if project_head_id is not None:
+            historical = connection.execute(
+                """
+                SELECT context_artifact_ids_json
+                FROM development_sessions
+                WHERE project_id = ? AND project_head_id = ?
+                ORDER BY created_at, session_id
+                LIMIT 1
+                """,
+                (project_id, project_head_id),
+            ).fetchone()
+            if historical is not None:
+                return list(json.loads(historical["context_artifact_ids_json"]))
+
+            completed_count = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM development_sessions
+                WHERE project_id = ? AND state = 'completed'
+                """,
+                (project_id,),
+            ).fetchone()["count"]
+            current_project_head_id = f"{project_id}-head-{completed_count}"
+            if project_head_id != current_project_head_id:
+                raise SessionConflictError(
+                    "project_head_id is not an available Project Head for this Project"
+                )
+
+        context_rows = connection.execute(
+            """
+            SELECT artifact.artifact_id
+            FROM development_evolution_artifacts_v2 AS artifact
+            JOIN (
+                SELECT target_id, MAX(created_at || artifact_id) AS latest
+                FROM development_evolution_artifacts_v2
+                WHERE project_id = ? AND artifact_type != 'report' AND promoted = 1
+                GROUP BY target_id
+            ) AS selected
+              ON selected.target_id = artifact.target_id
+             AND selected.latest = artifact.created_at || artifact.artifact_id
+            WHERE artifact.project_id = ?
+            ORDER BY artifact.target_id
+            """,
+            (project_id, project_id),
+        ).fetchall()
+        return [row["artifact_id"] for row in context_rows]
 
     def complete(self, session_id: str, result: dict[str, Any]) -> None:
         now = self._clock()
@@ -477,6 +550,7 @@ class SqliteSessionStore:
         return {
             "session_id": row["session_id"],
             "project_id": row["project_id"],
+            "project_head_id": row["project_head_id"],
             "task_title": row["task_title"],
             "instruction": row["instruction"],
             "response": row["response"],

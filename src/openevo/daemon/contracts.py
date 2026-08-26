@@ -23,6 +23,7 @@ class DevelopmentTaskObservationV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     task_id: core.OpaqueId
     project_id: core.OpaqueId
+    project_head_id: core.OpaqueId | None = None
     state: core.TaskStateV2
     created_at: core.UtcTimestamp
     updated_at: core.UtcTimestamp
@@ -39,6 +40,7 @@ class DevelopmentTaskCreateV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     action_id: core.OpaqueId
     project_id: core.OpaqueId
+    project_head_id: core.OpaqueId | None = None
     project_name: str = Field(min_length=1, max_length=512)
     task_title: str = Field(min_length=1, max_length=4_096)
     instruction: str = Field(min_length=1, max_length=256 * 1024)
@@ -84,6 +86,7 @@ class DevelopmentTaskPresentationV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     task_id: core.OpaqueId
     project_id: core.OpaqueId
+    project_head_id: core.OpaqueId | None = None
     task_title: str = Field(min_length=1, max_length=4_096)
     instruction: str = Field(min_length=1, max_length=256 * 1024)
     response: str | None = Field(default=None, max_length=4 * 1024 * 1024)

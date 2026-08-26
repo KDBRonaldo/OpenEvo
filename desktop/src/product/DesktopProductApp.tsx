@@ -38,6 +38,7 @@ import { DesktopApiErrorV2 } from "../api/v2/client";
 import type { LogEntryV2 } from "../api/v2/logs";
 import type {
   DesktopErrorV2,
+  ProjectHeadRefV2,
   ProjectV2,
   RemoteProfileV2,
   RemoteWorkspaceProfileV2,
@@ -66,6 +67,7 @@ type Workspace = "research" | "evolution" | "system";
 
 type StartingSessionV2 = {
   readonly projectId: string;
+  readonly projectHeadGeneration: number;
   readonly task: ScienceProjectConfigV2["task"];
   readonly phase: "validating" | "admitting";
 };
@@ -179,6 +181,22 @@ function withSessionDocumentEvolution(
   targets: ScienceProjectConfigV2["evolution"]["targets"],
 ): ScienceProjectConfigV2 {
   return { ...config, task, evolution: { targets } } as ScienceProjectConfigV2;
+}
+
+function availableProjectHeadsV2(
+  project: ProjectV2,
+  tasks: readonly TaskV2[],
+): readonly ProjectHeadRefV2[] {
+  const heads = new Map<string, ProjectHeadRefV2>();
+  if (project.active_project_head !== null) {
+    heads.set(project.active_project_head.project_head_id, project.active_project_head);
+  }
+  for (const task of tasks) {
+    if (task.project_id !== project.project_id) continue;
+    const head = task.admission.predecessor_project_head;
+    heads.set(head.project_head_id, head);
+  }
+  return [...heads.values()].sort((left, right) => right.generation - left.generation);
 }
 
 export interface DesktopProductAppProps {
@@ -399,12 +417,18 @@ export function DesktopProductApp({
     project: ProjectV2,
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
+    selectedProjectHead: ProjectHeadRefV2,
   ): Promise<boolean> => {
     if (project.state !== "ready") return false;
     setWorkspace("research");
     setSelectedWorkspacePath(null);
     setSelectedTaskId(null);
-    setStartingSession({ projectId: project.project_id, task, phase: "validating" });
+    setStartingSession({
+      projectId: project.project_id,
+      projectHeadGeneration: selectedProjectHead.generation,
+      task,
+      phase: "validating",
+    });
     setBusy(true);
     setActionError(null);
     setActionStatus(null);
@@ -460,8 +484,22 @@ export function DesktopProductApp({
       }
       currentSnapshot = validatedSnapshot;
       currentProject = validatedProject;
-      setStartingSession({ projectId: currentProject.project_id, task, phase: "admitting" });
-      const submittedTask = await provider.submitTask(currentProject.project_id, intentFor(currentSnapshot, "submit-task"));
+      const admissionHead = availableProjectHeadsV2(currentProject, currentSnapshot.tasks)
+        .find((head) => head.project_head_id === selectedProjectHead.project_head_id);
+      if (admissionHead === undefined) {
+        throw new Error("The selected Project Head is no longer available for this Session.");
+      }
+      setStartingSession({
+        projectId: currentProject.project_id,
+        projectHeadGeneration: admissionHead.generation,
+        task,
+        phase: "admitting",
+      });
+      const submittedTask = await provider.submitTask(
+        currentProject.project_id,
+        intentFor(currentSnapshot, "submit-task"),
+        admissionHead,
+      );
       const submittedSnapshot = await refresh();
       if (submittedSnapshot === null || !submittedSnapshot.tasks.some((candidate) => candidate.task_id === submittedTask.task_id)) {
         throw new Error("The admitted Session was not visible in the refreshed remote state.");
@@ -650,7 +688,9 @@ export function DesktopProductApp({
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
-              onRun={(task, selectedEvolutionTargets) => runProject(displayedProject, task, selectedEvolutionTargets)}
+              onRun={(task, selectedEvolutionTargets, projectHead) => (
+                runProject(displayedProject, task, selectedEvolutionTargets, projectHead)
+              )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
                 "Task cancellation requested.",
@@ -1466,7 +1506,7 @@ function StartingSessionChatV2({
   return (
     <div className="workspace-stack session-detail-workspace" data-testid="starting-session-workspace">
       <div className="session-detail-navigation">
-        <span className="session-starting-label">Starting a new Session in {project.display_name}</span>
+        <span className="session-starting-label">Starting a new Session in {project.display_name} · Project Head {session.projectHeadGeneration}</span>
       </div>
       <article className="product-panel v2-starting-session-card">
         <section className="v2-conversation-section session-chat-canvas" aria-label="Starting Session conversation">
@@ -1536,6 +1576,7 @@ function ResearchWorkspaceV2({
   readonly onRun: (
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
+    projectHead: ProjectHeadRefV2,
   ) => Promise<boolean>;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
@@ -1562,6 +1603,13 @@ function ResearchWorkspaceV2({
     }
   }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, tasks, visibleStartingSession]);
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
+  const availableProjectHeads = useMemo(
+    () => availableProjectHeadsV2(project, projectTasks),
+    [project, projectTasks],
+  );
+  const [selectedProjectHeadId, setSelectedProjectHeadId] = useState(
+    project.active_project_head?.project_head_id ?? "",
+  );
   const [taskTitle, setTaskTitle] = useState(project.config.task.title);
   const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
   const sessionEvolutionCapabilities = useMemo(() => (
@@ -1598,6 +1646,13 @@ function ResearchWorkspaceV2({
     setTaskObjective(project.config.task.objective);
     setSelectedEvolutionTargets(initialSessionEvolutionTargets());
   }, [initialSessionEvolutionTargets, project.project_id, project.project_config_sha256]);
+  useEffect(() => {
+    if (availableProjectHeads.some((head) => head.project_head_id === selectedProjectHeadId)) return;
+    setSelectedProjectHeadId(project.active_project_head?.project_head_id ?? "");
+  }, [availableProjectHeads, project.active_project_head?.project_head_id, selectedProjectHeadId]);
+  const selectedProjectHead = availableProjectHeads.find(
+    (head) => head.project_head_id === selectedProjectHeadId,
+  ) ?? null;
   const selectedEvolutionCount = Object.values(selectedEvolutionTargets).filter((target) => target.enabled).length;
   const normalizedTask = {
     title: taskTitle.trim(),
@@ -1605,10 +1660,16 @@ function ResearchWorkspaceV2({
   };
   const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
   const startDraftSession = async (): Promise<void> => {
-    const optimistic = { projectId: project.project_id, task: normalizedTask, phase: "validating" as const };
+    if (selectedProjectHead === null) return;
+    const optimistic = {
+      projectId: project.project_id,
+      projectHeadGeneration: selectedProjectHead.generation,
+      task: normalizedTask,
+      phase: "validating" as const,
+    };
     setOptimisticStartingSession(optimistic);
     try {
-      await onRun(normalizedTask, selectedEvolutionTargets);
+      await onRun(normalizedTask, selectedEvolutionTargets, selectedProjectHead);
     } finally {
       setOptimisticStartingSession(null);
     }
@@ -1643,7 +1704,9 @@ function ResearchWorkspaceV2({
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
           canContinue={ready && activeTask === null && !sessionStartBlocked}
-          onContinue={(task) => onRun(task, selectedEvolutionTargets)}
+          onContinue={(task) => selectedProjectHead === null
+            ? Promise.resolve(false)
+            : onRun(task, selectedEvolutionTargets, selectedProjectHead)}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
           onRetryEvolutionJob={onRetryEvolutionJob}
@@ -1657,8 +1720,8 @@ function ResearchWorkspaceV2({
   return (
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
-        <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task at a time against the current Project Head.</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" disabled={busy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || sessionStartBlocked || !ready || !taskValid} onClick={() => void startDraftSession()}><Play size={15} fill="currentColor" /> {sessionStartBlocked ? "Evolution running" : "Start session"}</button></div>
+        <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task against the Project Head whose evolved context you want to use.</p></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" disabled={busy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}><Play size={15} fill="currentColor" /> {sessionStartBlocked ? "Evolution running" : "Start session"}</button></div>
       </div>
       {!ready ? (
         <div className="disabled-reason">
@@ -1682,7 +1745,12 @@ function ResearchWorkspaceV2({
         <div className="next-task-fields">
           <label>Task title<input maxLength={256} value={taskTitle} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
           <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
-          <p className="form-help">Starting the session saves these instructions and runs them as the next task.</p>
+          <label>Evolution context
+            <select value={selectedProjectHeadId} disabled={busy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
+              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " — active" : " — historical"}</option>)}
+            </select>
+          </label>
+          <p className="form-help">The Session pins this Project Head and applies its evolved artifacts as Agent context. Historical Sessions remain reproducible.</p>
         </div>
         {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy || sessionStartBlocked}>
           <legend>Evolution after this session <span>Optional · formal contract</span></legend>

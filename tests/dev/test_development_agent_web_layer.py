@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 from fastapi.testclient import TestClient
 
 from desktop.sidecar.contracts.v2 import models as m
+from openevo.backend.contracts.v2 import models as core_m
 from openevo.web_gateway.product_app import (
     DevelopmentDaemonClient,
     DevelopmentDaemonEventCursorExpired,
@@ -169,6 +170,7 @@ class FakeDaemonClient:
                 existing = {
                     "session_id": session_id,
                     "project_id": body["project_id"],
+                    "project_head_id": body.get("project_head_id"),
                     "task_title": body["task_title"],
                     "instruction": body["instruction"],
                     "response": None,
@@ -204,6 +206,7 @@ class FakeDaemonClient:
                     "schema_version": "2",
                     "task_id": session["session_id"],
                     "project_id": session["project_id"],
+                    "project_head_id": session.get("project_head_id"),
                     "state": state,
                     "created_at": session["created_at"],
                     "updated_at": session["updated_at"],
@@ -319,6 +322,7 @@ class FakeDaemonClient:
             "schema_version": "2",
             "task_id": session["session_id"],
             "project_id": session["project_id"],
+            "project_head_id": session.get("project_head_id"),
             "task_title": session["task_title"],
             "instruction": session["instruction"],
             "response": session.get("response"),
@@ -1322,6 +1326,56 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].task_id == "session-1"
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
+
+
+def test_provider_submits_session_against_selected_historical_project_head() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [{
+                "project_id": "project-1",
+                "display_name": "Development project",
+                "config": _config(),
+                "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }],
+            "sessions": [{
+                "session_id": "session-1",
+                "project_id": "project-1",
+                "project_head_id": "project-1-head-0",
+                "task_title": "Historical task",
+                "instruction": "Use the genesis context.",
+                "state": "completed",
+                "logs": ["completed"],
+                "created_at": "2026-08-22T00:01:00Z",
+                "updated_at": "2026-08-22T00:02:00Z",
+            }],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+    project = provider.invoke("getDesktopProjectV2", {"project_id": "project-1"})
+    historical = provider.invoke(
+        "getDesktopTaskV2", {"task_id": "session-1"}
+    ).admission.predecessor_project_head
+
+    task = provider.invoke(
+        "submitDesktopTaskV2",
+        {
+            "request": core_m.TaskSubmitRequestV2(
+                project_id=project.project_id,
+                expected_project_admission_etag=project.admission_etag,
+                expected_project_head_id=historical.project_head_id,
+                expected_project_head_manifest_sha256=historical.manifest_sha256,
+                expected_project_config_sha256=project.project_config_sha256,
+            ),
+            "idempotency_key": "historical-head-action-1",
+            "resource_generation": historical.generation,
+        },
+    )
+
+    assert task.admission.predecessor_project_head.project_head_id == "project-1-head-0"
+    assert fake.state["sessions"][-1]["project_head_id"] == "project-1-head-0"
 
 
 def test_provider_cancels_task_through_daemon_v2_authority() -> None:

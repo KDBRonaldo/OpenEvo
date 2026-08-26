@@ -24,7 +24,7 @@ class SessionRuntimeStore(Protocol):
 
     def get_session(self, session_id: str) -> dict[str, Any]: ...
 
-    def start_session(self, session_id: str, request: dict[str, str]) -> None: ...
+    def start_session(self, session_id: str, request: dict[str, Any]) -> None: ...
 
     def request_session_cancellation(self, session_id: str) -> dict[str, Any]: ...
 
@@ -38,7 +38,7 @@ class ExclusiveOperationLock(Protocol):
 
 
 CancellationFactory = Callable[[], Any]
-SessionExecutor = Callable[[str, dict[str, str], Any], None]
+SessionExecutor = Callable[[str, dict[str, Any], Any], None]
 ExecutionFailureHandler = Callable[[str, BaseException], None]
 SessionIdFactory = Callable[[], str]
 
@@ -73,7 +73,7 @@ class SessionExecutionManager:
 
     def submit(
         self,
-        request: dict[str, str],
+        request: dict[str, Any],
         *,
         session_id: str | None = None,
     ) -> str:
@@ -101,7 +101,11 @@ class SessionExecutionManager:
                     existing["task_title"],
                     existing["instruction"],
                 )
-                if actual != expected:
+                requested_head_id = stable_request.get("project_head_id")
+                if actual != expected or (
+                    requested_head_id is not None
+                    and existing.get("project_head_id") != requested_head_id
+                ):
                     raise SessionExecutionConflictError(
                         "Task action_id is already bound to another request"
                     )
@@ -115,6 +119,11 @@ class SessionExecutionManager:
             if not callable(getattr(cancellation, "cancel", None)):
                 raise TypeError("Session cancellation signal must provide cancel()")
             self._store.start_session(admitted_session_id, stable_request)
+            admitted = self._store.get_session(admitted_session_id)
+            execution_request = {
+                **stable_request,
+                "context_artifact_ids": list(admitted.get("context_artifact_ids", [])),
+            }
         except BaseException:
             self._operation_lock.release()
             raise
@@ -123,7 +132,7 @@ class SessionExecutionManager:
             thread = threading.Thread(
                 target=self._run,
                 name=f"openevo-{admitted_session_id}",
-                args=(admitted_session_id, stable_request, cancellation),
+                args=(admitted_session_id, execution_request, cancellation),
                 daemon=True,
             )
             with self._active_lock:
@@ -162,7 +171,7 @@ class SessionExecutionManager:
     def _run(
         self,
         session_id: str,
-        request: dict[str, str],
+        request: dict[str, Any],
         cancellation: Any,
     ) -> None:
         try:

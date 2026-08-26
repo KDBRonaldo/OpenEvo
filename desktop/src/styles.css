@@ -880,6 +880,7 @@ pre.json {
 }
 
 .next-task-fields input,
+.next-task-fields select,
 .next-task-fields textarea {
   width: 100%;
   border: 1px solid var(--line);
@@ -894,6 +895,7 @@ pre.json {
 }
 
 .next-task-fields input:focus,
+.next-task-fields select:focus,
 .next-task-fields textarea:focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 3px rgb(43 113 93 / 12%);
@@ -901,6 +903,7 @@ pre.json {
 }
 
 .next-task-fields input:disabled,
+.next-task-fields select:disabled,
 .next-task-fields textarea:disabled {
   background: var(--surface-muted);
   color: var(--ink-500);

@@ -20,6 +20,7 @@ const ETAG = `"${"b".repeat(64)}"`;
 
 export interface DevelopmentAgentTurnRequest {
   readonly projectId: string;
+  readonly projectHeadId?: string;
   readonly projectName: string;
   readonly taskTitle: string;
   readonly instruction: string;
@@ -145,6 +146,7 @@ export interface PersistedDevelopmentProject {
 export interface PersistedDevelopmentSession {
   readonly sessionId: string;
   readonly projectId: string;
+  readonly projectHeadId?: string | null;
   readonly taskTitle: string;
   readonly instruction: string;
   readonly response: string | null;
@@ -423,12 +425,15 @@ function createRemoteBackedDesktopProductProvider(
       checks: [],
       validated_at: NOW,
     } as never),
-    submitTask: async (projectId) => {
+    submitTask: async (projectId, _intent, selectedProjectHead) => {
       await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project?.active_project_head || project.state !== "ready") throw new Error("Remote project is not ready.");
+      const head = selectedProjectHead ?? project.active_project_head;
+      if (head.project_id !== projectId) throw new Error("Selected Project Head belongs to another Project.");
       const submission = await options.developmentBackend.submitAgentTurn({
         projectId,
+        projectHeadId: head.project_head_id,
         projectName: project.display_name,
         taskTitle: project.config.task.title,
         instruction: project.config.task.objective,
@@ -616,8 +621,12 @@ function createDevelopmentAgentSnapshot(
   const projects = persisted.projects.map((storedProject, projectIndex) => {
     const config = storedProject.config;
     let activeHead = developmentGenesisHead(storedProject.projectId, config, projectIndex + 1);
+    const projectHeads = new Map([[activeHead.project_head_id, activeHead]]);
     const projectSessions = persisted.sessions.filter((session) => session.projectId === storedProject.projectId);
     for (const [sessionIndex, session] of projectSessions.entries()) {
+      const admissionHead = session.projectHeadId == null
+        ? activeHead
+        : projectHeads.get(session.projectHeadId) ?? activeHead;
       const sessionConfig = {
         ...config,
         task: { title: session.taskTitle, objective: session.instruction },
@@ -628,7 +637,7 @@ function createDevelopmentAgentSnapshot(
         display_name: storedProject.displayName,
         config: sessionConfig,
         project_config_sha256: scienceProjectConfigSha256ForV2(sessionConfig),
-        active_project_head: activeHead,
+        active_project_head: admissionHead,
         admission_etag: ETAG,
         state: "ready" as const,
         created_at: storedProject.createdAt,
@@ -667,6 +676,7 @@ function createDevelopmentAgentSnapshot(
       };
       if (session.state === "completed") {
         activeHead = developmentSuccessorHead(activeHead, config, produced.length);
+        projectHeads.set(activeHead.project_head_id, activeHead);
       }
     }
     return {

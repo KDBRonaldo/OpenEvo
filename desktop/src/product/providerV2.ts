@@ -235,7 +235,11 @@ export interface DesktopProductProviderV2 {
   activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   loadProjectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;
   validateProject(projectId: string, intent: ProductMutationIntentV2): Promise<ProjectValidationV2>;
-  submitTask(projectId: string, intent: ProductMutationIntentV2): Promise<TaskV2>;
+  submitTask(
+    projectId: string,
+    intent: ProductMutationIntentV2,
+    projectHead?: ProjectHeadRefV2,
+  ): Promise<TaskV2>;
   cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
   retryEvolutionJob?(jobId: string, intent: ProductMutationIntentV2): Promise<void>;

@@ -296,6 +296,7 @@ class DevelopmentAgentDesktopV2Provider:
             "acknowledgeDesktopLifecycleOperationV2": self._acknowledge_operation,
             "getDesktopProjectCapabilitiesV2": self._capabilities,
             "validateDesktopProjectV2": self._validate,
+            "getDesktopProjectHeadV2": self._project_head,
             "listDesktopTasksV2": self._tasks,
             "submitDesktopTaskV2": self._submit_task,
             "getDesktopTaskV2": self._task,
@@ -550,6 +551,37 @@ class DevelopmentAgentDesktopV2Provider:
     def _project(self, arguments: Mapping[str, object]) -> core.ProjectV2:
         return self._find_project(arguments.get("project_id"))
 
+    def _project_head(self, arguments: Mapping[str, object]) -> core.ProjectHeadRefV2:
+        project_head_id = str(arguments.get("project_head_id"))
+        for project in self._project_models(self._remote_state()):
+            for head in self._available_project_heads(project):
+                if head.project_head_id == project_head_id:
+                    return head
+        raise HTTPException(status_code=404, detail="project head not found")
+
+    def _available_project_heads(self, project: core.ProjectV2) -> list[core.ProjectHeadRefV2]:
+        active = project.active_project_head
+        assert active is not None
+        generation_by_id = {active.project_head_id: active.generation}
+        legacy_generation = 0
+        for observation in self._task_observations_v2():
+            if observation.project_id != project.project_id:
+                continue
+            head_id = observation.project_head_id or (
+                f"{project.project_id}-head-{legacy_generation}"
+            )
+            prefix = f"{project.project_id}-head-"
+            if head_id.startswith(prefix) and head_id[len(prefix) :].isdigit():
+                generation_by_id[head_id] = int(head_id[len(prefix) :])
+            if observation.state == "closed":
+                legacy_generation += 1
+        return [
+            self._head(project.project_id, project.config, generation)
+            for _, generation in sorted(
+                generation_by_id.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+
     def _update_project(self, arguments: Mapping[str, object]) -> core.ProjectV2:
         project_id = str(arguments["project_id"])
         request = arguments["request"]
@@ -669,11 +701,29 @@ class DevelopmentAgentDesktopV2Provider:
         return Response(status_code=204)
 
     def _task_model(
-        self, observation: DevelopmentTaskObservationV2, project: core.ProjectV2, ordinal: int
+        self,
+        observation: DevelopmentTaskObservationV2,
+        project: core.ProjectV2,
+        ordinal: int,
+        legacy_generation: int,
     ) -> core.TaskV2:
         task_id = observation.task_id
-        head = project.active_project_head
-        assert head is not None
+        selected_head_id = observation.project_head_id or (
+            f"{project.project_id}-head-{legacy_generation}"
+        )
+        head = next(
+            (
+                candidate
+                for candidate in self._available_project_heads(project)
+                if candidate.project_head_id == selected_head_id
+            ),
+            None,
+        )
+        if head is None:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon Task references an unavailable Project Head",
+            )
         admission_data = {
             "schema_version": "2",
             "task_admission_id": f"{project.project_id}-admission-{ordinal}",
@@ -749,13 +799,22 @@ class DevelopmentAgentDesktopV2Provider:
         projects = {p.project_id: p for p in self._project_models(state)}
         observations = self._task_observations_v2()
         tasks = []
-        for index, observation in enumerate(observations):
+        project_ordinals: dict[str, int] = {}
+        project_legacy_generations: dict[str, int] = {}
+        for observation in observations:
             project = projects.get(observation.project_id)
             if project is None:
                 raise HTTPException(
                     status_code=503, detail="development daemon Task references an unknown Project"
                 )
-            tasks.append(self._task_model(observation, project, index + 1))
+            ordinal = project_ordinals.get(observation.project_id, 0) + 1
+            project_ordinals[observation.project_id] = ordinal
+            legacy_generation = project_legacy_generations.get(observation.project_id, 0)
+            tasks.append(
+                self._task_model(observation, project, ordinal, legacy_generation)
+            )
+            if observation.state == "closed":
+                project_legacy_generations[observation.project_id] = legacy_generation + 1
         return tasks
 
     def _tasks(self, arguments: Mapping[str, object]) -> core.TaskPageV2:
@@ -777,9 +836,29 @@ class DevelopmentAgentDesktopV2Provider:
     def _submit_task(self, arguments: Mapping[str, object]) -> core.TaskV2:
         request = arguments["request"]
         project = self._find_project(request.project_id)
+        selected_head = next(
+            (
+                head
+                for head in self._available_project_heads(project)
+                if head.project_head_id == request.expected_project_head_id
+            ),
+            None,
+        )
+        if selected_head is None:
+            raise HTTPException(status_code=409, detail="selected Project Head is unavailable")
+        if (
+            selected_head.manifest_sha256 != request.expected_project_head_manifest_sha256
+            or project.project_config_sha256 != request.expected_project_config_sha256
+            or project.admission_etag != request.expected_project_admission_etag
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Task admission authority no longer matches the selected Project Head",
+            )
         creation = DevelopmentTaskCreateV2(
             action_id=str(arguments["idempotency_key"]),
             project_id=project.project_id,
+            project_head_id=selected_head.project_head_id,
             project_name=project.display_name,
             task_title=project.config.task.title,
             instruction=project.config.task.objective,
@@ -802,7 +881,13 @@ class DevelopmentAgentDesktopV2Provider:
                 detail="development daemon Task creation crossed Project authority",
             )
         self._invalidate_state()
-        return self._task({"task_id": presentation.task_id})
+        task = self._task({"task_id": presentation.task_id})
+        if task.admission.predecessor_project_head.project_head_id != selected_head.project_head_id:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon did not preserve the selected Project Head",
+            )
+        return task
 
     def _cancel_task(self, arguments: Mapping[str, object]) -> core.OperationV2:
         task_id = str(arguments["task_id"])

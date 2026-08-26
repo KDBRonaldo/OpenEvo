@@ -432,6 +432,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
     assert restored["sessions"][0] == {
         "session_id": "dev-session-1",
         "project_id": "development-project-1",
+        "project_head_id": "development-project-1-head-0",
         "task_title": "Question",
         "instruction": "Hello",
         "response": "Hello from Codex.",
@@ -779,6 +780,81 @@ def test_completed_legacy_sessions_are_backfilled_as_evolution_evidence(tmp_path
     record = json.loads(records_path.read_text(encoding="utf-8"))
     assert record["traces"][0]["prompt_messages"][0]["content"] == "Preserve this question"
     assert record["traces"][0]["response_messages"][0]["content"] == "Preserve this answer"
+
+
+def test_session_project_head_reuses_its_pinned_evolution_context(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project_id = "development-project-head-context"
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Head context",
+            "config": {"evolution": {"targets": {}}},
+        }
+    )
+
+    def request(head: int, title: str) -> dict[str, str]:
+        return {
+            "project_id": project_id,
+            "project_head_id": f"{project_id}-head-{head}",
+            "project_name": "Head context",
+            "task_title": title,
+            "instruction": title,
+        }
+
+    def complete(session_id: str) -> None:
+        store.complete_session(
+            session_id,
+            {
+                "response": "done",
+                "model": "test-model",
+                "duration_ms": 1,
+                "logs": [],
+            },
+        )
+
+    store.start_session("head-session-0", request(0, "Genesis"))
+    complete("head-session-0")
+    store.record_evolution_artifact(
+        artifact_id="memory-head-1",
+        project_id=project_id,
+        session_id="head-session-0",
+        target_id="text_memory",
+        artifact_type="text_memory",
+        method_id="text_memory_reflector",
+        renderer_kind="markdown",
+        documents=[{"path": "memory.md", "media_type": "text/markdown", "content": "old"}],
+        manifest={"content_path": "memory.md"},
+        previous_artifact_id=None,
+        promoted=True,
+    )
+    store.start_session("head-session-1", request(1, "Use old memory"))
+    complete("head-session-1")
+    store.record_evolution_artifact(
+        artifact_id="memory-head-2",
+        project_id=project_id,
+        session_id="head-session-1",
+        target_id="text_memory",
+        artifact_type="text_memory",
+        method_id="text_memory_reflector",
+        renderer_kind="markdown",
+        documents=[{"path": "memory.md", "media_type": "text/markdown", "content": "new"}],
+        manifest={"content_path": "memory.md"},
+        previous_artifact_id="memory-head-1",
+        promoted=True,
+    )
+
+    store.start_session("head-session-2", request(2, "Use new memory"))
+    store.start_session("head-session-historical", request(1, "Reuse old memory"))
+    sessions = {item["session_id"]: item for item in store.snapshot()["sessions"]}
+
+    assert sessions["head-session-2"]["context_artifact_ids"] == ["memory-head-2"]
+    assert sessions["head-session-historical"]["project_head_id"] == (
+        f"{project_id}-head-1"
+    )
+    assert sessions["head-session-historical"]["context_artifact_ids"] == [
+        "memory-head-1"
+    ]
 
 
 def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ import {
   type LocalOperationV2,
   type OperationV2,
   type HostKeyReviewRequestV2,
+  type ProjectHeadRefV2,
   type ProjectV2,
   type RemoteProfileV2,
   type RemoteWorkspaceProfileV2,
@@ -716,10 +717,17 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return validation;
   }
 
-  async submitTask(projectId: string, intent: ProductMutationIntentV2) {
+  async submitTask(
+    projectId: string,
+    intent: ProductMutationIntentV2,
+    selectedProjectHead?: ProjectHeadRefV2,
+  ) {
     const project = this.requireProject(projectId, intent);
     const snapshot = this.requireSnapshot();
-    const head = requireProjectHead(project);
+    const head = selectedProjectHead ?? requireProjectHead(project);
+    if (head.project_id !== projectId) {
+      throw new DesktopContractErrorV2("Selected Project Head belongs to another Project");
+    }
     if (project.state !== "ready" || project.admission_etag === null) {
       throw new DesktopContractErrorV2("Project successor is not ready for task admission");
     }

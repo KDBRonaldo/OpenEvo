@@ -1220,10 +1220,47 @@ describe("Desktop v2 product renderer", () => {
     expect(provider.submitTask).toHaveBeenCalledWith(
       "project-1",
       expect.objectContaining({ streamEpoch: 3 }),
+      expect.objectContaining({ project_head_id: "project-head-7", generation: 7 }),
     );
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
+  });
+
+  it("starts a session with the historical Project Head selected by the user", async () => {
+    const original = authoritySnapshot();
+    const historicalHead = {
+      ...original.tasks[0]!.admission.predecessor_project_head,
+      project_head_id: "project-head-6",
+      generation: 6,
+      predecessor_project_head_id: "project-head-5",
+    };
+    const snapshot = {
+      ...original,
+      tasks: [{
+        ...original.tasks[0]!,
+        admission: {
+          ...original.tasks[0]!.admission,
+          predecessor_project_head: historicalHead,
+        },
+      }],
+    };
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    const picker = document.querySelector<HTMLSelectElement>(".next-task-fields select");
+    expect(picker).toBeTruthy();
+
+    await act(async () => {
+      picker!.value = historicalHead.project_head_id;
+      picker!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click("Start session");
+
+    expect(provider.submitTask).toHaveBeenCalledWith(
+      "project-1",
+      expect.any(Object),
+      expect.objectContaining({ project_head_id: "project-head-6", generation: 6 }),
+    );
   });
 
   it("opens a chat immediately while the remote Session is being admitted", async () => {

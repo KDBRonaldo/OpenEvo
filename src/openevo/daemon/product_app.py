@@ -116,6 +116,7 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ALLOWED_REQUEST_FIELDS = {
     "schema_version",
     "project_id",
+    "project_head_id",
     "project_name",
     "task_title",
     "instruction",
@@ -2063,6 +2064,7 @@ class DevelopmentStateStore:
         return DevelopmentTaskObservationV2(
             task_id=row["session_id"],
             project_id=row["project_id"],
+            project_head_id=row["project_head_id"],
             state=state,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -2080,6 +2082,7 @@ class DevelopmentStateStore:
                 "schema_version": "2",
                 "task_id": record["session_id"],
                 "project_id": record["project_id"],
+                "project_head_id": record["project_head_id"],
                 "task_title": record["task_title"],
                 "instruction": record["instruction"],
                 "response": record["response"],
@@ -2272,6 +2275,11 @@ def validate_request(payload: object) -> dict[str, str]:
         raise RequestError("project_id is invalid")
 
     result = {"project_id": project_id}
+    project_head_id = payload.get("project_head_id")
+    if project_head_id is not None:
+        if not isinstance(project_head_id, str) or not ID_PATTERN.fullmatch(project_head_id):
+            raise RequestError("project_head_id is invalid")
+        result["project_head_id"] = project_head_id
     for field, maximum in (("project_name", 200), ("task_title", 200), ("instruction", 32_000)):
         value = payload.get(field)
         if not isinstance(value, str) or not value.strip():
@@ -3618,6 +3626,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 self.server.sessions.submit(
                     {
                         "project_id": request.project_id,
+                        "project_head_id": request.project_head_id,
                         "project_name": request.project_name,
                         "task_title": request.task_title,
                         "instruction": request.instruction,

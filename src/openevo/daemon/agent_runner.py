@@ -40,6 +40,8 @@ class AgentSessionStore(Protocol):
 
     def latest_context_artifacts(self, project_id: str) -> list[dict[str, Any]]: ...
 
+    def artifact(self, artifact_id: str) -> dict[str, Any]: ...
+
     def append_session_log(self, session_id: str, message: str) -> None: ...
 
     def apply_workspace_mutations(self, project_id: str, mutations: object) -> None: ...
@@ -142,7 +144,7 @@ class AgentSessionExecutor:
     def execute(
         self,
         session_id: str,
-        request: dict[str, str],
+        request: dict[str, Any],
         cancellation: HarnessCancellation,
     ) -> None:
         workspace_before: dict[str, Any] = {
@@ -153,11 +155,24 @@ class AgentSessionExecutor:
         try:
             workspace_path = self._store.workspace_path(request["project_id"])
             workspace_before = self._store.workspace_snapshot(request["project_id"])
+            pinned_artifact_ids = request.get("context_artifact_ids")
+            if pinned_artifact_ids is None:
+                evolved_contexts = self._store.latest_context_artifacts(request["project_id"])
+            else:
+                evolved_contexts = [
+                    self._store.artifact(artifact_id) for artifact_id in pinned_artifact_ids
+                ]
+                if any(
+                    artifact["project_id"] != request["project_id"]
+                    or artifact["artifact_type"] == "report"
+                    for artifact in evolved_contexts
+                ):
+                    raise AgentRunError("Pinned Project Head context crossed Project authority")
             execution_request = {
                 **request,
                 "workspace_path": workspace_path,
                 "workspace_snapshot": workspace_before,
-                "evolved_contexts": self._store.latest_context_artifacts(request["project_id"]),
+                "evolved_contexts": evolved_contexts,
             }
             result = self._runner.run(
                 execution_request,

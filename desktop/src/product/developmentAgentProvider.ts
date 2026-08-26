@@ -132,6 +132,7 @@ const projectSchema = z.object({
 const sessionSchema = z.object({
   session_id: z.string().min(1),
   project_id: z.string().min(1),
+  project_head_id: z.string().min(1).nullable().default(null),
   task_title: z.string().min(1),
   instruction: z.string().min(1),
   response: z.string().nullable(),
@@ -162,6 +163,7 @@ const taskPresentationV2Schema = z.object({
   schema_version: z.literal("2"),
   task_id: z.string().min(1),
   project_id: z.string().min(1),
+  project_head_id: z.string().min(1).nullable().default(null),
   task_title: z.string().min(1),
   instruction: z.string().min(1),
   response: z.string().nullable(),
@@ -672,6 +674,7 @@ export function createDevelopmentAgentProvider(
           sessions.push({
             session_id: item.task_id,
             project_id: item.project_id,
+            project_head_id: item.project_head_id,
             task_title: item.task_title,
             instruction: item.instruction,
             response: item.response,
@@ -835,6 +838,7 @@ export function createDevelopmentAgentProvider(
         sessions: sessions.map((session) => ({
           sessionId: session.session_id,
           projectId: session.project_id,
+          projectHeadId: session.project_head_id,
           taskTitle: session.task_title,
           instruction: session.instruction,
           response: session.response,
@@ -1155,6 +1159,7 @@ function toTurnRequestBody(request: DevelopmentAgentTurnRequest) {
   return {
     schema_version: "1",
     project_id: request.projectId,
+    ...(request.projectHeadId === undefined ? {} : { project_head_id: request.projectHeadId }),
     project_name: request.projectName,
     task_title: request.taskTitle,
     instruction: request.instruction,
