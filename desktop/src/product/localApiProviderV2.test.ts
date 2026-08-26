@@ -551,7 +551,7 @@ describe("Desktop v2 product provider", () => {
       "project-old",
       "project-active",
     ]);
-    expect(client.listTasks).toHaveBeenCalledWith({ limit: 100, projectId: "project-active" });
+    expect(client.listTasks).toHaveBeenCalledWith({ limit: 100 });
     expect(client.projectCapabilities).toHaveBeenCalledWith("project-active");
   });
 
@@ -838,6 +838,97 @@ describe("Desktop v2 product provider", () => {
       tasks.map((task) => task.task_id),
     );
     expect(maximumActiveRequests).toBe(4);
+  });
+
+  it("preloads every Project and reuses unchanged Session details across Project switches", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-1",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    let activeProjectId = "project-1";
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockImplementation(async () => ({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: activeProjectId,
+    }));
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: ["project-1", "project-2"].map((projectId) => ({
+        project_id: projectId,
+        config: { execution: { mode: "codex_subscription_transcript" } },
+      })),
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    const tasks = ["project-1", "project-2"].map((projectId, index) => ({
+      task_id: `task-${index + 1}`,
+      project_id: projectId,
+      state: "closed",
+      successor_transition: null,
+      updated_at: NOW,
+    }));
+    vi.mocked(client.listTasks).mockImplementation(async () => ({
+      schema_version: "2",
+      items: tasks,
+      next_cursor: null,
+      has_more: false,
+    } as never));
+    vi.mocked(client.listServices).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.projectCapabilities).mockImplementation(async (projectId) => ({
+      project_id: projectId,
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+    } as never));
+    vi.mocked(client.taskTimeline).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.taskArtifacts).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const first = await provider.refresh();
+    expect(first.status).toBe("fresh");
+    if (first.status !== "fresh") throw new Error("fixture refresh failed");
+    expect(first.snapshot.tasks.map((task) => task.project_id)).toEqual(["project-1", "project-2"]);
+    expect(client.taskTimeline).toHaveBeenCalledTimes(2);
+    expect(client.taskArtifacts).toHaveBeenCalledTimes(2);
+
+    activeProjectId = "project-2";
+    (current as { active_project_id: string | null }).active_project_id = activeProjectId;
+    const second = await provider.refresh();
+    expect(second.status).toBe("fresh");
+    if (second.status !== "fresh") throw new Error("fixture refresh failed");
+    expect(second.snapshot.state.active_project_id).toBe("project-2");
+    expect(client.taskTimeline).toHaveBeenCalledTimes(2);
+    expect(client.taskArtifacts).toHaveBeenCalledTimes(2);
+
+    tasks[1]!.updated_at = "2026-07-23T06:00:01Z";
+    await provider.refresh();
+    expect(client.taskTimeline).toHaveBeenCalledTimes(3);
+    expect(client.taskArtifacts).toHaveBeenCalledTimes(3);
+    expect(client.listTasks).toHaveBeenLastCalledWith({ limit: 100 });
   });
 
   it("creates a profile from an alias only and uses catalog generation authority", async () => {

@@ -1,4 +1,5 @@
 import {
+  canonicalJsonV2,
   desktopBootstrapContextV2Schema,
   type DesktopBootstrapContextV2,
 } from "../api/v2/schemas";
@@ -102,14 +103,40 @@ export function combineSelfHostedProviders(
   const featureFlags = Object.freeze([
     ...new Set([...formal.featureFlags, ...presentation.featureFlags]),
   ]);
+  let presentationAuthorityKey: string | null = null;
+  let cachedPresentation: DesktopProductSnapshotV2["runtimePresentation"];
+  let presentationLoaded = false;
+  let presentationDirty = true;
   const refresh = async (): Promise<ProductRefreshResultV2> => {
-    const [formalResult, presentationResult] = await Promise.all([
-      formal.refresh(),
-      presentation.refresh(),
-    ]);
+    // Preserve the original parallel first load; only later refreshes can make
+    // the cache decision from the newly observed formal authority.
+    const initialResults = !presentationLoaded
+      ? await Promise.all([formal.refresh(), presentation.refresh()] as const)
+      : null;
+    const formalResult = initialResults?.[0] ?? await formal.refresh();
     if (formalResult.status !== "fresh") return formalResult;
-    if (presentationResult.status !== "fresh") return presentationResult;
-    const compatibilityPresentation = presentationResult.snapshot.runtimePresentation;
+    // Active-Project selection is deliberately absent from this key. The
+    // formal snapshot already contains every Project's Task/artifact authority,
+    // so changing only active_project_id can reuse the complete presentation
+    // read model loaded by the previous refresh.
+    const nextPresentationAuthorityKey = canonicalJsonV2({
+      projects: formalResult.snapshot.projects,
+      tasks: formalResult.snapshot.tasks,
+      artifacts: formalResult.snapshot.artifacts,
+    });
+    if (
+      presentationDirty
+      || !presentationLoaded
+      || presentationAuthorityKey !== nextPresentationAuthorityKey
+    ) {
+      const presentationResult = initialResults?.[1] ?? await presentation.refresh();
+      if (presentationResult.status !== "fresh") return presentationResult;
+      cachedPresentation = presentationResult.snapshot.runtimePresentation;
+      presentationAuthorityKey = nextPresentationAuthorityKey;
+      presentationLoaded = true;
+      presentationDirty = false;
+    }
+    const compatibilityPresentation = cachedPresentation;
     const snapshot: DesktopProductSnapshotV2 = {
       ...formalResult.snapshot,
       runtimePresentation: compatibilityPresentation === undefined ? undefined : {
@@ -121,7 +148,10 @@ export function combineSelfHostedProviders(
 
   const subscribe = (listener: (signal: ProductSubscriptionSignalV2) => void) => {
     const stopFormal = formal.subscribe(listener);
-    const stopPresentation = presentation.subscribe(listener);
+    const stopPresentation = presentation.subscribe((signal) => {
+      presentationDirty = true;
+      listener(signal);
+    });
     return () => {
       stopFormal();
       stopPresentation();
@@ -133,10 +163,15 @@ export function combineSelfHostedProviders(
       if (property === "featureFlags") return featureFlags;
       if (property === "refresh") return refresh;
       if (property === "subscribe") return subscribe;
-      if (property === "retryEvolutionJob") return presentation.retryEvolutionJob?.bind(presentation);
-      if (property === "startEvolutionRun") return presentation.startEvolutionRun?.bind(presentation);
-      if (property === "applyEvolutionRun") return presentation.applyEvolutionRun?.bind(presentation);
-      if (property === "uploadWorkspaceFile") return presentation.uploadWorkspaceFile?.bind(presentation);
+      if (["retryEvolutionJob", "startEvolutionRun", "applyEvolutionRun", "uploadWorkspaceFile"].includes(String(property))) {
+        const mutation = Reflect.get(presentation, property);
+        if (typeof mutation !== "function") return mutation;
+        return async (...args: unknown[]) => {
+          const result = await mutation.apply(presentation, args);
+          presentationDirty = true;
+          return result;
+        };
+      }
       if (property === "downloadWorkspaceFile") return presentation.downloadWorkspaceFile?.bind(presentation);
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? value.bind(target) : value;

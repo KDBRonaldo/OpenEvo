@@ -74,6 +74,13 @@ const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 const RESOURCE_POLL_DELAYS_MS = [500, 1_000, 2_000, 4_000] as const;
 const TASK_DETAIL_LOAD_CONCURRENCY = 4;
 
+type CachedTaskDetailV2 = {
+  readonly authorityKey: string;
+  readonly timeline: readonly CoreEventEnvelopeV2[];
+  readonly artifacts: readonly ArtifactV2[];
+  readonly transition: SuccessorTransitionV2 | null;
+};
+
 async function mapWithConcurrencyV2<T, R>(
   items: readonly T[],
   concurrency: number,
@@ -135,6 +142,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly corePolls = new Map<string, Promise<void>>();
   private readonly diagnostics = new Map<string, DiagnosticV2>();
   private readonly diagnosticPolls = new Map<string, Promise<void>>();
+  private readonly taskDetailCache = new Map<string, CachedTaskDetailV2>();
   private refreshSequence = 0;
   private epoch = 0;
   private snapshot: DesktopProductSnapshotV2 | null = null;
@@ -1142,10 +1150,11 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     // worker pool below so a Project with many Sessions does not pay every SSH
     // round trip serially or create an unbounded request burst.
     const projects = await collectPages((options) => this.client.listProjects(options));
-    const tasks = await collectPages((options) => this.client.listTasks({
-      ...options,
-      projectId: state.active_project_id!,
-    }));
+    // Keep the complete remote Task collection in the browser snapshot. This
+    // makes Project selection a lightweight authority mutation: unchanged
+    // Session details can be reused instead of being downloaded again after
+    // every active-Project change.
+    const tasks = await collectPages((options) => this.client.listTasks(options));
     const services = await collectPages((options) => this.client.listServices(options));
     const activeProject = projects.find((project) => project.project_id === state.active_project_id);
     if (!activeProject) throw new DesktopContractErrorV2("Active project is absent from the remote project collection");
@@ -1154,14 +1163,29 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       tasks,
       TASK_DETAIL_LOAD_CONCURRENCY,
       async (task) => {
+        const authorityKey = canonicalJsonV2({
+          profile_id: activeProfile.profile_id,
+          connection_generation: activeProfile.connection_generation,
+          task,
+        });
+        const cached = this.taskDetailCache.get(task.task_id);
+        if (cached?.authorityKey === authorityKey) {
+          return { task, ...cached };
+        }
         const timeline = await collectPages((options) => this.client.taskTimeline(task.task_id, options));
         const artifacts = await collectPages((options) => this.client.taskArtifacts(task.task_id, options));
         const transition = task.successor_transition === null
           ? null
           : await this.client.getTransition(task.successor_transition.successor_transition_id);
-        return { task, timeline, artifacts, transition };
+        const detail = { authorityKey, timeline, artifacts, transition };
+        this.taskDetailCache.set(task.task_id, detail);
+        return { task, ...detail };
       },
     );
+    const taskIds = new Set(tasks.map((task) => task.task_id));
+    for (const taskId of this.taskDetailCache.keys()) {
+      if (!taskIds.has(taskId)) this.taskDetailCache.delete(taskId);
+    }
     const timelines: Record<string, readonly CoreEventEnvelopeV2[]> = {};
     const transitions: Record<string, SuccessorTransitionV2> = {};
     const artifactsById = new Map<string, ArtifactV2>();
@@ -1169,7 +1193,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       timelines[detail.task.task_id] = detail.timeline;
       if (detail.transition !== null) transitions[detail.transition.transition.successor_transition_id] = detail.transition;
       for (const artifact of detail.artifacts) {
-        if (artifact.project_id !== activeProject.project_id) {
+        if (artifact.project_id !== detail.task.project_id) {
           throw new DesktopContractErrorV2("Task artifact belongs to another project");
         }
         const existing = artifactsById.get(artifact.artifact_id);

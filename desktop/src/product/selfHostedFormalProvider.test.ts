@@ -51,6 +51,42 @@ describe("self-hosted formal provider", () => {
     expect(result.snapshot.runtimePresentation).toEqual(runtimePresentation);
   });
 
+  it("reuses the all-Project presentation model when only the active Project changes", async () => {
+    let activeProjectId = "project-1";
+    let taskUpdatedAt = "2026-08-26T10:00:00Z";
+    const formal = providerWith({
+      refresh: vi.fn(async () => ({
+        status: "fresh" as const,
+        snapshot: {
+          state: { active_project_id: activeProjectId },
+          projects: [{ project_id: "project-1" }, { project_id: "project-2" }],
+          tasks: [{ task_id: "task-1", updated_at: taskUpdatedAt }],
+          artifacts: [],
+        } as unknown as DesktopProductSnapshotV2,
+      })),
+    });
+    const presentationRefresh = vi.fn(async () => ({
+      status: "fresh" as const,
+      snapshot: {
+        runtimePresentation: { tasks: {}, artifacts: {} },
+      } as unknown as DesktopProductSnapshotV2,
+    }));
+    const combined = combineSelfHostedProviders(
+      formal,
+      providerWith({ refresh: presentationRefresh }),
+    );
+
+    await combined.refresh();
+    activeProjectId = "project-2";
+    await combined.refresh();
+
+    expect(presentationRefresh).toHaveBeenCalledTimes(1);
+
+    taskUpdatedAt = "2026-08-26T10:00:01Z";
+    await combined.refresh();
+    expect(presentationRefresh).toHaveBeenCalledTimes(2);
+  });
+
   it("routes project and task mutations formally but standalone Evolution explicitly to the proven bridge", async () => {
     const formalCreate = vi.fn();
     const formalSubmit = vi.fn();

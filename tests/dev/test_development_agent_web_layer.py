@@ -1330,7 +1330,7 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].task_id == "session-1"
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
-    assert fake.task_observation_requests == 1
+    assert fake.task_observation_requests == 0
 
 
 def test_provider_submits_session_against_selected_historical_project_head() -> None:

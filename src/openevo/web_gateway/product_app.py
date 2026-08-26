@@ -90,6 +90,7 @@ MAX_DEVELOPMENT_PROXY_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_DEVELOPMENT_WORKSPACE_UPLOAD_BYTES = 32 * 1024 * 1024
 MAX_DEVELOPMENT_EVOLUTION_REQUEST_BYTES = 256 * 1024
 STATE_CACHE_SECONDS = 1.0
+PROJECT_PROJECTION_CACHE_SECONDS = 30.0
 DAEMON_EVENT_WAIT_MILLISECONDS = 5_000
 LOGGER = logging.getLogger("openevo.development_agent_web_layer")
 
@@ -275,6 +276,15 @@ class DevelopmentAgentDesktopV2Provider:
         self._state_cache: dict[str, object] | None = None
         self._state_cache_deadline = 0.0
         self._state_lock = threading.RLock()
+        self._project_projection_lock = threading.Lock()
+        self._project_projection_cache: tuple[
+            list[core.ProjectV2],
+            list[DevelopmentTaskObservationV2],
+            dict[str, list[core.ProjectHeadRefV2]],
+        ] | None = None
+        self._project_projection_cache_state_sha256: str | None = None
+        self._project_projection_cache_deadline = 0.0
+        self._project_projection_generation = 0
         self._started_at = _now()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
@@ -335,12 +345,15 @@ class DevelopmentAgentDesktopV2Provider:
         with self._state_lock:
             self._state_cache = payload
             self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
+            if refresh:
+                self._invalidate_project_projection_locked()
         return payload
 
     def _invalidate_state(self) -> None:
         with self._state_lock:
             self._state_cache = None
             self._state_cache_deadline = 0.0
+            self._invalidate_project_projection_locked()
 
     def observe_remote_state(self, payload: dict[str, object]) -> None:
         """Publish one authoritative snapshot for the next browser refresh."""
@@ -348,6 +361,13 @@ class DevelopmentAgentDesktopV2Provider:
         with self._state_lock:
             self._state_cache = payload
             self._state_cache_deadline = time.monotonic() + STATE_CACHE_SECONDS
+            self._invalidate_project_projection_locked()
+
+    def _invalidate_project_projection_locked(self) -> None:
+        self._project_projection_cache = None
+        self._project_projection_cache_state_sha256 = None
+        self._project_projection_cache_deadline = 0.0
+        self._project_projection_generation += 1
 
     def _version(self, _: Mapping[str, object]) -> m.DesktopVersionV2:
         build_id = _canonical_digest({"source_commit": self._source_commit, "features": FEATURES})
@@ -548,13 +568,52 @@ class DevelopmentAgentDesktopV2Provider:
         dict[str, list[core.ProjectHeadRefV2]],
     ]:
         effective_state = state if state is not None else self._remote_state()
-        observations = self._task_observations_v2()
-        projects = self._project_models(effective_state, observations)
-        heads = {
-            project.project_id: self._available_project_heads(project, observations)
-            for project in projects
-        }
-        return projects, observations, heads
+        state_sha256 = _canonical_digest(effective_state)
+
+        def cached() -> tuple[
+            list[core.ProjectV2],
+            list[DevelopmentTaskObservationV2],
+            dict[str, list[core.ProjectHeadRefV2]],
+        ] | None:
+            with self._state_lock:
+                if (
+                    self._project_projection_cache is not None
+                    and self._project_projection_cache_state_sha256 == state_sha256
+                    and time.monotonic() < self._project_projection_cache_deadline
+                ):
+                    return self._project_projection_cache
+                return None
+
+        result = cached()
+        if result is not None:
+            return result
+        # Browser refreshes ask for Projects, Tasks, and then several Task
+        # timelines as separate v2 operations. Serialize the first projection
+        # so all of those requests share one bounded daemon /tasks inventory.
+        with self._project_projection_lock:
+            result = cached()
+            if result is not None:
+                return result
+            with self._state_lock:
+                projection_generation = self._project_projection_generation
+            observations = self._task_observations_v2()
+            projects = self._project_models(effective_state, observations)
+            heads = {
+                project.project_id: self._available_project_heads(project, observations)
+                for project in projects
+            }
+            result = (projects, observations, heads)
+            with self._state_lock:
+                # A daemon event may have invalidated authority while the
+                # remote inventory request was in flight. Return that bounded
+                # response to its caller, but never publish it back into cache.
+                if projection_generation == self._project_projection_generation:
+                    self._project_projection_cache = result
+                    self._project_projection_cache_state_sha256 = state_sha256
+                    self._project_projection_cache_deadline = (
+                        time.monotonic() + PROJECT_PROJECTION_CACHE_SECONDS
+                    )
+            return result
 
     def _projects(self, _: Mapping[str, object]) -> core.ProjectPageV2:
         projects, _, _ = self._project_projection(self._remote_state())
