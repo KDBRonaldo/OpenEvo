@@ -1417,6 +1417,41 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Enumerate claims");
   });
 
+  it("shows a recoverable loading state while candidate artifacts refresh", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      artifacts: [],
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        evolutionRuns: [{
+          runId: "evolution-run-awaiting-artifacts",
+          projectId: "project-1",
+          sourceTaskIds: ["task-1"],
+          selections: [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
+          state: "candidate_ready",
+          artifactIds: ["candidate-artifact-not-loaded"],
+          jobIds: [],
+          error: null,
+          createdAt: NOW,
+          updatedAt: NOW,
+        }],
+      },
+    };
+    const provider = {
+      ...providerFixture(snapshot),
+      startEvolutionRun: vi.fn(async () => undefined),
+      applyEvolutionRun: vi.fn(async () => undefined),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("Evolution");
+
+    expect(document.body.textContent).toContain("Loading result artifacts");
+    expect(document.body.textContent).not.toContain("without a readable textual artifact");
+    expect(button("Apply to future Sessions").disabled).toBe(true);
+  });
+
   it("does not present background Evolution as a Session submission spinner", async () => {
     const base = authoritySnapshot();
     const snapshot: DesktopProductSnapshotV2 = {

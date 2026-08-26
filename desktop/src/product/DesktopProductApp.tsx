@@ -877,6 +877,7 @@ export function DesktopProductApp({
                 },
                 "Evolution method retry started with the same evidence.",
               )}
+              onRefresh={() => { void refresh(); }}
             />
           ) : (
             <SystemWorkspaceV2
@@ -2628,6 +2629,7 @@ function EvolutionWorkspaceV2({
   onStartRun,
   onApplyRun,
   onRetryJob,
+  onRefresh,
 }: {
   readonly project: ProjectV2;
   readonly snapshot: DesktopProductSnapshotV2;
@@ -2644,6 +2646,7 @@ function EvolutionWorkspaceV2({
   ) => void;
   readonly onApplyRun: (runId: string) => void;
   readonly onRetryJob: (jobId: string) => void;
+  readonly onRefresh: () => void;
 }) {
   const [targets, setTargets] = useState(project.config.evolution.targets);
   useEffect(() => setTargets(project.config.evolution.targets), [project.project_config_sha256]);
@@ -2709,11 +2712,43 @@ function EvolutionWorkspaceV2({
       ? [{ targetId, method: selection.method, config: selection.config }]
       : []
   ));
+  const latestArtifactsPending = latestRun !== undefined
+    && ["candidate_ready", "applied"].includes(latestRun.state)
+    && latestRun.artifactIds.length > 0
+    && latestRunArtifacts.length === 0;
+  const resultSectionRef = useRef<HTMLElement>(null);
+  const lastResultSignature = useRef(
+    latestRun === undefined ? null : `${latestRun.runId}:${latestRun.state}`,
+  );
+  useEffect(() => {
+    const signature = latestRun === undefined ? null : `${latestRun.runId}:${latestRun.state}`;
+    const previous = lastResultSignature.current;
+    lastResultSignature.current = signature;
+    if (
+      previous !== null
+      && signature !== null
+      && previous !== signature
+      && latestRun !== undefined
+      && latestRun.state !== "running"
+    ) {
+      resultSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [latestRun?.runId, latestRun?.state]);
+  const scrollToEvolutionStep = (id: string): void => {
+    globalThis.document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
       <div className="workspace-heading"><div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p></div></div>
+      {standaloneAvailable ? <nav className="evolution-stepper" aria-label="Evolution workflow">
+        <button type="button" className={selectedTaskIds.length > 0 ? "complete" : "active"} onClick={() => scrollToEvolutionStep("evolution-evidence")}><span>1</span><div><strong>Evidence</strong><small>{selectedTaskIds.length > 0 ? `${selectedTaskIds.length} Sessions selected` : "Choose Sessions"}</small></div></button>
+        <ArrowRight size={15} />
+        <button type="button" className={enabledSelections.length > 0 ? "complete" : selectedTaskIds.length > 0 ? "active" : ""} onClick={() => scrollToEvolutionStep("evolution-methods")}><span>2</span><div><strong>Methods</strong><small>{enabledSelections.length > 0 ? `${enabledSelections.length} targets enabled` : "Configure targets"}</small></div></button>
+        <ArrowRight size={15} />
+        <button type="button" className={latestRun !== undefined ? "active" : ""} onClick={() => scrollToEvolutionStep("evolution-result")}><span>3</span><div><strong>Result</strong><small>{latestRun === undefined ? "Run Evolution" : evolutionRunStateLabel(latestRun.state)}</small></div></button>
+      </nav> : null}
       {project.active_project_head ? <section className="revision-strip"><div className="revision-node active"><span>Active Project Head</span><strong>Project Head {project.active_project_head.generation}</strong><small>Used by the next session</small></div></section> : null}
-      {standaloneAvailable ? <section className="product-panel task-panel">
+      {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section">
         <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
         {completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task) => {
           const selected = selectedTaskIds.includes(task.task_id);
@@ -2723,7 +2758,7 @@ function EvolutionWorkspaceV2({
         })}</div>}
         {completedTasks.length > evidenceTasks.length ? <Notice tone="warning" title="Some Sessions are unavailable" detail="Their transcript datasets were not sealed. Restart the updated development daemon to repair recoverable legacy Sessions; unavailable entries cannot be selected." /> : null}
       </section> : null}
-      <section className="product-panel task-panel">
+      <section id="evolution-methods" className="product-panel task-panel evolution-step-section">
         <div className="panel-heading"><div><span className="panel-kicker">{standaloneAvailable ? "Step 2 · Methods" : "Verified remote registry"}</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
         {capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
@@ -2751,10 +2786,10 @@ function EvolutionWorkspaceV2({
         })}</div>}
         <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div>
       </section>
-      {standaloneAvailable ? <section className="product-panel task-panel">
+      {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section">
         <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Current Evolution Result</h2></div><span className="muted-pill">{runs.length} total run{runs.length === 1 ? "" : "s"}</span></div>
         {latestRun === undefined ? <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div> : <article className={`v2-evolution-job v2-current-evolution-run ${latestRun.state}`}>
-          <header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${latestRun.state}`} aria-hidden="true">{latestRun.state === "running" ? <LoaderCircle className="spin" size={16} /> : latestRun.state === "applied" || latestRun.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{latestRun.selections.map((selection) => selection.targetId.replaceAll("_", " ")).join(", ")}</strong><small>{latestRun.sourceTaskIds.length} Session{latestRun.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(latestRun.createdAt)}</small></div></div><span className={`state-pill ${latestRun.state}`}>{latestRun.state.replaceAll("_", " ")}</span></header>
+          <header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${latestRun.state}`} aria-hidden="true">{latestRun.state === "running" ? <LoaderCircle className="spin" size={16} /> : latestRun.state === "applied" || latestRun.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{latestRun.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{latestRun.sourceTaskIds.length} Session{latestRun.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(latestRun.createdAt)}</small></div></div><span className={`state-pill ${latestRun.state}`}>{evolutionRunStateLabel(latestRun.state)}</span></header>
           {latestRun.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{latestRun.error}</p></div> : null}
           {latestRun.state === "running" ? <div className="v2-current-evolution-empty"><LoaderCircle className="spin" size={18} /><span>Producing the current candidate…</span></div> : null}
           {latestRunArtifacts.length ? <div className="v2-current-evolution-result">
@@ -2767,12 +2802,12 @@ function EvolutionWorkspaceV2({
               <div className="segmented-control" role="tablist" aria-label="Current result view"><button type="button" role="tab" aria-selected={latestArtifactView === "content"} className={latestArtifactView === "content" ? "active" : ""} onClick={() => setLatestArtifactView("content")}><FileText size={14} /> Content</button><button type="button" role="tab" aria-selected={latestArtifactView === "changes"} className={latestArtifactView === "changes" ? "active" : ""} onClick={() => setLatestArtifactView("changes")}><History size={14} /> Changes</button></div>
               {latestArtifactView === "content" ? <div className="v2-artifact-documents">{selectedLatestPreview?.documents.length ? selectedLatestPreview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>{document.path.endsWith(".md") ? "text/markdown" : "text/plain"}</small></div><pre>{document.content}</pre></section>) : <p className="v2-empty-copy">No readable document body is available for this result.</p>}</div> : <div className="v2-artifact-diff"><div className="v2-diff-summary"><span>Compared with <strong>{selectedLatestPreview?.previousArtifactId ?? "no previous version"}</strong></span></div>{selectedLatestPreview?.diffLines.length ? <pre>{selectedLatestPreview.diffLines.map((line, index) => <span key={`${line.kind}-${index}`} className={line.kind}>{line.kind === "added" ? "+ " : line.kind === "removed" ? "− " : "  "}{line.text}</span>)}</pre> : <p className="v2-empty-copy">No textual change preview is available.</p>}</div>}
             </div> : null}
-          </div> : latestRun.state !== "running" && latestRun.state !== "failed" ? <div className="v2-current-evolution-empty"><span>This run completed without a readable textual artifact.</span></div> : null}
-          <div className="v2-card-actions">{latestRun.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy} onClick={() => onApplyRun(latestRun.runId)}>Apply to future Sessions</button> : null}{latestRun.state === "applied" ? <span className="muted-pill">Active context</span> : null}{allJobs.filter((job) => latestRun.jobIds.includes(job.jobId) && job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {job.targetId.replaceAll("_", " ")}</button>)}</div>
+          </div> : latestArtifactsPending ? <div className="v2-current-evolution-empty loading"><LoaderCircle className="spin" size={18} /><div><strong>Loading result artifacts</strong><span>The candidate is ready. OpenEvo is refreshing its readable artifact inventory.</span></div><button type="button" className="secondary-button" disabled={busy} onClick={onRefresh}>Refresh result</button></div> : latestRun.state !== "running" && latestRun.state !== "failed" ? <div className="v2-current-evolution-empty"><div><strong>No displayable result was published</strong><span>The run completed, but it did not declare an artifact that this WebUI can preview.</span></div></div> : null}
+          <div className="v2-evolution-apply-bar"><div><strong>{latestRun.state === "applied" ? "Applied to future Sessions" : latestRun.state === "candidate_ready" ? "Candidate ready to apply" : "Evolution Run controls"}</strong><span>{latestRun.state === "candidate_ready" ? "Applying this candidate creates the context used by the next Project Head." : latestRun.state === "applied" ? "New Sessions now use this evolved context." : "Retry only the failed methods while preserving the original evidence."}</span></div><div className="v2-card-actions">{latestRun.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy || latestArtifactsPending} onClick={() => onApplyRun(latestRun.runId)}>Apply to future Sessions</button> : null}{latestRun.state === "applied" ? <span className="muted-pill">Active context</span> : null}{allJobs.filter((job) => latestRun.jobIds.includes(job.jobId) && job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></div>
         </article>}
         {runs.length > 1 ? <details className="v2-evolution-history"><summary><span><History size={15} /> Previous Evolution Runs</span><strong>{runs.length - 1}</strong></summary><div className="v2-evolution-job-list">{runs.slice(1).map((run) => {
           const jobs = allJobs.filter((job) => run.jobIds.includes(job.jobId));
-          return <article className={`v2-evolution-job ${run.state}`} key={run.runId}><header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={16} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{run.selections.map((selection) => selection.targetId.replaceAll("_", " ")).join(", ")}</strong><small>{run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(run.createdAt)}</small></div></div><span className={`state-pill ${run.state}`}>{run.state.replaceAll("_", " ")}</span></header>{run.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{run.error}</p></div> : null}<div className="v2-card-actions">{run.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy} onClick={() => onApplyRun(run.runId)}>Apply to future Sessions</button> : null}{run.state === "applied" ? <span className="muted-pill">Active context</span> : null}{jobs.filter((job) => job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {job.targetId.replaceAll("_", " ")}</button>)}</div></article>;
+          return <article className={`v2-evolution-job ${run.state}`} key={run.runId}><header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={16} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(run.createdAt)}</small></div></div><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></header>{run.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{run.error}</p></div> : null}<div className="v2-card-actions">{run.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy} onClick={() => onApplyRun(run.runId)}>Apply to future Sessions</button> : null}{run.state === "applied" ? <span className="muted-pill">Active context</span> : null}{jobs.filter((job) => job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></article>;
         })}</div></details> : null}
       </section> : null}
       {standaloneAvailable && artifacts.length ? <details className="v2-all-evolution-artifacts"><summary><span><FolderOpen size={15} /> Browse all Evolution artifacts</span><strong>{artifacts.length}</strong></summary><EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} /></details> : <EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} />}
@@ -3018,6 +3053,28 @@ function artifactStatusLabel(status: NonNullable<DesktopProductSnapshotV2["runti
     unavailable: "Content unavailable",
   } as const;
   return labels[status];
+}
+
+function evolutionRunStateLabel(state: "running" | "candidate_ready" | "applied" | "failed"): string {
+  const labels = {
+    running: "Running",
+    candidate_ready: "Candidate ready",
+    applied: "Applied",
+    failed: "Failed",
+  } as const;
+  return labels[state];
+}
+
+function evolutionTargetLabel(targetId: string): string {
+  const known = {
+    text_memory: "Text memory",
+    skill_bundle: "Skill bundle",
+    agent_system: "Agent system",
+    parametric_memory: "Parametric memory",
+  } as const;
+  if (targetId in known) return known[targetId as keyof typeof known];
+  const words = targetId.replaceAll("_", " ");
+  return words.length === 0 ? targetId : `${words[0]!.toUpperCase()}${words.slice(1)}`;
 }
 
 function formatBytes(bytes: number): string {

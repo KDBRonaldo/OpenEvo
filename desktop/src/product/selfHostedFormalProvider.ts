@@ -105,6 +105,7 @@ export function combineSelfHostedProviders(
   ]);
   let presentationAuthorityKey: string | null = null;
   let cachedPresentation: DesktopProductSnapshotV2["runtimePresentation"];
+  let cachedPresentationArtifacts: DesktopProductSnapshotV2["artifacts"] = [];
   let presentationLoaded = false;
   let presentationDirty = true;
   const refresh = async (): Promise<ProductRefreshResultV2> => {
@@ -132,13 +133,28 @@ export function combineSelfHostedProviders(
       const presentationResult = initialResults?.[1] ?? await presentation.refresh();
       if (presentationResult.status !== "fresh") return presentationResult;
       cachedPresentation = presentationResult.snapshot.runtimePresentation;
+      cachedPresentationArtifacts = presentationResult.snapshot.artifacts ?? [];
       presentationAuthorityKey = nextPresentationAuthorityKey;
       presentationLoaded = true;
       presentationDirty = false;
     }
     const compatibilityPresentation = cachedPresentation;
+    // Standalone Evolution publishes artifacts through the development bridge
+    // without mutating its source Task. Keep formal artifact authority when the
+    // same identity exists, but include bridge-only candidate artifacts so a
+    // cached Task detail cannot hide the result that the Evolution Run names.
+    const mergedArtifacts = new Map(
+      cachedPresentationArtifacts.map((artifact) => [artifact.artifact_id, artifact]),
+    );
+    for (const artifact of formalResult.snapshot.artifacts ?? []) {
+      mergedArtifacts.set(artifact.artifact_id, artifact);
+    }
     const snapshot: DesktopProductSnapshotV2 = {
       ...formalResult.snapshot,
+      artifacts: [...mergedArtifacts.values()].sort((left, right) => (
+        left.created_at.localeCompare(right.created_at)
+        || left.artifact_id.localeCompare(right.artifact_id)
+      )),
       runtimePresentation: compatibilityPresentation === undefined ? undefined : {
         ...compatibilityPresentation,
       },

@@ -17,6 +17,14 @@ function providerWith(
 describe("self-hosted formal provider", () => {
   it("keeps formal authority while merging readable development presentation", async () => {
     const formalSnapshot = { state: { active_project_id: "formal-project" } } as unknown as DesktopProductSnapshotV2;
+    const candidateArtifact = {
+      artifact_id: "candidate-artifact-1",
+      project_id: "formal-project",
+      artifact_type: "text_memory",
+      manifest_sha256: "a".repeat(64),
+      byte_size: 128,
+      created_at: "2026-08-26T10:00:00Z",
+    } as DesktopProductSnapshotV2["artifacts"][number];
     const runtimePresentation = {
       tasks: {
         "task-1": {
@@ -39,7 +47,10 @@ describe("self-hosted formal provider", () => {
     const presentation = providerWith({
       refresh: vi.fn(async () => ({
         status: "fresh" as const,
-        snapshot: { runtimePresentation } as unknown as DesktopProductSnapshotV2,
+        snapshot: {
+          artifacts: [candidateArtifact],
+          runtimePresentation,
+        } as unknown as DesktopProductSnapshotV2,
       })),
     });
 
@@ -48,6 +59,7 @@ describe("self-hosted formal provider", () => {
     expect(result.status).toBe("fresh");
     if (result.status !== "fresh") throw new Error("expected a fresh snapshot");
     expect(result.snapshot.state.active_project_id).toBe("formal-project");
+    expect(result.snapshot.artifacts).toEqual([candidateArtifact]);
     expect(result.snapshot.runtimePresentation).toEqual(runtimePresentation);
   });
 
@@ -85,6 +97,53 @@ describe("self-hosted formal provider", () => {
     taskUpdatedAt = "2026-08-26T10:00:01Z";
     await combined.refresh();
     expect(presentationRefresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes bridge-only Evolution artifacts even when the source Task is unchanged", async () => {
+    const candidateArtifact = {
+      artifact_id: "candidate-artifact-2",
+      project_id: "project-1",
+      artifact_type: "skill_bundle",
+      manifest_sha256: "b".repeat(64),
+      byte_size: 256,
+      created_at: "2026-08-26T10:01:00Z",
+    } as DesktopProductSnapshotV2["artifacts"][number];
+    const formalSnapshot = {
+      state: { active_project_id: "project-1" },
+      projects: [{ project_id: "project-1" }],
+      tasks: [{ task_id: "task-1", updated_at: "2026-08-26T10:00:00Z" }],
+      artifacts: [],
+    } as unknown as DesktopProductSnapshotV2;
+    let artifactPublished = false;
+    const presentationRefresh = vi.fn(async () => ({
+      status: "fresh" as const,
+      snapshot: {
+        artifacts: artifactPublished ? [candidateArtifact] : [],
+        runtimePresentation: { tasks: {}, artifacts: {} },
+      } as unknown as DesktopProductSnapshotV2,
+    }));
+    const combined = combineSelfHostedProviders(
+      providerWith({
+        refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot: formalSnapshot })),
+      }),
+      providerWith({
+        refresh: presentationRefresh,
+        startEvolutionRun: vi.fn(async () => { artifactPublished = true; }),
+      }),
+    );
+
+    await combined.refresh();
+    await combined.startEvolutionRun?.("project-1", ["task-1"], [{
+      targetId: "skill_bundle",
+      method: "skill_bundle_reflector",
+      config: {},
+    }], { actionId: "action-evolution-refresh", streamEpoch: 1 });
+    const result = await combined.refresh();
+
+    expect(presentationRefresh).toHaveBeenCalledTimes(2);
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("expected a fresh snapshot");
+    expect(result.snapshot.artifacts).toEqual([candidateArtifact]);
   });
 
   it("routes project and task mutations formally but standalone Evolution explicitly to the proven bridge", async () => {

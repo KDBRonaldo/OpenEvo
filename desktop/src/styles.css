@@ -5311,6 +5311,90 @@ pre.json {
   overflow-wrap: anywhere;
 }
 
+.evolution-stepper {
+  position: sticky;
+  top: -1px;
+  z-index: 8;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: 0 8px 24px rgb(21 48 44 / 7%);
+  backdrop-filter: blur(12px);
+}
+
+.evolution-stepper > svg {
+  color: var(--line-strong);
+}
+
+.evolution-stepper button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.evolution-stepper button:hover,
+.evolution-stepper button.active {
+  color: var(--ink);
+  background: var(--surface-soft);
+}
+
+.evolution-stepper button > span {
+  display: grid;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.evolution-stepper button.complete > span,
+.evolution-stepper button.active > span {
+  border-color: var(--accent);
+  color: white;
+  background: var(--accent);
+}
+
+.evolution-stepper button div,
+.evolution-stepper button strong,
+.evolution-stepper button small {
+  display: block;
+  min-width: 0;
+}
+
+.evolution-stepper button strong {
+  color: inherit;
+  font-size: 12px;
+}
+
+.evolution-stepper button small {
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evolution-step-section {
+  scroll-margin-top: 82px;
+}
+
 .v2-current-evolution-run {
   margin-top: 14px;
   padding: 18px;
@@ -5409,6 +5493,66 @@ pre.json {
   background: var(--surface-soft);
 }
 
+.v2-current-evolution-empty > div,
+.v2-current-evolution-empty strong,
+.v2-current-evolution-empty span {
+  display: block;
+}
+
+.v2-current-evolution-empty strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.v2-current-evolution-empty div > span {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.v2-current-evolution-empty.loading .secondary-button {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.v2-evolution-apply-bar {
+  position: sticky;
+  bottom: -1px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px -18px -18px;
+  padding: 13px 18px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 9px 9px;
+  background: color-mix(in srgb, var(--surface) 96%, transparent);
+  box-shadow: 0 -8px 24px rgb(21 48 44 / 5%);
+  backdrop-filter: blur(10px);
+}
+
+.v2-evolution-apply-bar > div:first-child,
+.v2-evolution-apply-bar strong,
+.v2-evolution-apply-bar span {
+  display: block;
+}
+
+.v2-evolution-apply-bar strong {
+  font-size: 12px;
+}
+
+.v2-evolution-apply-bar > div:first-child > span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.v2-evolution-apply-bar .v2-card-actions {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
 .v2-evolution-history,
 .v2-all-evolution-artifacts {
   margin-top: 14px;
@@ -5468,12 +5612,30 @@ pre.json {
 }
 
 @media (max-width: 920px) {
+  .evolution-stepper {
+    grid-template-columns: 1fr;
+  }
+
+  .evolution-stepper > svg {
+    display: none;
+  }
+
   .v2-current-evolution-result {
     grid-template-columns: 1fr;
   }
 
   .v2-current-evolution-tabs {
     grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+
+  .v2-evolution-apply-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .v2-evolution-apply-bar .v2-card-actions,
+  .v2-evolution-apply-bar .primary-button {
+    width: 100%;
   }
 }
 
