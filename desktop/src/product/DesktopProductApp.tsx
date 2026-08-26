@@ -18,6 +18,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Search,
   Server,
   Settings,
   ShieldCheck,
@@ -75,6 +76,58 @@ type StartingSessionV2 = {
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width";
+const PROJECT_SESSION_SELECTIONS_KEY = "openevo.desktop.navigation.project-session-selections";
+const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
+
+function readPersistedRecord(storageKey: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(globalThis.localStorage?.getItem(storageKey) ?? "{}") as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => (
+      typeof entry[1] === "string"
+    )));
+  } catch {
+    return {};
+  }
+}
+
+function persistRecord(storageKey: string, value: Readonly<Record<string, string>>): void {
+  try {
+    globalThis.localStorage?.setItem(storageKey, JSON.stringify(value));
+  } catch {
+    // Navigation persistence is optional when browser storage is unavailable.
+  }
+}
+
+function compareTasksNewestFirst(left: TaskV2, right: TaskV2): number {
+  return right.updated_at.localeCompare(left.updated_at) || right.task_id.localeCompare(left.task_id);
+}
+
+function preferredTaskIdV2(
+  projectId: string,
+  tasks: readonly TaskV2[],
+  remembered: Readonly<Record<string, string>>,
+): string | null {
+  const projectTasks = tasks.filter((task) => task.project_id === projectId);
+  const rememberedId = remembered[projectId];
+  if (rememberedId && projectTasks.some((task) => task.task_id === rememberedId)) return rememberedId;
+  return null;
+}
+
+function taskStateLabelV2(state: TaskV2["state"]): string {
+  const labels: Record<TaskV2["state"], string> = {
+    admitted: "已接收",
+    preparing: "准备中",
+    running: "运行中",
+    cancelling: "取消中",
+    completed: "已完成",
+    failed: "失败",
+    cancelled: "已取消",
+    closed: "已关闭",
+    waiting_for_successor: "等待进化",
+  };
+  return labels[state];
+}
 
 function clampPaneWidth(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, Math.round(value)));
@@ -219,6 +272,7 @@ export function DesktopProductApp({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [switchingProjectId, setSwitchingProjectId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [startingSession, setStartingSession] = useState<StartingSessionV2 | null>(null);
@@ -246,6 +300,18 @@ export function DesktopProductApp({
   const refreshInFlight = useRef<Promise<DesktopProductSnapshotV2 | null> | null>(null);
   const snapshotRef = useRef<DesktopProductSnapshotV2 | null>(null);
   const projectRecoveryRefreshInFlight = useRef(false);
+  const selectedSessionByProject = useRef<Record<string, string>>(
+    readPersistedRecord(PROJECT_SESSION_SELECTIONS_KEY),
+  );
+  const resolvedSelectionProjectId = useRef<string | null>(null);
+
+  const rememberSelectedSession = useCallback((projectId: string, taskId: string): void => {
+    selectedSessionByProject.current = {
+      ...selectedSessionByProject.current,
+      [projectId]: taskId,
+    };
+    persistRecord(PROJECT_SESSION_SELECTIONS_KEY, selectedSessionByProject.current);
+  }, []);
 
   const refresh = useCallback((): Promise<DesktopProductSnapshotV2 | null> => {
     refreshRequestSequence.current += 1;
@@ -301,6 +367,24 @@ export function DesktopProductApp({
     void refresh();
     return provider.subscribe(() => void refresh());
   }, [provider, refresh]);
+
+  useEffect(() => {
+    const activeProjectId = snapshot?.state.active_project_id ?? null;
+    if (activeProjectId === null || switchingProjectId !== null) return;
+    if (resolvedSelectionProjectId.current === activeProjectId) return;
+    resolvedSelectionProjectId.current = activeProjectId;
+    setSelectedTaskId(preferredTaskIdV2(
+      activeProjectId,
+      snapshot?.tasks ?? [],
+      selectedSessionByProject.current,
+    ));
+  }, [snapshot?.state.active_project_id, snapshot?.tasks, switchingProjectId]);
+
+  useEffect(() => {
+    if (actionStatus === null) return;
+    const timer = globalThis.setTimeout(() => setActionStatus(null), 3_200);
+    return () => globalThis.clearTimeout(timer);
+  }, [actionStatus]);
 
   useEffect(() => {
     if (!openConnectionSettings || snapshot === null) return;
@@ -386,15 +470,17 @@ export function DesktopProductApp({
   const activeProject = snapshot.projects.find(
     (project) => project.project_id === snapshot.state.active_project_id,
   ) ?? null;
-  const displayedProject = activeProject;
+  const displayedProject = snapshot.projects.find(
+    (project) => project.project_id === (switchingProjectId ?? snapshot.state.active_project_id),
+  ) ?? activeProject;
   const activeProfile = snapshot.profiles.find(
     (profile) => profile.profile_id === snapshot.state.active_profile_id,
   ) ?? null;
   const connectedProfiles = snapshot.profiles.filter(isConnectedProfile);
   const generation = displayedProject?.active_project_head?.generation ?? 0;
-  const displayedProjectTasks = displayedProject === null ? [] : snapshot.tasks.filter(
-    (task) => task.project_id === displayedProject.project_id,
-  );
+  const displayedProjectTasks = displayedProject === null ? [] : snapshot.tasks
+    .filter((task) => task.project_id === displayedProject.project_id)
+    .sort(compareTasksNewestFirst);
   const displayedWorkspace = displayedProject === null
     ? undefined
     : snapshot.runtimePresentation?.workspaces?.[displayedProject.project_id];
@@ -429,7 +515,6 @@ export function DesktopProductApp({
       task,
       phase: "validating",
     });
-    setBusy(true);
     setActionError(null);
     setActionStatus(null);
     try {
@@ -505,9 +590,8 @@ export function DesktopProductApp({
         throw new Error("The admitted Session was not visible in the refreshed remote state.");
       }
       setSelectedTaskId(submittedTask.task_id);
-      setActionStatus(developmentAgentBridge
-        ? "The remote Session started. Its transcript will become reusable evidence in Evolution."
-        : "Task admitted with immutable Project Head and execution authority.");
+      rememberSelectedSession(project.project_id, submittedTask.task_id);
+      setActionStatus("Session 已启动，完成后的对话记录可用于后续进化。");
       return true;
     } catch (error) {
       setActionError(userMessageV2(error));
@@ -515,27 +599,47 @@ export function DesktopProductApp({
       return false;
     } finally {
       setStartingSession(null);
-      setBusy(false);
     }
   };
 
   const selectProject = (projectId: string): void => {
     const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
-    if (!project) return;
+    if (!project || switchingProjectId !== null) return;
     setSelectedWorkspacePath(null);
     setWorkspace("research");
+    const preferredTaskId = preferredTaskIdV2(
+      projectId,
+      snapshot.tasks,
+      selectedSessionByProject.current,
+    );
+    setSelectedTaskId(preferredTaskId);
     if (project.project_id === activeProject?.project_id) {
-      setSelectedTaskId(snapshot.tasks.find((task) => task.project_id === projectId)?.task_id ?? null);
       return;
     }
-    setSelectedTaskId(null);
-    void act(
-      () => provider.activateProject(project.project_id, intentFor(snapshot, "activate-project")),
-      `Switched to ${project.display_name}.`,
-    ).then((result) => {
-      if (result === null || result.snapshot === null) return;
-      setSelectedTaskId(result.snapshot.tasks.find((task) => task.project_id === projectId)?.task_id ?? null);
-    });
+    setSwitchingProjectId(projectId);
+    setActionError(null);
+    setActionStatus(null);
+    void (async () => {
+      try {
+        await provider.activateProject(project.project_id, intentFor(snapshot, "activate-project"));
+        const refreshed = await refresh();
+        if (refreshed === null || refreshed.state.active_project_id !== projectId) {
+          throw new Error("切换后的 Project 状态尚未同步，请重试。");
+        }
+        resolvedSelectionProjectId.current = projectId;
+        setSelectedTaskId(preferredTaskIdV2(
+          projectId,
+          refreshed.tasks,
+          selectedSessionByProject.current,
+        ));
+      } catch (error) {
+        setActionError(userMessageV2(error));
+        resolvedSelectionProjectId.current = null;
+        await refresh();
+      } finally {
+        setSwitchingProjectId(null);
+      }
+    })();
   };
 
   const uploadWorkspaceFiles = (files: readonly File[], overwrite: boolean): void => {
@@ -582,16 +686,16 @@ export function DesktopProductApp({
         "--session-pane-width": `${sessionPaneWidth}px`,
       } as CSSProperties}
     >
-      <aside className="product-activitybar" aria-label="Primary navigation">
+      <aside className="product-activitybar" aria-label="主导航">
         <div className="product-brand" aria-label="OpenEvo Desktop" title="OpenEvo Desktop">
           <span className="product-mark"><OpenEvoMark /></span>
         </div>
-        <nav className="product-nav" aria-label="Workspace views">
-          <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>Research</WorkspaceButton>
-          <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
-          <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>System</WorkspaceButton>
+        <nav className="product-nav" aria-label="工作区视图">
+          <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>研究</WorkspaceButton>
+          <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>进化</WorkspaceButton>
+          <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>系统</WorkspaceButton>
         </nav>
-        <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
+        <button type="button" className="activitybar-settings" aria-label="远程工作区设置" title="远程工作区设置" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
       </aside>
 
       <ProjectExplorerV2
@@ -599,7 +703,8 @@ export function DesktopProductApp({
         activeProject={displayedProject}
         workspace={displayedWorkspace}
         selectedPath={selectedWorkspacePath}
-        busy={busy}
+        busy={busy || startingSession !== null}
+        switching={switchingProjectId !== null}
         fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
         onSelectProject={selectProject}
         onCreateProject={() => { setProjectEditing(false); setProjectOpen(true); }}
@@ -615,7 +720,12 @@ export function DesktopProductApp({
         tasks={displayedProjectTasks}
         presentation={snapshot.runtimePresentation?.tasks}
         selectedTaskId={selectedTaskId}
-        onSelectTask={(taskId) => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(taskId); }}
+        onSelectTask={(taskId) => {
+          setWorkspace("research");
+          setSelectedWorkspacePath(null);
+          setSelectedTaskId(taskId);
+          if (displayedProject) rememberSelectedSession(displayedProject.project_id, taskId);
+        }}
         onNewSession={() => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(null); }}
         paneWidth={sessionPaneWidth}
         onResizePane={setSessionPaneWidth}
@@ -623,37 +733,38 @@ export function DesktopProductApp({
 
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
+          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "文件" : "Session" : workspace === "evolution" ? "进化" : "系统"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
           <div className="topbar-actions">
             {displayedProject === null && connectedProfiles.length > 0 ? (
               <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
-                <FolderOpen size={15} /> New project
+                <FolderOpen size={15} /> 新建项目
               </button>
             ) : null}
             {activeProfile && activeProfile.profile_kind === "system_openssh" ? (
               <>
                 <div className={`connection-badge ${activeProfile.connection_state === "connected" ? "success" : "neutral"}`} title={`${activeProfile.display_name}: ${connectionLabel(activeProfile.connection_state)}`}><span className="status-dot" /><span>{activeProfile.display_name}</span><strong>{connectionLabel(activeProfile.connection_state)}</strong></div>
-                <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
+                <button type="button" className="icon-button" aria-label="远程工作区设置" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
               </>
             ) : (
-              <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> Add remote workspace</button>
+              <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> 添加远程工作区</button>
             )}
           </div>
         </header>
 
         <main className="product-main">
-          {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
-          {actionError ? <Notice tone="error" title="Action could not be completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
+          {loadError ? <Notice tone="error" title="刷新失败" detail={loadError} /> : null}
+          {actionError ? <Notice tone="error" title="操作未完成" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
           {developmentAgentBridge ? (
             <Notice
-              tone="warning"
-              title="Real-agent development mode"
-              detail="Agent replies come from the remote Codex CLI. Project and Session history are persisted by the remote development daemon; standalone Evolution is available through the unverified development registry."
+              tone="info"
+              title="远程 Agent 模式"
+              detail="回复来自远程 Codex CLI，Project 与 Session 历史由远程 daemon 持久化。"
+              compact
             />
           ) : null}
-          {actionStatus ? <Notice tone="success" title={developmentAgentBridge ? "Development session updated" : "Remote authority updated"} detail={actionStatus} onDismiss={() => setActionStatus(null)} /> : null}
+          {actionStatus ? <Notice tone="success" title="操作成功" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
           {snapshot.stream.status !== "fresh" ? (
-            <Notice tone="warning" title="Refreshing authoritative state" detail="Actions remain paused until Desktop reloads current remote state." />
+            <Notice tone="warning" title="正在同步远程状态" detail="同步完成前，写入操作将暂时停用。" compact />
           ) : null}
 
           {displayedProject === null ? (
@@ -667,7 +778,7 @@ export function DesktopProductApp({
               project={displayedProject}
               entry={selectedWorkspaceEntry}
               fileTransferAvailable={provider.downloadWorkspaceFile !== undefined}
-              busy={busy}
+              busy={busy || switchingProjectId !== null}
               onDownload={() => downloadWorkspaceFile(selectedWorkspaceEntry.path)}
             />
           ) : workspace === "research" ? (
@@ -682,10 +793,13 @@ export function DesktopProductApp({
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
               startingSession={startingSession?.projectId === displayedProject.project_id ? startingSession : null}
-              busy={busy}
+              busy={busy || switchingProjectId !== null}
               sessionStartBlocked={developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
-              onSelectTask={setSelectedTaskId}
+              onSelectTask={(taskId) => {
+                setSelectedTaskId(taskId);
+                if (taskId !== null) rememberSelectedSession(displayedProject.project_id, taskId);
+              }}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
               onRun={(task, selectedEvolutionTargets, projectHead) => (
@@ -693,18 +807,18 @@ export function DesktopProductApp({
               )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
-                "Task cancellation requested.",
+                "已提交 Session 取消请求。",
               )}
               onRetryTask={(task) => void act(
                 () => provider.retryTask(task.task_id, intentFor(snapshot, "retry-task")),
-                "A new infrastructure Attempt was requested under the same Task Admission.",
+                "已在同一 Session 记录下请求新的运行尝试。",
               )}
               onRetryEvolutionJob={(jobId) => void act(
                 async () => {
                   if (!provider.retryEvolutionJob) throw new Error("This backend does not support retrying an individual Evolution method.");
                   await provider.retryEvolutionJob(jobId, intentFor(snapshot, "retry-evolution-job"));
                 },
-                "The failed Evolution method is running again with the original Session inputs.",
+                "失败的进化方法正在使用原始 Session 输入重新运行。",
               )}
               onLoadTaskLogs={async (taskId) => {
                 setBusy(true);
@@ -720,11 +834,11 @@ export function DesktopProductApp({
               }}
               onRetryTransition={(transition) => void act(
                 () => provider.retryTransition(transition.transition.successor_transition_id, intentFor(snapshot, "retry-transition")),
-                "Successor transition retry requested.",
+                "已提交后继版本重试请求。",
               )}
               onAbandonTransition={(transition) => void act(
                 () => provider.abandonTransition(transition.transition.successor_transition_id, intentFor(snapshot, "abandon-transition")),
-                "Successor transition abandonment requested.",
+                "已放弃该后继进化结果。",
               )}
             />
           ) : workspace === "evolution" ? (
@@ -1365,6 +1479,7 @@ function ProjectExplorerV2({
   workspace,
   selectedPath,
   busy,
+  switching,
   fileTransferAvailable,
   onSelectProject,
   onCreateProject,
@@ -1379,6 +1494,7 @@ function ProjectExplorerV2({
   readonly workspace: ProjectWorkspacePresentationV2 | undefined;
   readonly selectedPath: string | null;
   readonly busy: boolean;
+  readonly switching: boolean;
   readonly fileTransferAvailable: boolean;
   readonly onSelectProject: (projectId: string) => void;
   readonly onCreateProject: () => void;
@@ -1399,12 +1515,15 @@ function ProjectExplorerV2({
   });
   return (
     <aside className="project-explorer" aria-label="Project explorer">
-      <div className="explorer-heading"><span>Project</span><button type="button" aria-label="Create project" title="Create project" disabled={busy} onClick={onCreateProject}><Plus size={15} /></button></div>
-      <select id="v2-project-switcher" aria-label="Select project" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
-        {projects.length === 0 ? <option value="">No projects</option> : null}
-        {projects.map((project) => <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>)}
-      </select>
-      <div className="explorer-section-heading"><span>Files</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
+      <div className="explorer-heading"><span>项目</span><button type="button" aria-label="新建项目" title="新建项目" disabled={busy || switching} onClick={onCreateProject}><Plus size={15} /></button></div>
+      <div className={`project-switcher-shell${switching ? " switching" : ""}`}>
+        <select id="v2-project-switcher" aria-label="选择项目" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || switching || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
+          {projects.length === 0 ? <option value="">暂无项目</option> : null}
+          {projects.map((project) => <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>)}
+        </select>
+        {switching ? <span className="project-switching-indicator" role="status"><LoaderCircle className="spin" size={14} /> 正在切换</span> : null}
+      </div>
+      <div className="explorer-section-heading"><span>文件</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="选择要上传的文件" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
         if (selectedFiles.length === 0) return;
@@ -1413,7 +1532,7 @@ function ProjectExplorerV2({
         if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
         onUpload(selectedFiles, hasCollision);
       }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={14} /></button></> : null}</div></div>
-      <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
+      <div className="explorer-file-tree" role="tree" aria-label="项目工作区文件">
         {visibleEntries.length ? visibleEntries.map((entry) => {
           const depth = Math.max(0, entry.path.split("/").length - 1);
           const name = entry.path.split("/").at(-1) ?? entry.path;
@@ -1432,11 +1551,11 @@ function ProjectExplorerV2({
             {entry.kind === "directory" ? <FolderOpen size={14} /> : <FileText size={14} />}
             <span title={entry.path}>{name}</span>
           </button>;
-        }) : <div className="explorer-empty">No files yet</div>}
+        }) : <div className="explorer-empty">暂无文件</div>}
       </div>
-      {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
-      <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
-      <VerticalResizeHandle label="Resize Project pane" value={paneWidth} defaultValue={248} minimum={180} maximum={440} onChange={onResizePane} />
+      {workspace?.truncated ? <div className="explorer-warning">文件预览已截断。</div> : null}
+      <div className="explorer-foot"><CircleDot size={13} /><span>当前 Project Head {generation}</span></div>
+      <VerticalResizeHandle label="调整项目栏宽度" value={paneWidth} defaultValue={248} minimum={180} maximum={440} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1460,14 +1579,60 @@ function SessionExplorerV2({
   readonly paneWidth: number;
   readonly onResizePane: (width: number) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "active" | "completed" | "failed">("all");
+  const listRef = useRef<HTMLDivElement>(null);
+  const projectId = project?.project_id ?? null;
+  const sortedTasks = useMemo(() => [...tasks].sort(compareTasksNewestFirst), [tasks]);
+  const visibleTasks = useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    return sortedTasks.filter((task) => {
+      const stateMatches = filter === "all"
+        || (filter === "active" && ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state))
+        || (filter === "completed" && ["completed", "closed"].includes(task.state))
+        || (filter === "failed" && ["failed", "cancelled"].includes(task.state));
+      const title = presentation?.[task.task_id]?.instruction?.title ?? task.task_id;
+      return stateMatches && (normalizedQuery === "" || title.toLocaleLowerCase().includes(normalizedQuery));
+    });
+  }, [filter, presentation, query, sortedTasks]);
+  useEffect(() => {
+    setQuery("");
+    setFilter("all");
+    if (projectId === null) return;
+    const remembered = Number.parseFloat(readPersistedRecord(PROJECT_SESSION_SCROLLS_KEY)[projectId] ?? "0");
+    const timer = globalThis.setTimeout(() => {
+      if (listRef.current) listRef.current.scrollTop = Number.isFinite(remembered) ? remembered : 0;
+    }, 0);
+    return () => globalThis.clearTimeout(timer);
+  }, [projectId]);
+  const rememberScroll = (): void => {
+    if (projectId === null || listRef.current === null) return;
+    persistRecord(PROJECT_SESSION_SCROLLS_KEY, {
+      ...readPersistedRecord(PROJECT_SESSION_SCROLLS_KEY),
+      [projectId]: String(Math.round(listRef.current.scrollTop)),
+    });
+  };
   return (
     <aside className="session-explorer" aria-label="Project sessions">
-      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="New session" title="New session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
-      <div className="session-explorer-project">{project?.display_name ?? "No project selected"}</div>
-      <div className="session-explorer-list">
-        {tasks.length ? tasks.map((task, index) => <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{presentation?.[task.task_id]?.instruction?.title ?? `Session ${tasks.length - index}`}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{task.state.replaceAll("_", " ")}</em></button>) : <div className="explorer-empty">No Sessions yet. Create the first task in the central workspace.</div>}
+      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="新建 Session" title="新建 Session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
+      <div className="session-explorer-project" title={project?.display_name}>{project?.display_name ?? "未选择项目"}</div>
+      <div className="session-explorer-tools">
+        <label className="session-search"><Search size={13} /><input type="search" aria-label="搜索 Session" placeholder="搜索 Session" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+        <select aria-label="筛选 Session 状态" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
+          <option value="all">全部</option>
+          <option value="active">进行中</option>
+          <option value="completed">已完成</option>
+          <option value="failed">失败/取消</option>
+        </select>
       </div>
-      <VerticalResizeHandle label="Resize Session list pane" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />
+      <div className="session-result-count">显示 {visibleTasks.length} / {tasks.length}</div>
+      <div ref={listRef} className="session-explorer-list" onScroll={rememberScroll}>
+        {visibleTasks.length ? visibleTasks.map((task, index) => {
+          const title = presentation?.[task.task_id]?.instruction?.title ?? `Session ${sortedTasks.length - index}`;
+          return <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)} title={title}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{taskStateLabelV2(task.state)}</em></button>;
+        }) : <div className="explorer-empty">{tasks.length ? "没有符合条件的 Session" : "暂无 Session，点击右上角 + 创建。"}</div>}
+      </div>
+      <VerticalResizeHandle label="调整 Session 栏宽度" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />
     </aside>
   );
 }
@@ -1585,7 +1750,9 @@ function ResearchWorkspaceV2({
   readonly onRetryTransition: (transition: SuccessorTransitionV2) => void;
   readonly onAbandonTransition: (transition: SuccessorTransitionV2) => void;
 }) {
-  const projectTasks = tasks.filter((task) => task.project_id === project.project_id);
+  const projectTasks = tasks
+    .filter((task) => task.project_id === project.project_id)
+    .sort(compareTasksNewestFirst);
   const selectedTask = projectTasks.find((task) => task.task_id === selectedTaskId) ?? null;
   const observedTask = selectedTask ?? projectTasks[0] ?? null;
   const activeTask = projectTasks.find((task) => ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)) ?? null;
@@ -1654,6 +1821,7 @@ function ResearchWorkspaceV2({
     (head) => head.project_head_id === selectedProjectHeadId,
   ) ?? null;
   const selectedEvolutionCount = Object.values(selectedEvolutionTargets).filter((target) => target.enabled).length;
+  const formBusy = busy || visibleStartingSession !== null;
   const normalizedTask = {
     title: taskTitle.trim(),
     objective: taskObjective.trim(),
@@ -1674,9 +1842,6 @@ function ResearchWorkspaceV2({
       setOptimisticStartingSession(null);
     }
   };
-  if (visibleStartingSession !== null) {
-    return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
-  }
   if (selectedTask) {
     const transition = selectedTask.successor_transition
       ? transitions[selectedTask.successor_transition.successor_transition_id] ?? null
@@ -1690,7 +1855,7 @@ function ResearchWorkspaceV2({
         <div className="session-detail-navigation">
           <button type="button" className="session-back-button" onClick={() => onSelectTask(null)}>
             <ArrowLeft size={16} />
-            Back to {project.display_name}
+            返回 {project.display_name}
           </button>
         </div>
         <TaskAuthorityCardV2
@@ -1720,52 +1885,62 @@ function ResearchWorkspaceV2({
   return (
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
-        <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task against the Project Head whose evolved context you want to use.</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" disabled={busy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}><Play size={15} fill="currentColor" /> {sessionStartBlocked ? "Evolution running" : "Start session"}</button></div>
+        <div><p className="eyebrow">研究工作区</p><h1>{project.display_name}</h1><p>填写任务并选择要应用的 Project Head，随后启动新的 Session。</p></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> 编辑项目</button></div>
       </div>
+      {visibleStartingSession ? (
+        <div className="session-submit-progress" role="status">
+          <LoaderCircle className="spin" size={17} />
+          <div><strong>{visibleStartingSession.phase === "validating" ? "正在校验 Session" : "正在启动 Session"}</strong><span>表单内容已保留，你仍可查看其他区域。</span></div>
+        </div>
+      ) : null}
       {!ready ? (
         <div className="disabled-reason">
           <AlertCircle size={14} />
           <span>
-            <strong>Next task is not ready.</strong>{" "}
+            <strong>暂时无法启动下一个任务。</strong>{" "}
             {project.state === "not_ready" && project.active_project_head === null
-              ? "OpenEvo is preparing the remote services and Generation 0 Project Head. This page retries automatically."
-              : "The current successor, settings, workspace, or runtime transition must finish before Core can admit another Task."}
+              ? "OpenEvo 正在准备远程服务和初始 Project Head，本页面会自动重试。"
+              : "请等待当前进化、设置、工作区或运行时变更完成。"}
           </span>
           {project.state === "not_ready" && project.active_project_head === null ? (
-            <button type="button" className="text-button" disabled={busy} onClick={onRetryInitialization}>
-              Retry now
+            <button type="button" className="text-button" disabled={formBusy} onClick={onRetryInitialization}>
+              立即重试
             </button>
           ) : null}
         </div>
       ) : null}
       <div className="research-grid">
-      <section className="product-panel task-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">Task draft</span><h2>What should the agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state.replaceAll("_", " ")}</span></div>
+      <section className="product-panel task-panel" aria-busy={visibleStartingSession !== null}>
+        <div className="panel-heading"><div><span className="panel-kicker">Session 草稿</span><h2>希望 Agent 接下来做什么？</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "可启动" : "准备中"}</span></div>
         <div className="next-task-fields">
-          <label>Task title<input maxLength={256} value={taskTitle} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
-          <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={busy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
-          <label>Evolution context
-            <select value={selectedProjectHeadId} disabled={busy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
-              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " — active" : " — historical"}</option>)}
+          <label>任务标题<input maxLength={256} value={taskTitle} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
+          <label>任务说明<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
+          <label>进化上下文
+            <select value={selectedProjectHeadId} disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
+              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · 当前推荐" : " · 历史版本"}</option>)}
             </select>
           </label>
-          <p className="form-help">The Session pins this Project Head and applies its evolved artifacts as Agent context. Historical Sessions remain reproducible.</p>
+          <p className="form-help">本次 Session 会固定使用所选 Project Head 的进化产物；选择历史版本不会改变已有 Session。</p>
         </div>
-        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy || sessionStartBlocked}>
+        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
           <legend>Evolution after this session <span>Optional · formal contract</span></legend>
           <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
           <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
         </fieldset> : null}
-        {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? `${selectedEvolutionCount} selected` : "Run separately"}</strong></div></div>
+        {!taskValid ? <p className="form-error" role="status">请填写任务标题和任务说明。</p> : null}
+        <div className="brief-footer"><div><span>运行模式</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex 订阅" : "自部署"}</strong></div><div><span>记录</span><strong>Session 对话</strong></div><div><span>进化</span><strong>{sessionEvolutionAvailable ? `已选 ${selectedEvolutionCount} 项` : "单独运行"}</strong></div></div>
+        <div className="session-draft-actions">
+          <div><strong>{selectedProjectHead ? `Project Head ${selectedProjectHead.generation}` : "未选择 Project Head"}</strong><span>{sessionStartBlocked ? "进化运行期间暂不能启动" : "启动失败时将保留当前表单"}</span></div>
+          <button type="button" className="primary-button" disabled={formBusy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}>{formBusy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} {sessionStartBlocked ? "进化运行中" : visibleStartingSession ? "正在启动" : "启动 Session"}</button>
+        </div>
       </section>
       <section className="product-panel active-run-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
-        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "Open live session" : "Open session result"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>Cancel session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
+        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "最近的 Session" : "Session 状态"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "尚未选择 Session"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">就绪</span>}</div>
+        {observedTask ? <><div className="revision-pin"><div><span>固定上下文</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>接收方式</span><strong>不可变 Session 记录</strong></div><span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "该历史 Session 暂无任务说明。"}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "打开实时 Session" : "查看 Session 结果"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>取消 Session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>远程工作区就绪后即可启动 Session。</p></div>}
       </section>
       </div>
-      {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
+      {project.active_project_head ? <details className="v2-authority-details"><summary>查看不可变 Project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );
 }
@@ -2700,8 +2875,8 @@ function WorkspaceButton({ active, onClick, icon: Icon, children }: { readonly a
   return <button type="button" className={`product-nav-item ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={onClick}><Icon size={17} /> {children}</button>;
 }
 
-function Notice({ tone, title, detail, action, onDismiss }: { readonly tone: "error" | "warning" | "success" | "info"; readonly title: string; readonly detail: string; readonly action?: React.ReactNode; readonly onDismiss?: () => void }) {
-  return <div className={`v2-notice ${tone}`} role={tone === "error" ? "alert" : "status"}>{tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}<div><strong>{title}</strong><span>{detail}</span></div>{action}{onDismiss ? <button type="button" className="icon-button" aria-label="Dismiss message" onClick={onDismiss}><X size={15} /></button> : null}</div>;
+function Notice({ tone, title, detail, action, compact = false, onDismiss }: { readonly tone: "error" | "warning" | "success" | "info"; readonly title: string; readonly detail: string; readonly action?: React.ReactNode; readonly compact?: boolean; readonly onDismiss?: () => void }) {
+  return <div className={`v2-notice ${tone}${compact ? " compact" : ""}`} role={tone === "error" ? "alert" : "status"}>{tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}<div><strong>{title}</strong><span>{detail}</span></div>{action}{onDismiss ? <button type="button" className="icon-button" aria-label="关闭提示" onClick={onDismiss}><X size={15} /></button> : null}</div>;
 }
 
 function useDialogBoundary(onClose: () => void) {
@@ -2785,7 +2960,7 @@ function userMessageV2(error: unknown): string {
   if (error instanceof DesktopApiErrorV2) return error.apiError.summary;
   if (isDesktopErrorV2(error)) return error.summary;
   if (error instanceof Error && error.message.length > 0 && error.message.length <= 768) return error.message;
-  return "OpenEvo Desktop could not complete this action. Refresh the current authority and try again.";
+  return "OpenEvo 未能完成该操作，请刷新远程状态后重试。";
 }
 
 function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
@@ -2802,15 +2977,15 @@ function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
 
 function connectionLabel(state: RemoteWorkspaceProfileV2["connection_state"]): string {
   const labels: Record<RemoteWorkspaceProfileV2["connection_state"], string> = {
-    disconnected: "Disconnected",
-    connecting: "Starting system OpenSSH",
-    prompt_pending: "Waiting for native authentication",
-    host_key_review: "Host identity review required",
-    bootstrapping: "Checking or installing OpenEvo Daemon",
-    negotiating: "Negotiating exact Core v2 authority",
-    connected: "Connected",
-    disconnecting: "Disconnecting",
-    failed: "Connection failed",
+    disconnected: "未连接",
+    connecting: "正在连接 OpenSSH",
+    prompt_pending: "等待本机认证",
+    host_key_review: "需要确认主机身份",
+    bootstrapping: "正在检查 OpenEvo Daemon",
+    negotiating: "正在协商 Core authority",
+    connected: "已连接",
+    disconnecting: "正在断开",
+    failed: "连接失败",
   };
   return labels[state];
 }

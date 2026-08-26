@@ -665,6 +665,8 @@ describe("Desktop v2 product renderer", () => {
     window.localStorage.removeItem("openevo.desktop.layout.project-pane-width");
     window.localStorage.removeItem("openevo.desktop.layout.session-pane-width");
     window.localStorage.removeItem("openevo.desktop.layout.session-inspector-width");
+    window.localStorage.removeItem("openevo.desktop.navigation.project-session-selections");
+    window.localStorage.removeItem("openevo.desktop.navigation.project-session-scrolls");
     window.history.replaceState(null, "", window.location.pathname);
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -727,7 +729,7 @@ describe("Desktop v2 product renderer", () => {
   it("shows an explicit empty project state without demo authority", async () => {
     root = await render(providerFixture(baseSnapshot()));
 
-    expect(document.body.textContent).toContain("Active Project Head");
+    expect(document.body.textContent).toContain("当前 Project Head");
     expect(document.body.textContent).toContain("No project yet");
     expect(document.body.textContent).not.toContain("Demo Project Head");
   });
@@ -770,7 +772,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-activitybar")).toBeTruthy();
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
-    const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize Project pane"]');
+    const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="调整项目栏宽度"]');
     expect(projectResizer).toBeTruthy();
     await act(async () => projectResizer!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
     expect(document.querySelector<HTMLElement>(".product-v2-shell")?.style.getPropertyValue("--project-pane-width")).toBe("260px");
@@ -1133,7 +1135,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Unsupported conclusions are marked as hypotheses",
     );
-    expect(document.body.textContent).not.toContain("Task draft");
+    expect(document.body.textContent).not.toContain("Session 草稿");
     expect(document.querySelector(".session-explorer")).toBeTruthy();
 
     await click("Back to Protein study");
@@ -1141,7 +1143,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
-    expect(document.body.textContent).toContain("Task draft");
+    expect(document.body.textContent).toContain("Session 草稿");
     expect(document.querySelector(".session-explorer-list")).toBeTruthy();
   });
 
@@ -1263,7 +1265,26 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
-  it("opens a chat immediately while the remote Session is being admitted", async () => {
+  it("keeps the Session draft when admission fails", async () => {
+    const fixture = providerFixture(authoritySnapshot());
+    const provider = {
+      ...fixture,
+      validateProject: vi.fn(async () => {
+        throw new Error("Remote validation failed.");
+      }),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    setInput("Task title", "Keep this draft title");
+    setTextarea("Task instructions", "Keep this draft objective after the error.");
+    await click("Start session");
+
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Remote validation failed."));
+    expect(input("Task title").value).toBe("Keep this draft title");
+    expect(textarea("Task instructions").value).toBe("Keep this draft objective after the error.");
+  });
+
+  it("keeps the draft visible with local progress while the remote Session is being admitted", async () => {
     const snapshot = authoritySnapshot();
     let releaseSubmission!: (task: DesktopProductSnapshotV2["tasks"][number]) => void;
     const submission = new Promise<DesktopProductSnapshotV2["tasks"][number]>((resolve) => {
@@ -1281,9 +1302,10 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeTruthy();
+    expect(document.querySelector(".session-submit-progress")).toBeTruthy();
+    expect(document.querySelector('[data-testid="research-workspace"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
-    expect(document.body.textContent).toContain("Agent is starting");
+    expect(document.body.textContent).toContain("正在启动 Session");
 
     await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
     await act(async () => {
@@ -1293,7 +1315,7 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
     await vi.waitFor(() => {
-      expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeNull();
+      expect(document.querySelector(".session-submit-progress")).toBeNull();
       expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
     });
   });
@@ -1473,7 +1495,7 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     const createProject = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="Create project"]',
+      'button[aria-label="新建项目"]',
     );
     expect(createProject).toBeTruthy();
     await act(async () => createProject!.click());
@@ -1553,6 +1575,124 @@ describe("Desktop v2 product renderer", () => {
     ).toBeFalsy();
   });
 
+  it("restores each Project's last Session and Session-list scroll position", async () => {
+    const initial = authoritySnapshot();
+    const secondProject = {
+      ...initial.projects[0]!,
+      project_id: "project-2",
+      display_name: "Second protein study",
+      active_project_head: {
+        ...initial.projects[0]!.active_project_head!,
+        project_head_id: "project-head-second",
+        project_id: "project-2",
+      },
+    };
+    const secondTask = {
+      ...initial.tasks[0]!,
+      task_id: "task-2",
+      project_id: "project-2",
+      admission: {
+        ...initial.tasks[0]!.admission,
+        task_id: "task-2",
+        project_id: "project-2",
+        predecessor_project_head: secondProject.active_project_head,
+      },
+    };
+    let current: DesktopProductSnapshotV2 = {
+      ...initial,
+      projects: [...initial.projects, secondProject] as never,
+      tasks: [...initial.tasks, secondTask] as never,
+      runtimePresentation: {
+        ...initial.runtimePresentation!,
+        tasks: {
+          ...initial.runtimePresentation!.tasks,
+          "task-2": {
+            instruction: { title: "Second project session", objective: "Project two." },
+            transcript: [], outputFiles: [], usedArtifactIds: [], producedArtifactIds: [],
+          },
+        },
+      },
+    };
+    const fixture = providerFixture(current);
+    const provider = {
+      ...fixture,
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot: current })),
+      activateProject: vi.fn(async (projectId: string) => {
+        current = { ...current, state: { ...current.state, active_project_id: projectId } };
+        return { schema_version: "2" } as never;
+      }),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("Review evidence");
+    const firstList = document.querySelector<HTMLElement>(".session-explorer-list")!;
+    firstList.scrollTop = 120;
+    firstList.dispatchEvent(new Event("scroll"));
+
+    const switcher = document.querySelector<HTMLSelectElement>("#v2-project-switcher")!;
+    await act(async () => {
+      switcher.value = "project:project-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(switcher.disabled).toBe(false));
+    await click("Second project session");
+
+    await act(async () => {
+      switcher.value = "project:project-1";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(switcher.disabled).toBe(false));
+    await vi.waitFor(() => expect(
+      document.querySelector<HTMLButtonElement>('button[title="Review evidence"]')?.classList.contains("active"),
+    ).toBe(true));
+    await vi.waitFor(() => expect(document.querySelector<HTMLElement>(".session-explorer-list")?.scrollTop).toBe(120));
+  });
+
+  it("sorts Sessions newest-first and supports search and status filters", async () => {
+    const base = authoritySnapshot();
+    const baseTask = base.tasks[0]!;
+    const running = { ...baseTask, task_id: "task-running", state: "running" as const, updated_at: "2026-07-24T06:00:00Z" };
+    const failed = { ...baseTask, task_id: "task-failed", state: "failed" as const, updated_at: "2026-07-22T06:00:00Z" };
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      tasks: [baseTask, failed, running] as never,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        tasks: {
+          ...base.runtimePresentation!.tasks,
+          "task-running": { instruction: { title: "Newest running session", objective: "Run." }, transcript: [], outputFiles: [], usedArtifactIds: [], producedArtifactIds: [] },
+          "task-failed": { instruction: { title: "Older failed session", objective: "Fail." }, transcript: [], outputFiles: [], usedArtifactIds: [], producedArtifactIds: [] },
+        },
+      },
+    };
+    root = await render(providerFixture(snapshot));
+
+    const sessionButtons = () => [...document.querySelectorAll<HTMLButtonElement>(".session-explorer-list > button")];
+    expect(sessionButtons()[0]?.title).toBe("Newest running session");
+
+    const search = document.querySelector<HTMLInputElement>('input[aria-label="搜索 Session"]')!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(search, "failed");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(sessionButtons().map((item) => item.title)).toEqual(["Older failed session"]);
+
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(search, "");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      const filter = document.querySelector<HTMLSelectElement>('select[aria-label="筛选 Session 状态"]')!;
+      filter.value = "active";
+      filter.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(sessionButtons().map((item) => item.title)).toEqual(["Newest running session"]);
+  });
+
   it("renders a supported Core-owned selection resolver as the saved method", async () => {
     const snapshot = authoritySnapshot();
     const project = snapshot.projects[0]!;
@@ -1620,7 +1760,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
-    expect(document.body.textContent).not.toContain("Task draft");
+    expect(document.body.textContent).not.toContain("Session 草稿");
     expect(
       [...document.querySelectorAll("button")].some((candidate) =>
         candidate.textContent?.includes("Start session"),
@@ -1656,7 +1796,7 @@ describe("Desktop v2 product renderer", () => {
 
     expect(button("Start session").disabled).toBe(true);
     expect(document.body.textContent).toContain(
-      "OpenEvo is preparing the remote services and Generation 0 Project Head",
+      "OpenEvo 正在准备远程服务和初始 Project Head",
     );
 
     const refreshCalls = provider.refresh.mock.calls.length;
@@ -1744,8 +1884,8 @@ describe("Desktop v2 product renderer", () => {
     expect(cancelTask).toHaveBeenCalledWith("task-1", expect.objectContaining({ streamEpoch: 1 }));
 
     await click("Back to Protein study");
-    expect(document.body.textContent).toContain("Open live session");
-    expect(document.body.textContent).toContain("Cancel session");
+    expect(document.body.textContent).toContain("打开实时 Session");
+    expect(document.body.textContent).toContain("取消 Session");
   });
 
   it("hides the transient Agent activity after the Session is complete", async () => {
@@ -2259,7 +2399,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).not.toContain(
       "Desktop Local API request timed out",
     );
-    expect(document.body.textContent).toContain("Project creation started");
+    expect(document.body.textContent).not.toContain("Project creation started");
     expect(
       Array.from(document.querySelectorAll("button")).some(
         (candidate) => candidate.textContent?.trim() === "Create project",
@@ -2319,10 +2459,23 @@ async function render(provider: DesktopProductProviderV2): Promise<Root> {
   return root;
 }
 
+const TEST_LABEL_ALIASES: Readonly<Record<string, string>> = {
+  "Add remote workspace": "添加远程工作区",
+  Evolution: "进化",
+  System: "系统",
+  "Task title": "任务标题",
+  "Task instructions": "任务说明",
+  "Start session": "启动 Session",
+  "Evolution running": "进化运行中",
+  "Retry now": "立即重试",
+  "Back to Protein study": "返回 Protein study",
+};
+
 function button(label: string): HTMLButtonElement {
+  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const match = [
     ...document.querySelectorAll<HTMLButtonElement>("button"),
-  ].find((candidate) => candidate.textContent?.trim().includes(label));
+  ].find((candidate) => candidate.textContent?.trim().includes(localized));
   if (!match) throw new Error(`button not found: ${label}`);
   return match;
 }
@@ -2341,9 +2494,10 @@ function dialog(): HTMLElement | null {
 }
 
 function setInput(label: string, value: string): void {
+  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
   const owner = labels.find((candidate) =>
-    candidate.textContent?.includes(label),
+    candidate.textContent?.includes(localized),
   );
   const input = owner?.querySelector<HTMLInputElement>("input");
   if (!input) throw new Error(`input not found: ${label}`);
@@ -2359,9 +2513,10 @@ function setInput(label: string, value: string): void {
 }
 
 function setTextarea(label: string, value: string): void {
+  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
   const owner = labels.find((candidate) =>
-    candidate.textContent?.includes(label),
+    candidate.textContent?.includes(localized),
   );
   const input = owner?.querySelector<HTMLTextAreaElement>("textarea");
   if (!input) throw new Error(`textarea not found: ${label}`);
@@ -2391,8 +2546,9 @@ function setAriaTextarea(label: string, value: string): void {
 }
 
 function input(label: string): HTMLInputElement {
+  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const owner = [...document.querySelectorAll<HTMLLabelElement>("label")].find(
-    (candidate) => candidate.textContent?.includes(label),
+    (candidate) => candidate.textContent?.includes(localized),
   );
   const control = owner?.querySelector<HTMLInputElement>("input");
   if (!control) throw new Error(`input not found: ${label}`);
@@ -2400,8 +2556,9 @@ function input(label: string): HTMLInputElement {
 }
 
 function textarea(label: string): HTMLTextAreaElement {
+  const localized = TEST_LABEL_ALIASES[label] ?? label;
   const owner = [...document.querySelectorAll<HTMLLabelElement>("label")].find(
-    (candidate) => candidate.textContent?.includes(label),
+    (candidate) => candidate.textContent?.includes(localized),
   );
   const control = owner?.querySelector<HTMLTextAreaElement>("textarea");
   if (!control) throw new Error(`textarea not found: ${label}`);

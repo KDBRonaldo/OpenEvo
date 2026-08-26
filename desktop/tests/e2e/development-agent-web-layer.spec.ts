@@ -66,7 +66,7 @@ test("real browser can create a project, run an agent session, and produce evolu
   await test.step("open the real development product through Vite and Web Layer", async () => {
     await page.goto(PRODUCT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await expect(page.locator(".product-shell")).toBeVisible({ timeout: 60_000 });
-    await expect(page.getByText("Real-agent development mode", { exact: true })).toBeVisible();
+    await expect(page.getByText("远程 Agent 模式", { exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add remote workspace" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Remote workspace settings" }).first()).toBeVisible();
     expect(observedRequests).toContain("GET /desktop/v2/state");
