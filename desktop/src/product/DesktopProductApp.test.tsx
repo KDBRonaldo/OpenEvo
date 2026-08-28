@@ -779,6 +779,9 @@ describe("Desktop v2 product renderer", () => {
     expect(window.localStorage.getItem("openevo.desktop.layout.project-pane-width")).toBe("260");
     expect(document.body.textContent).toContain("report.md");
     expect(document.body.textContent).toContain("Review evidence");
+    const reportTreeItem = document.querySelector<HTMLElement>('[role="treeitem"][title="results/report.md"]');
+    expect(reportTreeItem?.getAttribute("aria-level")).toBe("2");
+    expect(reportTreeItem?.querySelector(".explorer-file-type-icon.markdown")).toBeTruthy();
 
     await click("report.md");
     expect(document.querySelector('[data-testid="project-file-workspace"]')).toBeTruthy();

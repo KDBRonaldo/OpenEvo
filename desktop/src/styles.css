@@ -1846,7 +1846,9 @@ pre.json {
 
 .explorer-file-tree {
   padding: 8px 7px 14px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  font-feature-settings: "liga" 0;
+  text-rendering: optimizeLegibility;
 }
 
 .explorer-tree-node {
@@ -1900,9 +1902,10 @@ pre.json {
 
 .explorer-tree-kind {
   display: inline-flex;
-  width: 17px;
-  flex: 0 0 17px;
+  width: 19px;
+  flex: 0 0 19px;
   align-items: center;
+  justify-content: center;
   color: #728079;
 }
 
@@ -1913,14 +1916,61 @@ pre.json {
 .explorer-tree-label {
   min-width: 0;
   overflow: hidden;
-  font-size: 11px;
+  color: #3e4943;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .explorer-tree-node.directory > button > .explorer-tree-label {
-  color: #34433b;
-  font-weight: 620;
+  color: #303c35;
+  font-weight: 600;
+}
+
+.explorer-file-type-icon {
+  display: inline-flex;
+  width: 19px;
+  height: 19px;
+  align-items: center;
+  justify-content: center;
+  color: #7a8580;
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 8.5px;
+  font-weight: 750;
+  letter-spacing: -.04em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.explorer-file-type-icon.python { color: #3572a5; }
+.explorer-file-type-icon.markdown { color: #3977a8; font-size: 9px; }
+.explorer-file-type-icon.cpp { color: #6757a8; }
+.explorer-file-type-icon.c { color: #4875a6; font-size: 10px; }
+.explorer-file-type-icon.typescript { color: #3178c6; }
+.explorer-file-type-icon.javascript { color: #b58b00; }
+.explorer-file-type-icon.json { color: #ad7d16; font-size: 10px; }
+.explorer-file-type-icon.yaml { color: #c64b4b; font-size: 10px; }
+.explorer-file-type-icon.html { color: #d86735; font-size: 9px; }
+.explorer-file-type-icon.css { color: #397fbd; font-size: 11px; }
+.explorer-file-type-icon.shell { color: #37845b; font-size: 9px; }
+.explorer-file-type-icon.pdf { color: #cf4343; font-size: 7px; letter-spacing: -.07em; }
+.explorer-file-type-icon.image { color: #8a61a8; font-size: 6.5px; }
+.explorer-file-type-icon.archive { color: #9a6c2f; font-size: 6.5px; }
+.explorer-file-type-icon.data { color: #2b8861; font-size: 6.5px; }
+.explorer-file-type-icon.config { color: #6f7f89; font-size: 6.5px; }
+.explorer-file-type-icon.rust { color: #a45e3b; }
+.explorer-file-type-icon.go { color: #168fa4; }
+.explorer-file-type-icon.java { color: #b65c38; }
+.explorer-file-type-icon.notebook { color: #e07824; font-size: 10px; }
+.explorer-file-type-icon.docker { color: #2496ed; font-size: 10px; }
+.explorer-file-type-icon.build { color: #6f7f89; font-size: 7px; }
+
+.explorer-tree-node > button.selected .explorer-tree-label {
+  color: #183b32;
+  font-weight: 500;
 }
 
 .explorer-tree-branch {

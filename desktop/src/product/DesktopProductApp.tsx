@@ -1528,6 +1528,48 @@ function filterProjectFileTreeV2(
   });
 }
 
+type ProjectFileVisualV2 = {
+  kind: string;
+  label: string | null;
+};
+
+function projectFileVisualV2(path: string): ProjectFileVisualV2 {
+  const name = path.split("/").at(-1)?.toLocaleLowerCase() ?? path.toLocaleLowerCase();
+  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+  if (["py", "pyi", "pyw"].includes(extension)) return { kind: "python", label: "Py" };
+  if (["md", "mdx", "markdown"].includes(extension)) return { kind: "markdown", label: "M↓" };
+  if (["cpp", "cc", "cxx", "hpp", "hh", "hxx"].includes(extension)) return { kind: "cpp", label: "C+" };
+  if (["c", "h"].includes(extension)) return { kind: "c", label: "C" };
+  if (["ts", "tsx"].includes(extension)) return { kind: "typescript", label: "TS" };
+  if (["js", "jsx", "mjs", "cjs"].includes(extension)) return { kind: "javascript", label: "JS" };
+  if (["json", "jsonl"].includes(extension)) return { kind: "json", label: "{}" };
+  if (["yaml", "yml"].includes(extension)) return { kind: "yaml", label: "Y" };
+  if (["html", "htm", "vue", "svelte"].includes(extension)) return { kind: "html", label: "<>" };
+  if (["css", "scss", "sass", "less"].includes(extension)) return { kind: "css", label: "#" };
+  if (["sh", "bash", "zsh", "fish", "ps1", "bat", "cmd"].includes(extension)) return { kind: "shell", label: ">_" };
+  if (extension === "pdf") return { kind: "pdf", label: "PDF" };
+  if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico"].includes(extension)) return { kind: "image", label: "IMG" };
+  if (["zip", "tar", "gz", "bz2", "xz", "7z", "rar"].includes(extension)) return { kind: "archive", label: "ZIP" };
+  if (["csv", "tsv", "xls", "xlsx", "parquet"].includes(extension)) return { kind: "data", label: "CSV" };
+  if (["toml", "ini", "cfg", "conf", "env"].includes(extension)) return { kind: "config", label: "CFG" };
+  if (["rs"].includes(extension)) return { kind: "rust", label: "Rs" };
+  if (["go"].includes(extension)) return { kind: "go", label: "Go" };
+  if (["java", "kt", "kts"].includes(extension)) return { kind: "java", label: "Jv" };
+  if (["ipynb"].includes(extension)) return { kind: "notebook", label: "J" };
+  if (name === "dockerfile" || name.startsWith("dockerfile.")) return { kind: "docker", label: "D" };
+  if (name === "makefile" || name === "cmakelists.txt") return { kind: "build", label: "MK" };
+  return { kind: "default", label: null };
+}
+
+function ProjectFileTypeIconV2({ path }: { readonly path: string }) {
+  const visual = projectFileVisualV2(path);
+  return (
+    <span className={`explorer-file-type-icon ${visual.kind}`} aria-hidden="true">
+      {visual.label === null ? <FileText size={15} /> : <span>{visual.label}</span>}
+    </span>
+  );
+}
+
 function ProjectExplorerV2({
   projects,
   activeProject,
@@ -1607,7 +1649,7 @@ function ProjectExplorerV2({
             {directory ? expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : null}
           </span>
           <span className="explorer-tree-kind" aria-hidden="true">
-            {directory ? <FolderOpen size={15} /> : <FileText size={14} />}
+            {directory ? <FolderOpen size={15} /> : <ProjectFileTypeIconV2 path={node.path} />}
           </span>
           <span className="explorer-tree-label">{node.name}</span>
         </button>
