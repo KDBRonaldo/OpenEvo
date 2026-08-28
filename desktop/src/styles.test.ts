@@ -56,9 +56,9 @@ describe("Desktop product responsive CSS", () => {
     expect(styles).toMatch(/--session-inspector-width,\s*420px/);
   });
 
-  it("uses a custom animated Project switcher and motion-safe running state", () => {
-    expect(styles).toMatch(/\.project-switcher-menu\s*{[\s\S]*?backdrop-filter:\s*blur\(18px\)/);
-    expect(styles).toMatch(/@keyframes\s+project-switcher-in/);
+  it("uses custom animated selectors and a motion-safe running state", () => {
+    expect(styles).toMatch(/\.soft-select-menu\s*{[\s\S]*?backdrop-filter:\s*blur\(18px\)/);
+    expect(styles).toMatch(/@keyframes\s+soft-select-in/);
     expect(styles).toMatch(/\.v2-agent-running-text\s*{[\s\S]*?background-clip:\s*text;[\s\S]*?agent-running-sheen/);
     expect(styles).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.v2-agent-running-text\s*{[\s\S]*?animation:\s*none;/);
   });

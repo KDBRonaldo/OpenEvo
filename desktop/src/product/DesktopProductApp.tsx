@@ -36,6 +36,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import { DesktopApiErrorV2 } from "../api/v2/client";
@@ -1201,7 +1202,7 @@ function RemoteWorkspaceSetupV2({
             ) : null}
             <label>Workspace name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
             {selectableHosts.length > 0 ? (
-              <label>SSH host alias<select autoFocus value={alias} onChange={(event) => setAlias(event.target.value)}>{selectableHosts.map((host) => <option key={host.ssh_host_alias} value={host.ssh_host_alias}>{host.ssh_host_alias}</option>)}</select></label>
+              <div className="soft-select-field"><span>SSH host alias</span><SoftSelectV2 ariaLabel="SSH host alias" autoFocus value={alias} options={selectableHosts.map((host) => ({ value: host.ssh_host_alias, label: host.ssh_host_alias }))} onChange={setAlias} /></div>
             ) : (
               <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>No usable SSH aliases were found.</strong> Add a literal Host entry to your system <code>~/.ssh/config</code>, confirm that <code>ssh alias</code> works, then select Rescan.</span></div>
             )}
@@ -1550,6 +1551,127 @@ function ProjectFileTypeIconV2({ path }: { readonly path: string }) {
   );
 }
 
+type SoftSelectOptionV2 = {
+  readonly key?: string;
+  readonly value: string;
+  readonly label: string;
+  readonly disabled?: boolean;
+};
+
+function SoftSelectV2({
+  id,
+  ariaLabel,
+  value,
+  options,
+  disabled = false,
+  autoFocus = false,
+  placement = "bottom",
+  className = "",
+  onChange,
+}: {
+  readonly id?: string;
+  readonly ariaLabel: string;
+  readonly value: string;
+  readonly options: readonly SoftSelectOptionV2[];
+  readonly disabled?: boolean;
+  readonly autoFocus?: boolean;
+  readonly placement?: "top" | "bottom";
+  readonly className?: string;
+  readonly onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const matchedIndex = options.findIndex((option) => option.value === value);
+  const selectedIndex = matchedIndex >= 0 ? matchedIndex : options.length ? 0 : -1;
+  const selected = selectedIndex >= 0 ? options[selectedIndex]! : null;
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    globalThis.document.addEventListener("pointerdown", closeOnOutsidePointer);
+    globalThis.document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      globalThis.document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      globalThis.document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+  const moveOptionFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, direction: 1 | -1): void => {
+    event.preventDefault();
+    const choices = [...(rootRef.current?.querySelectorAll<HTMLButtonElement>('[role="option"]:not(:disabled)') ?? [])];
+    const current = choices.indexOf(event.currentTarget);
+    choices[(current + direction + choices.length) % choices.length]?.focus();
+  };
+  return (
+    <div ref={rootRef} className={`soft-select ${placement}${open ? " open" : ""}${className ? ` ${className}` : ""}`}>
+      <button
+        ref={triggerRef}
+        id={id}
+        type="button"
+        className="soft-select-trigger"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        data-value={value}
+        autoFocus={autoFocus}
+        disabled={disabled || options.length === 0}
+        title={selected?.label}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
+        <span>{selected?.label ?? "No options"}</span>
+        <ChevronDown size={15} />
+      </button>
+      {open ? (
+        <div className="soft-select-menu" role="listbox" aria-label={ariaLabel}>
+          {options.map((option, index) => {
+            const optionSelected = index === selectedIndex;
+            return (
+              <button
+                type="button"
+                role="option"
+                aria-selected={optionSelected}
+                className={optionSelected ? "selected" : ""}
+                key={option.key ?? option.value}
+                data-value={option.value}
+                disabled={option.disabled}
+                title={option.label}
+                autoFocus={optionSelected}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown") moveOptionFocus(event, 1);
+                  if (event.key === "ArrowUp") moveOptionFocus(event, -1);
+                }}
+                onClick={() => {
+                  setOpen(false);
+                  if (!optionSelected) onChange(option.value);
+                  triggerRef.current?.focus();
+                }}
+              >
+                <span>{option.label}</span>
+                {optionSelected ? <CheckCircle2 size={15} /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ProjectExplorerV2({
   projects,
   activeProject,
@@ -1587,11 +1709,9 @@ function ProjectExplorerV2({
   const [fileQuery, setFileQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
-  const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const folderUploadInputRef = useRef<HTMLInputElement>(null);
   const uploadMenuRef = useRef<HTMLDivElement>(null);
-  const projectSwitcherRef = useRef<HTMLDivElement>(null);
   const fileTree = useMemo(() => buildProjectFileTreeV2(entries), [entries]);
   const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
   const visibleFileTree = useMemo(
@@ -1603,7 +1723,6 @@ function ProjectExplorerV2({
     setFileQuery("");
     setSearchOpen(false);
     setUploadMenuOpen(false);
-    setProjectSwitcherOpen(false);
   }, [activeProject?.project_id]);
   useEffect(() => {
     folderUploadInputRef.current?.setAttribute("webkitdirectory", "");
@@ -1624,24 +1743,6 @@ function ProjectExplorerV2({
       globalThis.document.removeEventListener("keydown", closeOnEscape);
     };
   }, [uploadMenuOpen]);
-  useEffect(() => {
-    if (!projectSwitcherOpen) return undefined;
-    const closeOnOutsidePointer = (event: PointerEvent): void => {
-      if (!projectSwitcherRef.current?.contains(event.target as Node)) setProjectSwitcherOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") setProjectSwitcherOpen(false);
-    };
-    globalThis.document.addEventListener("pointerdown", closeOnOutsidePointer);
-    globalThis.document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      globalThis.document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      globalThis.document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [projectSwitcherOpen]);
-  useEffect(() => {
-    if (busy || switching) setProjectSwitcherOpen(false);
-  }, [busy, switching]);
   const submitUploadSelection = (selectedFiles: readonly File[], preserveHierarchy: boolean): void => {
     const uploads = selectedFiles.map((file) => {
       const browserPath = preserveHierarchy && file.webkitRelativePath ? file.webkitRelativePath : file.name;
@@ -1698,44 +1799,16 @@ function ProjectExplorerV2({
   return (
     <aside className="project-explorer" aria-label="Project explorer">
       <div className="explorer-heading"><span>Project</span><button type="button" aria-label="Create project" title="Create project" disabled={busy || switching} onClick={onCreateProject}><Plus size={15} /></button></div>
-      <div ref={projectSwitcherRef} className={`project-switcher-shell${projectSwitcherOpen ? " open" : ""}${switching ? " switching" : ""}`}>
-        <button
+      <div className={`project-switcher-shell${switching ? " switching" : ""}`}>
+        <SoftSelectV2
           id="v2-project-switcher"
-          type="button"
-          className="project-switcher-trigger"
-          aria-label="Select project"
-          aria-haspopup="listbox"
-          aria-expanded={projectSwitcherOpen}
+          ariaLabel="Select project"
+          value={activeProject?.project_id ?? ""}
+          options={projects.map((project) => ({ value: project.project_id, label: project.display_name }))}
           disabled={busy || switching || projects.length === 0}
-          onClick={() => setProjectSwitcherOpen((current) => !current)}
-        >
-          <span title={activeProject?.display_name}>{activeProject?.display_name ?? "No projects"}</span>
-          {switching ? <LoaderCircle className="spin" size={15} /> : <ChevronDown size={15} />}
-        </button>
-        {projectSwitcherOpen ? (
-          <div className="project-switcher-menu" role="listbox" aria-label="Projects">
-            {projects.map((project) => {
-              const selected = project.project_id === activeProject?.project_id;
-              return (
-                <button
-                  type="button"
-                  role="option"
-                  aria-selected={selected}
-                  className={selected ? "selected" : ""}
-                  key={project.project_id}
-                  title={project.display_name}
-                  onClick={() => {
-                    setProjectSwitcherOpen(false);
-                    if (!selected) onSelectProject(project.project_id);
-                  }}
-                >
-                  <span>{project.display_name}</span>
-                  {selected ? <CheckCircle2 size={15} /> : null}
-                </button>
-              );
-            })}
-          </div>
-        ) : null}
+          className="project-switcher-select"
+          onChange={onSelectProject}
+        />
         {switching ? <span className="project-switching-indicator" role="status">Switching</span> : null}
       </div>
       <div className="explorer-files-header">
@@ -1819,12 +1892,18 @@ function SessionExplorerV2({
       <div className="session-explorer-project" title={project?.display_name}>{project?.display_name ?? "No Project selected"}</div>
       <div className="session-explorer-tools">
         <label className="session-search"><Search size={13} /><input type="search" aria-label="Search Sessions" placeholder="Search Sessions" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-        <select aria-label="Filter Sessions by status" value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}>
-          <option value="all">All</option>
-          <option value="active">Active</option>
-          <option value="completed">Completed</option>
-          <option value="failed">Failed / cancelled</option>
-        </select>
+        <SoftSelectV2
+          ariaLabel="Filter Sessions by status"
+          value={filter}
+          options={[
+            { value: "all", label: "All" },
+            { value: "active", label: "Active" },
+            { value: "completed", label: "Completed" },
+            { value: "failed", label: "Failed / cancelled" },
+          ]}
+          className="session-filter-select"
+          onChange={(next) => setFilter(next as typeof filter)}
+        />
       </div>
       <div className="session-result-count">Showing {visibleTasks.length} of {tasks.length}</div>
       <div ref={listRef} className="session-explorer-list" onScroll={rememberScroll}>
@@ -2150,13 +2229,22 @@ function ResearchWorkspaceV2({
             </fieldset> : null}
             {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
             <div className="session-composer-footer">
-              <label className="session-head-picker">
+              <div className="session-head-picker">
                 <Sparkles size={15} />
                 <span className="visually-hidden">Evolution context</span>
-                <select value={selectedProjectHeadId} disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
-                  {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}</option>)}
-                </select>
-              </label>
+                <SoftSelectV2
+                  ariaLabel="Evolution context"
+                  value={selectedProjectHeadId}
+                  options={availableProjectHeads.map((head) => ({
+                    value: head.project_head_id,
+                    label: `Project Head ${head.generation}${head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}`,
+                  }))}
+                  disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0}
+                  placement="top"
+                  className="session-head-select"
+                  onChange={setSelectedProjectHeadId}
+                />
+              </div>
               <button
                 type="submit"
                 className="session-send-button"
@@ -3053,12 +3141,16 @@ function EvolutionWorkspaceV2({
           const selectedResolver = resolvers.find((resolver) => resolver.selection_value === methodId);
           const selectionAccepted = target.accepted_methods.some((method) => method.method_id === methodId)
             || selectedResolver?.supported === true;
-          return <article key={target.target_id}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} disabled={busy} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><label>Method<select value={methodId} disabled={busy || !current.enabled} onChange={(event) => {
-            const selected = methods.find((method) => method.method_id === event.target.value);
+          return <article key={target.target_id}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} disabled={busy} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><div className="soft-select-field compact"><span>Method</span><SoftSelectV2 ariaLabel={`${target.display_name} method`} value={methodId} disabled={busy || !current.enabled} options={[
+            { key: "default", value: "", label: "No supported default" },
+            ...resolvers.map((resolver) => ({ key: `resolver:${resolver.selection_value}`, value: resolver.selection_value, label: resolver.display_name, disabled: !resolver.supported })),
+            ...methods.map((method) => ({ key: `method:${method.method_id}`, value: method.method_id, label: method.display_name })),
+          ]} onChange={(nextMethodId) => {
+            const selected = methods.find((method) => method.method_id === nextMethodId);
             let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
             try { defaultConfig = selected ? JSON.parse(selected.default_config_json) as typeof defaultConfig : {}; } catch { defaultConfig = {}; }
-            setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: true, method: event.target.value, config: defaultConfig } }));
-          }}><option value="">No supported default</option>{resolvers.map((resolver) => <option key={`resolver:${resolver.selection_value}`} value={resolver.selection_value} disabled={!resolver.supported}>{resolver.display_name}</option>)}{methods.map((method) => <option key={`method:${method.method_id}`} value={method.method_id}>{method.display_name}</option>)}</select></label>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This target has no method accepted by the active registry.</p> : null}</article>;
+            setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: true, method: nextMethodId, config: defaultConfig } }));
+          }} /></div>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This target has no method accepted by the active registry.</p> : null}</article>;
         })}</div>}
         <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div>
       </section>

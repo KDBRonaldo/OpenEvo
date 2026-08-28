@@ -216,9 +216,7 @@ pre.json {
   backdrop-filter: blur(12px);
 }
 
-.project-switcher-wrap,
 .topbar-actions,
-.project-switcher-control,
 .heading-actions,
 .panel-heading,
 .section-heading,
@@ -235,50 +233,6 @@ pre.json {
 .danger-button {
   display: flex;
   align-items: center;
-}
-
-.project-switcher-wrap {
-  min-width: 0;
-  gap: 8px;
-}
-
-.project-switcher-wrap > label {
-  color: var(--subtle);
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.project-switcher-control {
-  position: relative;
-  min-width: 190px;
-  max-width: 320px;
-}
-
-.project-switcher-control select {
-  width: 100%;
-  height: 32px;
-  padding: 0 30px 0 10px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  color: var(--ink);
-  background: transparent;
-  font-weight: 650;
-  appearance: none;
-  cursor: pointer;
-}
-
-.project-switcher-control select:hover,
-.project-switcher-control select:focus {
-  border-color: var(--line-strong);
-  outline: none;
-  background: var(--surface-soft);
-}
-
-.project-switcher-control svg {
-  position: absolute;
-  right: 9px;
-  pointer-events: none;
-  color: var(--muted);
 }
 
 .topbar-actions {
@@ -1046,26 +1000,41 @@ pre.json {
   background: #f5f8f6;
 }
 
-.session-head-picker select {
+.session-head-picker .soft-select {
+  flex: 1;
   min-width: 0;
   max-width: 100%;
+}
+
+.session-head-picker .soft-select-trigger {
+  height: 32px;
+  padding: 0 2px;
   border: 0;
-  outline: 0;
+  border-radius: 999px;
   color: var(--ink-700);
   background: transparent;
+  box-shadow: none;
   font: inherit;
   font-size: 12px;
   font-weight: 650;
-  cursor: pointer;
 }
 
+.session-head-picker:has(.soft-select.open),
 .session-head-picker:focus-within {
   border-color: #8ab5a5;
   box-shadow: 0 0 0 3px rgb(43 113 93 / 9%);
 }
 
-.session-head-picker:has(select:disabled) {
+.session-head-picker:has(.soft-select-trigger:disabled) {
   opacity: 0.55;
+}
+
+.session-head-picker .soft-select-menu {
+  min-width: min(330px, 72vw);
+}
+
+.next-task-fields:has(.soft-select.open) {
+  overflow: visible;
 }
 
 .session-send-button {
@@ -1717,7 +1686,16 @@ pre.json {
   margin: 0 10px 12px;
 }
 
-.project-switcher-trigger {
+.soft-select {
+  position: relative;
+  min-width: 0;
+}
+
+.soft-select.open {
+  z-index: 80;
+}
+
+.soft-select-trigger {
   display: grid;
   height: 40px;
   width: 100%;
@@ -1739,54 +1717,56 @@ pre.json {
   transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, transform 120ms ease;
 }
 
-.project-switcher-trigger > span {
+.soft-select-trigger > span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.project-switcher-trigger > svg {
+.soft-select-trigger > svg {
   color: #65736c;
   transition: color 160ms ease, transform 180ms cubic-bezier(.2, .8, .2, 1);
 }
 
-.project-switcher-trigger:hover:not(:disabled) {
+.soft-select-trigger:hover:not(:disabled) {
   border-color: #9dbdaf;
   background: linear-gradient(135deg, #fff, #f1f8f5);
   box-shadow: 0 7px 20px rgb(28 80 61 / 9%);
 }
 
-.project-switcher-shell.open .project-switcher-trigger {
+.soft-select.open .soft-select-trigger {
   border-color: #75a997;
   box-shadow: 0 0 0 3px rgb(49 130 104 / 10%), 0 10px 26px rgb(28 80 61 / 10%);
 }
 
-.project-switcher-shell.open .project-switcher-trigger > svg {
+.soft-select.open .soft-select-trigger > svg {
   color: var(--accent);
   transform: rotate(180deg);
 }
 
-.project-switcher-trigger:focus-visible {
+.soft-select-trigger:focus-visible {
   outline: 3px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
-.project-switcher-trigger:disabled {
+.soft-select-trigger:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
 
-.project-switcher-shell.switching .project-switcher-trigger {
+.project-switcher-shell.switching .soft-select-trigger {
   padding-right: 82px;
   border-color: #8fb8aa;
   background: #f4faf7;
 }
 
-.project-switcher-menu {
+.soft-select-menu {
   position: absolute;
   top: calc(100% + 7px);
   right: 0;
-  left: 0;
+  width: max-content;
+  min-width: max(100%, 180px);
+  max-width: min(360px, 78vw);
   display: grid;
   max-height: min(54vh, 420px);
   gap: 3px;
@@ -1798,10 +1778,17 @@ pre.json {
   box-shadow: 0 18px 48px rgb(20 57 45 / 18%), 0 3px 12px rgb(20 57 45 / 8%);
   backdrop-filter: blur(18px) saturate(1.15);
   transform-origin: top center;
-  animation: project-switcher-in 170ms cubic-bezier(.2, .8, .2, 1) both;
+  animation: soft-select-in 170ms cubic-bezier(.2, .8, .2, 1) both;
 }
 
-.project-switcher-menu button {
+.soft-select.top .soft-select-menu {
+  top: auto;
+  bottom: calc(100% + 7px);
+  transform-origin: bottom center;
+  animation-name: soft-select-in-top;
+}
+
+.soft-select-menu button {
   display: grid;
   min-height: 38px;
   width: 100%;
@@ -1820,28 +1807,40 @@ pre.json {
   transition: color 130ms ease, background 130ms ease, transform 130ms ease;
 }
 
-.project-switcher-menu button > span {
+.soft-select-menu button > span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.project-switcher-menu button:hover,
-.project-switcher-menu button:focus-visible {
+.soft-select-menu button:hover,
+.soft-select-menu button:focus-visible {
   outline: 0;
   color: #174f40;
   background: linear-gradient(90deg, rgb(57 139 112 / 13%), rgb(57 139 112 / 4%));
   transform: translateX(2px);
 }
 
-.project-switcher-menu button.selected {
+.soft-select-menu button.selected {
   color: #174f40;
   background: linear-gradient(90deg, rgb(57 139 112 / 16%), rgb(57 139 112 / 5%));
   font-weight: 700;
 }
 
-.project-switcher-menu button.selected svg {
+.soft-select-menu button.selected svg {
   color: var(--accent);
+}
+
+.soft-select-menu button:disabled {
+  color: #9aa39e;
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.project-switcher-select .soft-select-menu {
+  width: 100%;
+  min-width: 100%;
+  max-width: 100%;
 }
 
 .project-switching-indicator {
@@ -1858,8 +1857,13 @@ pre.json {
   pointer-events: none;
 }
 
-@keyframes project-switcher-in {
+@keyframes soft-select-in {
   from { opacity: 0; transform: translateY(-7px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes soft-select-in-top {
+  from { opacity: 0; transform: translateY(7px) scale(.985); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
@@ -2282,15 +2286,23 @@ pre.json {
   font-size: 11px;
 }
 
-.session-explorer-tools > select {
+.session-filter-select {
   min-width: 0;
+}
+
+.session-filter-select .soft-select-trigger {
   height: 30px;
-  padding: 0 5px;
+  padding: 0 8px;
   border: 1px solid var(--line);
   border-radius: 6px;
   color: #536058;
   background: var(--surface);
+  box-shadow: none;
   font-size: 10px;
+}
+
+.session-filter-select .soft-select-menu {
+  min-width: 150px;
 }
 
 .session-result-count {
@@ -3555,12 +3567,39 @@ pre.json {
   font-size: 13px;
 }
 
-.form-section > label {
+.form-section > label,
+.form-section > .soft-select-field {
   display: block;
   margin-top: 11px;
   color: #535d57;
   font-size: 11px;
   font-weight: 650;
+}
+
+.soft-select-field > span {
+  display: block;
+  margin-bottom: 5px;
+  color: #535d57;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.soft-select-field .soft-select-trigger {
+  height: 38px;
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 2px 8px rgb(28 65 53 / 3%);
+  font-size: 12px;
+}
+
+.soft-select-field.compact > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.soft-select-field.compact .soft-select-trigger {
+  height: 36px;
+  border-radius: 8px;
 }
 
 .form-section input:not([type="checkbox"]),
@@ -6830,20 +6869,14 @@ pre.json {
   font-size: 10px;
 }
 
-.v2-target-list > article > label:last-of-type {
+.v2-target-list > article > .soft-select-field {
   color: var(--muted);
   font-size: 10px;
   font-weight: 650;
 }
 
-.v2-target-list select {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  padding: 7px;
-  border: 1px solid var(--line-strong);
-  border-radius: 5px;
-  background: var(--surface);
+.v2-target-list .soft-select-menu {
+  min-width: 100%;
 }
 
 .v2-target-list .form-error {
@@ -7174,7 +7207,7 @@ pre.json {
 
 @media (prefers-reduced-motion: reduce) {
   .lifecycle-subprogress progress:not([value]),
-  .project-switcher-menu,
+  .soft-select-menu,
   .product-main > .workspace-stack,
   .product-main > .v2-workspace-stack,
   .product-main > .quiet-empty,

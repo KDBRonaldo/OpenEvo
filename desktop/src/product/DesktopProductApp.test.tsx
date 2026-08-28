@@ -1312,13 +1312,10 @@ describe("Desktop v2 product renderer", () => {
     };
     const provider = providerFixture(snapshot);
     root = await render(provider);
-    const picker = document.querySelector<HTMLSelectElement>(".next-task-fields select");
+    const picker = document.querySelector<HTMLButtonElement>('.next-task-fields .soft-select-trigger[aria-label="Evolution context"]');
     expect(picker).toBeTruthy();
 
-    await act(async () => {
-      picker!.value = historicalHead.project_head_id;
-      picker!.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await selectSoftOption("Evolution context", "Project Head 6");
     await click("Start session");
 
     expect(provider.submitTask).toHaveBeenCalledWith(
@@ -1834,10 +1831,8 @@ describe("Desktop v2 product renderer", () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
       setter?.call(search, "");
       search.dispatchEvent(new Event("input", { bubbles: true }));
-      const filter = document.querySelector<HTMLSelectElement>('select[aria-label="Filter Sessions by status"]')!;
-      filter.value = "active";
-      filter.dispatchEvent(new Event("change", { bubbles: true }));
     });
+    await selectSoftOption("Filter Sessions by status", "Active");
     expect(sessionButtons().map((item) => item.title)).toEqual(["Newest running session"]);
   });
 
@@ -1891,13 +1886,16 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Evolution");
 
-    const method = document.querySelector<HTMLSelectElement>(
-      ".v2-target-list select",
+    const method = document.querySelector<HTMLButtonElement>(
+      ".v2-target-list .soft-select-trigger",
     );
-    expect(method?.value).toBe("auto");
-    expect([...method!.options].map((option) => option.textContent)).toContain(
-      "Automatic",
-    );
+    expect(method?.dataset.value).toBe("auto");
+    expect(method?.textContent).toContain("Automatic");
+    await act(async () => {
+      method?.click();
+      await Promise.resolve();
+    });
+    expect([...document.querySelectorAll('[role="option"]')].map((option) => option.textContent)).toContain("Automatic");
     expect(document.body.textContent).not.toContain("blocks Task admission");
   });
 
@@ -2631,6 +2629,26 @@ async function selectProject(label: string): Promise<void> {
   const option = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')]
     .find((candidate) => candidate.textContent?.trim().includes(label));
   if (!option) throw new Error(`project option not found: ${label}`);
+  await act(async () => {
+    option.click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function selectSoftOption(ariaLabel: string, optionLabel: string): Promise<void> {
+  const trigger = [...document.querySelectorAll<HTMLButtonElement>(".soft-select-trigger")]
+    .find((candidate) => candidate.getAttribute("aria-label") === ariaLabel);
+  if (!trigger) throw new Error(`select trigger not found: ${ariaLabel}`);
+  await act(async () => {
+    trigger.click();
+    await Promise.resolve();
+  });
+  const listbox = [...document.querySelectorAll<HTMLElement>('[role="listbox"]')]
+    .find((candidate) => candidate.getAttribute("aria-label") === ariaLabel);
+  const option = [...(listbox?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? [])]
+    .find((candidate) => candidate.textContent?.trim().includes(optionLabel));
+  if (!option) throw new Error(`select option not found: ${optionLabel}`);
   await act(async () => {
     option.click();
     await Promise.resolve();
