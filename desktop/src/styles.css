@@ -4448,6 +4448,228 @@ pre.json {
   white-space: nowrap;
 }
 
+.session-inspector-section {
+  padding: 16px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-inspector-section-heading {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.session-inspector-section-heading > span {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid #d8e4df;
+  border-radius: 7px;
+  background: #fff;
+  color: var(--accent-strong);
+}
+
+.session-inspector-section-heading h3 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.01em;
+}
+
+.session-inspector-section-heading > strong {
+  min-width: 24px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.session-inspector-output-list,
+.session-inspector-context-list,
+.session-inspector-change-list {
+  display: grid;
+  gap: 6px;
+}
+
+.session-inspector-output-list button,
+.session-inspector-context-list button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-inspector-output-list button:hover,
+.session-inspector-context-list button:hover {
+  border-color: #d5e3dd;
+  background: #fff;
+  color: var(--accent-strong);
+}
+
+.session-inspector-output-list button > span,
+.session-inspector-context-list button > span:not(.v2-artifact-type),
+.session-inspector-change-list > div > span:last-child,
+.session-project-head-row > span {
+  min-width: 0;
+}
+
+.session-inspector-output-list strong,
+.session-inspector-context-list strong,
+.session-inspector-change-list strong,
+.session-project-head-row strong {
+  display: block;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-inspector-output-list small,
+.session-inspector-context-list small,
+.session-inspector-change-list small,
+.session-project-head-row small {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-inspector-change-list > div {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+}
+
+.session-change-kind {
+  padding: 3px 6px;
+  border-radius: 5px;
+  background: #e9f3ef;
+  color: var(--accent-strong);
+  font-size: 8px;
+  font-weight: 750;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.session-change-kind.deleted {
+  background: #f7eae7;
+  color: #9a4a3e;
+}
+
+.session-change-kind.renamed {
+  background: #edf0f8;
+  color: #58699b;
+}
+
+.session-project-head-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+  padding: 10px;
+  border: 1px solid #d6e5df;
+  border-radius: 7px;
+  background: #eef5f2;
+  color: var(--accent-strong);
+}
+
+.session-inspector-context-list .v2-artifact-type {
+  width: 68px;
+  overflow: hidden;
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-inspector-empty {
+  margin: 0;
+  padding: 4px 10px 2px 36px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.session-inspector-empty.context-empty {
+  padding-left: 10px;
+}
+
+.session-evolution-availability {
+  padding: 16px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.session-evolution-availability-heading {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.session-evolution-availability-heading > span:first-child {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  background: #f0efff;
+  color: #5b61c8;
+}
+
+.session-evolution-availability-heading strong,
+.session-evolution-availability-heading small {
+  display: block;
+}
+
+.session-evolution-availability-heading strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.session-evolution-availability-heading small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.session-evolution-availability-heading .muted-pill.available {
+  border-color: #d6e4df;
+  background: #eef5f2;
+  color: var(--accent-strong);
+}
+
+.session-evolution-availability > .v2-evolution-job-list,
+.session-evolution-availability > .v2-evolution-result-collection {
+  margin-top: 12px;
+}
+
 .session-inspector-pane .v2-evolution-priority,
 .session-inspector-pane .v2-supporting-module,
 .session-inspector-pane .v2-session-technical-details {

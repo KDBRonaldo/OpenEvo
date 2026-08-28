@@ -793,8 +793,8 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector('[role="separator"][aria-label="Resize Session inspector"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
     expect(document.body.textContent).toContain("I checked the evidence table");
-    expect(document.body.textContent).toContain("Context used");
-    expect(document.body.textContent).toContain("artifact-memory-1");
+    expect(document.body.textContent).toContain("Applied Evolution Context");
+    expect(document.body.textContent).toContain("Previous research memory");
 
     await click("Evolution");
     expect(document.body.textContent).toContain("Cross-session changes");
@@ -1148,16 +1148,18 @@ describe("Desktop v2 product renderer", () => {
     expect(chatCanvas?.querySelector(".v2-session-module-heading")).toBeNull();
     expect(chatCanvas?.querySelector("article.user")?.textContent).toContain("Review the evidence");
     expect(chatCanvas?.querySelector("article.agent")?.textContent).toContain("I checked the evidence table");
-    expect(document.body.textContent).toContain("02 / Cross-session adaptation");
-    expect(document.body.textContent).toContain("03 / Workspace evidence");
-    expect(document.body.textContent).toContain("Context and files");
+    expect(document.body.textContent).toContain("Output Files");
+    expect(document.body.textContent).toContain("Workspace Changes");
+    expect(document.body.textContent).toContain("Applied Evolution Context");
+    expect(document.body.textContent).toContain("Available for Evolution");
+    expect(document.body.textContent).toContain("Project Head 7");
     expect(document.body.textContent).toContain("04 / Execution trace");
     expect(document.body.textContent).toContain("Memory · Update");
     expect(document.body.textContent).toContain("Skill · Update");
     expect(document.body.textContent).toContain("Agent system · Update");
     expect(document.body.textContent).not.toContain("artifact-memory-2");
-    expect(document.body.textContent).toContain("Context used");
-    expect(document.body.textContent).toContain("artifact-memory-1");
+    expect(document.body.textContent).toContain("Previous research memory");
+    expect(document.body.textContent).toContain("Previous evidence skill");
     expect(document.body.textContent).toContain("authoritative · closed");
     expect(document.body.textContent).toContain("superseded");
     expect(document.body.textContent).toContain("successor-transition-8");
@@ -1165,7 +1167,7 @@ describe("Desktop v2 product renderer", () => {
       [...document.querySelectorAll("[data-session-priority]")].map((node) =>
         node.getAttribute("data-session-priority"),
       ),
-    ).toEqual(["conversation", "evolution", "supporting", "technical"]);
+    ).toEqual(["conversation", "outputs", "workspace", "context", "evolution", "technical"]);
 
     await click("Memory · Update");
     expect(

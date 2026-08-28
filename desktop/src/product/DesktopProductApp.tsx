@@ -81,6 +81,10 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
+type SessionOutputFileV2 = NonNullable<
+  DesktopProductSnapshotV2["runtimePresentation"]
+>["tasks"][string]["outputFiles"][number];
+
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width";
@@ -2364,6 +2368,44 @@ function SessionModuleHeadingV2({
   );
 }
 
+function InspectorSectionHeadingV2({
+  icon: Icon,
+  title,
+  metric,
+}: {
+  readonly icon: LucideIcon;
+  readonly title: string;
+  readonly metric: string;
+}) {
+  return (
+    <header className="session-inspector-section-heading">
+      <span aria-hidden="true"><Icon size={16} /></span>
+      <h3>{title}</h3>
+      <strong>{metric}</strong>
+    </header>
+  );
+}
+
+function workspaceChangeKindV2(file: SessionOutputFileV2): "Created" | "Modified" | "Renamed" | "Deleted" {
+  const summary = file.summary.trim().toLowerCase();
+  if (summary.startsWith("deleted")) return "Deleted";
+  if (summary.startsWith("renamed")) return "Renamed";
+  if (summary.startsWith("created")) return "Created";
+  if (summary.startsWith("modified") || summary.startsWith("updated")) return "Modified";
+  if (file.diffLines?.some((line) => line.kind === "removed")) return "Modified";
+  return "Created";
+}
+
+function workspaceChangeSummaryV2(file: SessionOutputFileV2): string {
+  const additions = file.diffLines?.filter((line) => line.kind === "added").length ?? 0;
+  const deletions = file.diffLines?.filter((line) => line.kind === "removed").length ?? 0;
+  const changes = [
+    additions ? `${additions} ${additions === 1 ? "addition" : "additions"}` : null,
+    deletions ? `${deletions} ${deletions === 1 ? "deletion" : "deletions"}` : null,
+  ].filter((part): part is string => part !== null);
+  return changes.length ? changes.join(" · ") : file.summary;
+}
+
 function TaskAuthorityCardV2({
   task,
   taskContent,
@@ -2424,7 +2466,9 @@ function TaskAuthorityCardV2({
   const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
-  const supportingItemCount = usedArtifacts.length + (presentation?.outputFiles.length ?? 0);
+  const outputFiles = presentation?.outputFiles ?? [];
+  const evolutionEvidenceAvailable = presentation?.evolutionEvidenceReady
+    ?? task.state === "closed";
   const [selectedResult, setSelectedResult] = useState<
     | { readonly kind: "artifact"; readonly artifactId: string }
     | { readonly kind: "output"; readonly fileName: string }
@@ -2524,31 +2568,30 @@ function TaskAuthorityCardV2({
       <aside className="session-inspector-pane" aria-label="Session inspector">
       <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={340} minimum={280} maximum={560} onChange={setInspectorWidth} direction={-1} edge="left" />
       {selectedResult ? <div className="session-inspector-preview-mode">{resultInspector}</div> : <>
-      <header className="session-inspector-heading"><div><span className="panel-kicker">Session details</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></header>
-      <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
-        <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title={presentation?.selectedEvolution?.length ? "Evolution" : "Evolution evidence"} description={presentation?.selectedEvolution?.length ? "Evolution methods attached by the legacy per-Session workflow." : "This Session transcript can be combined with other completed Sessions from the Evolution workspace."} metric={presentation?.selectedEvolution?.length ? `${producedArtifacts.length} produced` : "Available"} icon={Sparkles} tone="evolution" />
-        <div className="session-evolution-summary">
-          <div><span className="panel-kicker">{presentation?.selectedEvolution?.length ? "Selected for this legacy session" : "Independent workflow"}</span><strong>{presentation?.selectedEvolution?.length ? `${presentation.selectedEvolution.length} methods` : "Ready for selection"}</strong></div>
-          {presentation?.selectedEvolution?.length ? (
-            <EvolutionJobStatusCollectionV2
-              selections={presentation.selectedEvolution}
-              jobs={presentation.evolutionJobs ?? []}
-              errors={presentation.evolutionErrors ?? []}
-              busy={busy}
-              onRetry={onRetryEvolutionJob}
-            />
-          ) : <p>No Evolution method ran inside this Session. Open Evolution to select this transcript, combine evidence, and create a reviewable candidate.</p>}
-        </div>
-        <EvolutionResultCollection
-          artifacts={producedArtifacts}
-          artifactPresentation={artifactPresentation}
-          jobs={presentation?.evolutionJobs ?? []}
-          onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })}
-        />
+      <header className="session-inspector-heading">
+        <div><span className="panel-kicker">Session details</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2><small>{formatTimeV2(task.updated_at)}</small></div>
+        <span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span>
+      </header>
+      <section className="session-inspector-section" data-session-priority="outputs">
+        <InspectorSectionHeadingV2 icon={FileText} title="Output Files" metric={`${outputFiles.length}`} />
+        {outputFiles.length ? <div className="session-inspector-output-list">{outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="session-inspector-empty">No files were produced by this Session.</p>}
       </section>
-      <section className="v2-supporting-module v2-session-module" data-session-priority="supporting">
-        <SessionModuleHeadingV2 index="03" label="Workspace evidence" title="Context and files" description="Inputs, workspace changes, and files associated with this Session." metric={`${supportingItemCount} items`} icon={FolderOpen} tone="context" />
-        <div className="v2-supporting-results"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></div>
+      {outputFiles.length ? <section className="session-inspector-section" data-session-priority="workspace">
+        <InspectorSectionHeadingV2 icon={History} title="Workspace Changes" metric={`${outputFiles.length}`} />
+        <div className="session-inspector-change-list">{outputFiles.map((file) => <div key={file.name}><span className={`session-change-kind ${workspaceChangeKindV2(file).toLowerCase()}`}>{workspaceChangeKindV2(file)}</span><span><strong>{file.name}</strong><small>{workspaceChangeSummaryV2(file)}</small></span></div>)}</div>
+      </section> : null}
+      <section className="session-inspector-section" data-session-priority="context">
+        <InspectorSectionHeadingV2 icon={Sparkles} title="Applied Evolution Context" metric={usedArtifacts.length ? `${usedArtifacts.length}` : "Base only"} />
+        <div className="session-project-head-row"><CircleDot size={17} /><span><strong>Project Head {task.admission.predecessor_project_head.generation}</strong><small>Baseline pinned when this Session started</small></span></div>
+        {usedArtifacts.length ? <div className="session-inspector-context-list">{usedArtifacts.map((artifact) => {
+          const preview = artifactPresentation?.[artifact.artifact_id];
+          return <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => setSelectedResult({ kind: "artifact", artifactId: artifact.artifact_id })}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{preview?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong><small>{preview?.statusDetail || `${artifactTypeLabel(artifact.artifact_type)} · ${formatBytes(artifact.byte_size)}`}</small></span><ArrowRight size={14} /></button>;
+        })}</div> : <p className="session-inspector-empty context-empty">No evolved artifacts were added beyond the pinned Project Head.</p>}
+      </section>
+      <section className="session-evolution-availability" data-session-priority="evolution">
+        <div className="session-evolution-availability-heading"><span aria-hidden="true"><Sparkles size={17} /></span><div><strong>Available for Evolution</strong><small>{evolutionEvidenceAvailable ? "This transcript can be selected as evidence in the Evolution workspace." : "This transcript will become selectable after the Session is complete."}</small></div><span className={`muted-pill ${evolutionEvidenceAvailable ? "available" : "pending"}`}>{evolutionEvidenceAvailable ? "Available" : "Pending"}</span></div>
+        {presentation?.selectedEvolution?.length ? <EvolutionJobStatusCollectionV2 selections={presentation.selectedEvolution} jobs={presentation.evolutionJobs ?? []} errors={presentation.evolutionErrors ?? []} busy={busy} onRetry={onRetryEvolutionJob} /> : null}
+        {producedArtifacts.length ? <EvolutionResultCollection artifacts={producedArtifacts} artifactPresentation={artifactPresentation} jobs={presentation?.evolutionJobs ?? []} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /> : null}
       </section>
       <details className="session-troubleshooting-disclosure" data-session-priority="technical">
       <summary><span><Activity size={17} /><span><strong>Technical details</strong><small>IDs, attempts, logs, pinned authority, and recovery controls</small></span></span><ChevronDown size={16} /></summary>
@@ -2643,10 +2686,6 @@ function SessionResultInspectorV2({
       )}
     </section>
   );
-}
-
-function ResultCollection({ title, empty, artifacts, onOpen }: { readonly title: string; readonly empty: string; readonly artifacts: DesktopProductSnapshotV2["artifacts"]; readonly onOpen: (artifactId: string) => void }) {
-  return <div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">{title}</span><strong>{artifacts.length}</strong></div>{artifacts.length ? <div className="v2-result-artifacts">{artifacts.map((artifact) => <button type="button" key={artifact.artifact_id} onClick={() => onOpen(artifact.artifact_id)}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{artifact.artifact_id}</strong><small>{formatBytes(artifact.byte_size)}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">{empty}</p>}</div>;
 }
 
 function evolutionAttemptStageLabelV2(stage: string): string {
