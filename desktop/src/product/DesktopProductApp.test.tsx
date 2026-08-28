@@ -1142,7 +1142,7 @@ describe("Desktop v2 product renderer", () => {
     expect(chatCanvas?.querySelector("article.user")?.textContent).toContain("Review the evidence");
     expect(chatCanvas?.querySelector("article.agent")?.textContent).toContain("I checked the evidence table");
     expect(document.body.textContent).toContain("Output Files");
-    expect(document.body.textContent).toContain("Workspace Changes");
+    expect(document.body.textContent).not.toContain("Workspace Changes");
     expect(document.body.textContent).toContain("Applied Evolution Context");
     expect(document.body.textContent).toContain("Available for Evolution");
     expect(document.body.textContent).toContain("Project Head 7");
@@ -1163,7 +1163,19 @@ describe("Desktop v2 product renderer", () => {
       [...document.querySelectorAll("[data-session-priority]")].map((node) =>
         node.getAttribute("data-session-priority"),
       ),
-    ).toEqual(["conversation", "outputs", "workspace", "context", "evolution"]);
+    ).toEqual(["conversation", "outputs", "context", "evolution"]);
+
+    await click("Project Head 7");
+    expect(
+      document.querySelector('[data-testid="project-head-inspector"]'),
+    ).toBeTruthy();
+    expect(document.body.textContent).toContain("Included evolution context");
+    expect(document.body.textContent).toContain("2 artifacts");
+    expect(document.body.textContent).toContain("2 files");
+    expect(document.body.textContent).toContain("Codex subscription");
+    expect(document.body.textContent).not.toContain("workspace-snapshot-1");
+    expect(document.body.textContent).not.toContain(DIGEST);
+    await click("Session details");
 
     await click("Memory · Update");
     expect(

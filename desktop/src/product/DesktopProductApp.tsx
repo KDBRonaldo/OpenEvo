@@ -79,10 +79,6 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
-type SessionOutputFileV2 = NonNullable<
-  DesktopProductSnapshotV2["runtimePresentation"]
->["tasks"][string]["outputFiles"][number];
-
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
@@ -2380,26 +2376,6 @@ function InspectorSectionHeadingV2({
   );
 }
 
-function workspaceChangeKindV2(file: SessionOutputFileV2): "Created" | "Modified" | "Renamed" | "Deleted" {
-  const summary = file.summary.trim().toLowerCase();
-  if (summary.startsWith("deleted")) return "Deleted";
-  if (summary.startsWith("renamed")) return "Renamed";
-  if (summary.startsWith("created")) return "Created";
-  if (summary.startsWith("modified") || summary.startsWith("updated")) return "Modified";
-  if (file.diffLines?.some((line) => line.kind === "removed")) return "Modified";
-  return "Created";
-}
-
-function workspaceChangeSummaryV2(file: SessionOutputFileV2): string {
-  const additions = file.diffLines?.filter((line) => line.kind === "added").length ?? 0;
-  const deletions = file.diffLines?.filter((line) => line.kind === "removed").length ?? 0;
-  const changes = [
-    additions ? `${additions} ${additions === 1 ? "addition" : "additions"}` : null,
-    deletions ? `${deletions} ${deletions === 1 ? "deletion" : "deletions"}` : null,
-  ].filter((part): part is string => part !== null);
-  return changes.length ? changes.join(" · ") : file.summary;
-}
-
 function TaskAuthorityCardV2({
   task,
   taskContent,
@@ -2464,6 +2440,7 @@ function TaskAuthorityCardV2({
   const [selectedResult, setSelectedResult] = useState<
     | { readonly kind: "artifact"; readonly artifactId: string }
     | { readonly kind: "output"; readonly fileName: string }
+    | { readonly kind: "project_head" }
     | null
   >(null);
   const [followUp, setFollowUp] = useState("");
@@ -2490,7 +2467,15 @@ function TaskAuthorityCardV2({
     360,
     640,
   );
-  const resultInspector = selectedResult ? (
+  const resultInspector = selectedResult?.kind === "project_head" ? (
+    <ProjectHeadInspectorV2
+      projectHead={task.admission.predecessor_project_head}
+      artifacts={usedArtifacts}
+      artifactPresentation={artifactPresentation}
+      onOpenArtifact={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })}
+      onClose={() => setSelectedResult(null)}
+    />
+  ) : selectedResult ? (
     <SessionResultInspectorV2
       selection={selectedResult}
       artifacts={artifacts}
@@ -2567,13 +2552,9 @@ function TaskAuthorityCardV2({
         <InspectorSectionHeadingV2 icon={FileText} title="Output Files" metric={`${outputFiles.length}`} />
         {outputFiles.length ? <div className="session-inspector-output-list">{outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="session-inspector-empty">No files were produced by this Session.</p>}
       </section>
-      {outputFiles.length ? <section className="session-inspector-section" data-session-priority="workspace">
-        <InspectorSectionHeadingV2 icon={History} title="Workspace Changes" metric={`${outputFiles.length}`} />
-        <div className="session-inspector-change-list">{outputFiles.map((file) => <div key={file.name}><span className={`session-change-kind ${workspaceChangeKindV2(file).toLowerCase()}`}>{workspaceChangeKindV2(file)}</span><span><strong>{file.name}</strong><small>{workspaceChangeSummaryV2(file)}</small></span></div>)}</div>
-      </section> : null}
       <section className="session-inspector-section" data-session-priority="context">
         <InspectorSectionHeadingV2 icon={Sparkles} title="Applied Evolution Context" metric={usedArtifacts.length ? `${usedArtifacts.length}` : "Base only"} />
-        <div className="session-project-head-row"><CircleDot size={17} /><span><strong>Project Head {task.admission.predecessor_project_head.generation}</strong></span></div>
+        <button type="button" className="session-project-head-row" onClick={() => setSelectedResult({ kind: "project_head" })}><CircleDot size={17} /><span><strong>Project Head {task.admission.predecessor_project_head.generation}</strong></span><ArrowRight size={14} /></button>
         {usedArtifacts.length ? <div className="session-inspector-context-list">{usedArtifacts.map((artifact) => {
           const preview = artifactPresentation?.[artifact.artifact_id];
           return <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => setSelectedResult({ kind: "artifact", artifactId: artifact.artifact_id })}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{preview?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong></span><ArrowRight size={14} /></button>;
@@ -2591,6 +2572,71 @@ function TaskAuthorityCardV2({
       </>}
       </aside>
     </article>
+  );
+}
+
+function ProjectHeadInspectorV2({
+  projectHead,
+  artifacts,
+  artifactPresentation,
+  onOpenArtifact,
+  onClose,
+}: {
+  readonly projectHead: ProjectHeadRefV2;
+  readonly artifacts: DesktopProductSnapshotV2["artifacts"];
+  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
+  readonly onOpenArtifact: (artifactId: string) => void;
+  readonly onClose: () => void;
+}) {
+  const executionLabel = projectHead.effective_execution_snapshot.execution_mode === "codex_subscription_transcript"
+    ? "Codex subscription"
+    : "Self-hosted";
+  const predecessorGeneration = projectHead.generation > 0 ? projectHead.generation - 1 : null;
+  const artifactCount = projectHead.evolution_revision.artifact_count;
+  return (
+    <section
+      className="project-head-inspector"
+      data-testid="project-head-inspector"
+      aria-label={`Project Head ${projectHead.generation} details`}
+    >
+      <div className="session-result-inspector-head">
+        <div>
+          <span className="panel-kicker">Project Head</span>
+          <h3>Project Head {projectHead.generation}</h3>
+          <p>{predecessorGeneration === null ? "Initial project context" : `Built from Project Head ${predecessorGeneration}`}</p>
+        </div>
+        <button type="button" className="session-result-back-button" onClick={onClose}>
+          <ArrowLeft size={14} /> Session details
+        </button>
+      </div>
+      <div className="project-head-facts" aria-label="Project Head summary">
+        <div><span>Evolution context</span><strong>{artifactCount} {artifactCount === 1 ? "artifact" : "artifacts"}</strong></div>
+        <div><span>Workspace</span><strong>{projectHead.workspace_snapshot.entry_count} {projectHead.workspace_snapshot.entry_count === 1 ? "file" : "files"}</strong></div>
+        <div><span>Workspace size</span><strong>{formatBytes(projectHead.workspace_snapshot.byte_size)}</strong></div>
+        <div><span>Execution</span><strong>{executionLabel}</strong></div>
+      </div>
+      <section className="project-head-contents">
+        <header><h4>Included evolution context</h4><span>{artifactCount}</span></header>
+        {artifacts.length ? (
+          <div className="project-head-artifact-list">
+            {artifacts.map((artifact) => {
+              const preview = artifactPresentation?.[artifact.artifact_id];
+              return (
+                <button type="button" key={artifact.artifact_id} onClick={() => onOpenArtifact(artifact.artifact_id)}>
+                  <span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span>
+                  <strong>{preview?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong>
+                  <ArrowRight size={14} />
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <p className="project-head-empty">{artifactCount
+            ? "Artifact details are not available for this Session."
+            : "This Project Head contains only the base project context."}</p>
+        )}
+      </section>
+    </section>
   );
 }
 
