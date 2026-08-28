@@ -2554,7 +2554,6 @@ function TaskAuthorityCardV2({
               : <ArrowUp size={18} />}
           </button>
         </div>
-        <small>Starts a new Session with the current Project context. Shift+Enter adds a new line.</small>
       </form>
       </div>
       <aside className="session-inspector-pane" aria-label="Session inspector">

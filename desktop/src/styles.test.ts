@@ -28,4 +28,11 @@ describe("Desktop product responsive CSS", () => {
     expect(styles).toMatch(/\.session-table-head\s*>\s*span:last-child,\s*\.session-table-row\s*>\s*span:last-child\s*{\s*display:\s*none;/);
     expect(styles).not.toMatch(/\.session-table-row\s+span:last-child\s*{\s*display:\s*none;/);
   });
+
+  it("keeps Session composers visually continuous while preserving the inspector split", () => {
+    expect(styles).toMatch(/\.session-composer-title::after\s*{[\s\S]*?linear-gradient/);
+    expect(styles).toMatch(/\.product-shell \.session-composer-title input:focus-visible,[\s\S]*?outline:\s*0;/);
+    expect(styles).toMatch(/\.product-v2-shell \.v2-task-result-detail\s*{[\s\S]*?grid-template-columns:[\s\S]*?gap:\s*16px;/);
+    expect(styles).toMatch(/\.session-chat-composer-box\s*{[\s\S]*?min-height:\s*148px;/);
+  });
 });
