@@ -1004,10 +1004,35 @@ class DevelopmentAgentDesktopV2Provider:
     def _tasks(self, arguments: Mapping[str, object]) -> core.TaskPageV2:
         tasks = self._all_tasks()
         project_id = arguments.get("project_id")
+        filtered = [
+            task for task in tasks if project_id is None or task.project_id == project_id
+        ]
+        limit = int(arguments.get("limit", 50))
+        if not 1 <= limit <= 100:
+            raise HTTPException(
+                status_code=400, detail="task page limit must be between 1 and 100"
+            )
+
+        start = 0
+        after = arguments.get("after")
+        if after is not None:
+            cursor = str(after)
+            cursor_index = next(
+                (index for index, task in enumerate(filtered) if task.task_id == cursor),
+                None,
+            )
+            if cursor_index is None:
+                raise HTTPException(
+                    status_code=410, detail="task cursor is no longer available"
+                )
+            start = cursor_index + 1
+
+        items = filtered[start : start + limit]
+        has_more = start + len(items) < len(filtered)
         return core.TaskPageV2(
-            items=[t for t in tasks if project_id is None or t.project_id == project_id],
-            next_cursor=None,
-            has_more=False,
+            items=items,
+            next_cursor=items[-1].task_id if has_more else None,
+            has_more=has_more,
         )
 
     def _task(self, arguments: Mapping[str, object]) -> core.TaskV2:

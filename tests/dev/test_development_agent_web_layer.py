@@ -218,11 +218,23 @@ class FakeDaemonClient:
                     "created_at": session["created_at"],
                     "updated_at": session["updated_at"],
                 })
+            query = parse_qs(parsed.query)
+            after = query.get("after", [None])[0]
+            start = 0
+            if after is not None:
+                start = next(
+                    index + 1
+                    for index, item in enumerate(items)
+                    if item["task_id"] == after
+                )
+            limit = int(query.get("limit", ["100"])[0])
+            page_items = items[start : start + limit]
+            has_more = start + len(page_items) < len(items)
             return {
                 "schema_version": "2",
-                "items": items,
-                "next_cursor": None,
-                "has_more": False,
+                "items": page_items,
+                "next_cursor": page_items[-1]["task_id"] if has_more else None,
+                "has_more": has_more,
             }
         task_logs = re.fullmatch(r"/tasks/([^/]+)/logs", parsed.path)
         if task_logs:
@@ -1336,6 +1348,55 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
     assert fake.task_observation_requests == 0
+
+
+def test_provider_pages_more_than_one_hundred_tasks_without_capping_history() -> None:
+    fake = FakeDaemonClient()
+    fake.state.update(
+        {
+            "active_project_id": "project-1",
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "display_name": "Development project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": f"session-{index:03d}",
+                    "project_id": "project-1",
+                    "state": "running",
+                    "logs": ["started"],
+                    "created_at": "2026-08-22T00:01:00Z",
+                    "updated_at": "2026-08-22T00:01:00Z",
+                }
+                for index in range(1, 102)
+            ],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    first = provider.invoke(
+        "listDesktopTasksV2",
+        {"project_id": "project-1", "limit": 100, "after": None},
+    )
+    second = provider.invoke(
+        "listDesktopTasksV2",
+        {"project_id": "project-1", "limit": 100, "after": first.next_cursor},
+    )
+
+    assert len(first.items) == 100
+    assert first.items[0].task_id == "session-001"
+    assert first.items[-1].task_id == "session-100"
+    assert first.next_cursor == "session-100"
+    assert first.has_more is True
+    assert [task.task_id for task in second.items] == ["session-101"]
+    assert second.next_cursor is None
+    assert second.has_more is False
+    assert fake.task_observation_requests == 2
 
 
 def test_provider_projects_daemon_project_heads_without_session_count_synthesis() -> None:
