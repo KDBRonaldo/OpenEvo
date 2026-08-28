@@ -1398,7 +1398,7 @@ describe("Desktop v2 product renderer", () => {
     expect(textarea("Task instructions").value).toBe("Keep this draft objective after the error.");
   });
 
-  it("keeps the draft visible with local progress while the remote Session is being admitted", async () => {
+  it("opens the chat view while the remote Session is being admitted", async () => {
     const snapshot = authoritySnapshot();
     let releaseSubmission!: (task: DesktopProductSnapshotV2["tasks"][number]) => void;
     const submission = new Promise<DesktopProductSnapshotV2["tasks"][number]>((resolve) => {
@@ -1416,8 +1416,8 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector(".session-submit-progress")).toBeTruthy();
-    expect(document.querySelector('[data-testid="research-workspace"]')).toBeTruthy();
+    expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeTruthy();
+    expect(document.querySelector('[data-testid="research-workspace"]')).toBeNull();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
     expect(document.body.textContent).toContain("Starting Session");
 
@@ -1429,8 +1429,83 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
     await vi.waitFor(() => {
-      expect(document.querySelector(".session-submit-progress")).toBeNull();
+      expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeNull();
       expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
+    });
+  });
+
+  it("switches from admission progress to the live chat as soon as the Session is running", async () => {
+    const snapshot = authoritySnapshot();
+    const runningTask = {
+      ...snapshot.tasks[0]!,
+      task_id: "task-running-new",
+      state: "running" as const,
+      updated_at: "2026-07-23T06:00:01Z",
+    };
+    let current = snapshot;
+    let notify = (): void => undefined;
+    let releaseSubmission!: (task: typeof runningTask) => void;
+    const submission = new Promise<typeof runningTask>((resolve) => {
+      releaseSubmission = resolve;
+    });
+    const fixture = providerFixture(snapshot);
+    const provider = {
+      ...fixture,
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot: current })),
+      subscribe: vi.fn((listener: Parameters<DesktopProductProviderV2["subscribe"]>[0]) => {
+        notify = () => listener({ kind: "snapshot_changed" });
+        return () => undefined;
+      }),
+      submitTask: vi.fn(async () => submission),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await act(async () => {
+      button("Start session").click();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
+    expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeTruthy();
+
+    current = {
+      ...current,
+      tasks: [runningTask, ...current.tasks],
+      runtimePresentation: {
+        ...current.runtimePresentation!,
+        tasks: {
+          ...current.runtimePresentation!.tasks,
+          [runningTask.task_id]: {
+            instruction: {
+              title: "Live research session",
+              objective: "Stream the Agent response in the conversation view.",
+            },
+            transcript: [],
+            outputFiles: [],
+            usedArtifactIds: [],
+            producedArtifactIds: [],
+          },
+        },
+      },
+    };
+    await act(async () => {
+      notify();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeNull();
+      expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
+      expect(document.body.textContent).toContain("Live research session");
+      expect(document.body.textContent).toContain("Running");
+    });
+
+    await act(async () => {
+      releaseSubmission(runningTask);
+      await submission;
+      await Promise.resolve();
+      await Promise.resolve();
     });
   });
 

@@ -1995,7 +1995,6 @@ function ResearchWorkspaceV2({
   const visibleStartingSession = startingSession ?? optimisticStartingSession;
   const autoOpenedActiveTaskId = useRef<string | null>(null);
   useEffect(() => {
-    if (visibleStartingSession !== null) return;
     if (selectedTaskId !== null && !projectTasks.some((task) => task.task_id === selectedTaskId)) onSelectTask(null);
     if (activeTask !== null && selectedTaskId === activeTask.task_id) {
       autoOpenedActiveTaskId.current = activeTask.task_id;
@@ -2003,7 +2002,7 @@ function ResearchWorkspaceV2({
       autoOpenedActiveTaskId.current = activeTask.task_id;
       onSelectTask(activeTask.task_id);
     }
-  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, tasks, visibleStartingSession]);
+  }, [activeTask?.task_id, onSelectTask, project.project_id, selectedTaskId, tasks]);
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
   const availableProjectHeads = useMemo(
     () => availableProjectHeadsV2(project, projectTasks),
@@ -2096,6 +2095,9 @@ function ResearchWorkspaceV2({
       setOptimisticStartingSession(null);
     }
   };
+  if (visibleStartingSession?.phase === "admitting" && selectedTask === null) {
+    return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
+  }
   if (selectedTask) {
     const transition = selectedTask.successor_transition
       ? transitions[selectedTask.successor_transition.successor_transition_id] ?? null
