@@ -685,14 +685,34 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         previous_artifact_id=None,
         promoted=False,
     )
+    replacement_artifact = store.record_evolution_artifact(
+        artifact_id="candidate-memory-2",
+        project_id=project_id,
+        session_id="dev-session-evidence-2",
+        run_id=run["run_id"],
+        target_id="text_memory",
+        artifact_type="text_memory",
+        method_id="text_memory_reflector",
+        renderer_kind="markdown",
+        documents=[
+            {
+                "path": "memory.md",
+                "media_type": "text/markdown",
+                "content": "# Final candidate memory",
+            }
+        ],
+        manifest={"content_path": "memory.md"},
+        previous_artifact_id=artifact["artifact_id"],
+        promoted=False,
+    )
     store.finish_evolution_job(
         "job-memory-evolution-run-1",
         attempt_id=attempt["attempt_id"],
-        artifact_ids=[artifact["artifact_id"]],
+        artifact_ids=[artifact["artifact_id"], replacement_artifact["artifact_id"]],
     )
     candidate = store.finish_evolution_run(
         run["run_id"],
-        artifact_ids=[artifact["artifact_id"]],
+        artifact_ids=[artifact["artifact_id"], replacement_artifact["artifact_id"]],
         error=None,
     )
 
@@ -701,7 +721,7 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
     applied = store.apply_evolution_run(run["run_id"])
     assert applied["state"] == "applied"
     assert [item["artifact_id"] for item in store.latest_context_artifacts(project_id)] == [
-        "candidate-memory-1"
+        "candidate-memory-2"
     ]
     store.start_session(
         "dev-session-uses-applied-context",
@@ -717,7 +737,7 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         for session in store.snapshot()["sessions"]
         if session["session_id"] == "dev-session-uses-applied-context"
     )
-    assert started_session["context_artifact_ids"] == ["candidate-memory-1"]
+    assert started_session["context_artifact_ids"] == ["candidate-memory-2"]
     second_run = store.start_evolution_run("evolution-run-2", request)
     second_attempt = store.start_evolution_job(
         job_id="job-memory-evolution-run-2",
@@ -727,10 +747,100 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         method_id="text_memory_reflector",
         requested_method_id="text_memory_reflector",
         resolver_input_artifact_ids=["dataset-dev-session-evidence-1"],
-        previous_artifact_id="candidate-memory-1",
+        previous_artifact_id="candidate-memory-2",
         config={},
     )
     assert second_attempt["ordinal"] == 1
+
+
+def test_store_repairs_duplicate_active_head_targets_with_immutable_successor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "duplicate-head.sqlite3"
+    project_id = "development-project-duplicate-head"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Duplicate Head",
+            "config": {"evolution": {"targets": {}}},
+        }
+    )
+    store.start_session(
+        "duplicate-head-session",
+        {
+            "project_id": project_id,
+            "project_name": "Duplicate Head",
+            "task_title": "Create context",
+            "instruction": "Create context",
+        },
+    )
+    store.complete_session(
+        "duplicate-head-session",
+        {
+            "response": "done",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        },
+    )
+    for ordinal in (1, 2):
+        store.record_evolution_artifact(
+            artifact_id=f"duplicate-agent-system-{ordinal}",
+            project_id=project_id,
+            session_id="duplicate-head-session",
+            target_id="agent_system",
+            artifact_type="agent_system",
+            method_id="agent_system_reflector",
+            renderer_kind="markdown",
+            documents=[{
+                "path": "agent-system.md",
+                "media_type": "text/markdown",
+                "content": f"# Agent system {ordinal}",
+            }],
+            manifest={"content_path": "agent-system.md"},
+            previous_artifact_id=(
+                None if ordinal == 1 else "duplicate-agent-system-1"
+            ),
+            promoted=True,
+        )
+
+    invalid_head_id = store.active_project_head(project_id)["project_head_id"]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE development_project_heads SET artifact_ids_json = ? "
+            "WHERE project_head_id = ?",
+            (
+                json.dumps([
+                    "duplicate-agent-system-1",
+                    "duplicate-agent-system-2",
+                ]),
+                invalid_head_id,
+            ),
+        )
+
+    restored = MODULE.DevelopmentStateStore(database)
+    repaired = restored.active_project_head(project_id)
+
+    assert repaired["project_head_id"] != invalid_head_id
+    assert repaired["predecessor_project_head_id"] == invalid_head_id
+    assert repaired["artifact_ids"] == ["duplicate-agent-system-2"]
+    assert restored.project_head(invalid_head_id)["artifact_ids"] == [
+        "duplicate-agent-system-1",
+        "duplicate-agent-system-2",
+    ]
+    restored.start_session(
+        "session-after-head-repair",
+        {
+            "project_id": project_id,
+            "project_name": "Duplicate Head",
+            "task_title": "Use repaired context",
+            "instruction": "Use repaired context",
+        },
+    )
+    assert restored.get_session("session-after-head-repair")["context_artifact_ids"] == [
+        "duplicate-agent-system-2"
+    ]
 
 
 def test_completed_legacy_sessions_are_backfilled_as_evolution_evidence(tmp_path: Path) -> None:

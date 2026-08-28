@@ -683,6 +683,7 @@ class DevelopmentStateStore:
         for project_id in project_ids:
             self.workspaces.ensure_project(project_id)
             self._ensure_project_head_history(project_id)
+            self._repair_active_project_head_membership(project_id)
         try:
             path.chmod(0o600)
         except OSError:
@@ -719,6 +720,40 @@ class DevelopmentStateStore:
                 if entry["kind"] == "file"
             ),
         }
+
+    @staticmethod
+    def _normalized_runtime_artifacts(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        artifact_ids: Sequence[str],
+    ) -> list[sqlite3.Row]:
+        """Select exactly one newest runtime artifact for each target."""
+
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        if not unique_ids:
+            return []
+        rows = connection.execute(
+            f"SELECT artifact_id, project_id, target_id, artifact_type, created_at "
+            f"FROM development_evolution_artifacts_v2 "
+            f"WHERE artifact_id IN ({','.join('?' for _ in unique_ids)})",
+            tuple(unique_ids),
+        ).fetchall()
+        if {row["artifact_id"] for row in rows} != set(unique_ids):
+            raise StateConflictError("Project Head artifacts are incomplete")
+        if any(row["project_id"] != project_id for row in rows):
+            raise StateConflictError("Project Head artifact belongs to another Project")
+        selected: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            if row["artifact_type"] == "report":
+                continue
+            previous = selected.get(row["target_id"])
+            if previous is None or (row["created_at"], row["artifact_id"]) > (
+                previous["created_at"],
+                previous["artifact_id"],
+            ):
+                selected[row["target_id"]] = row
+        return [selected[target_id] for target_id in sorted(selected)]
 
     @staticmethod
     def _project_head_record(row: sqlite3.Row) -> dict[str, Any]:
@@ -850,6 +885,14 @@ class DevelopmentStateStore:
                         inherited = list(contexts[generation][0])
                     if generation == maximum_generation:
                         inherited = promoted_ids
+                    inherited = [
+                        row["artifact_id"]
+                        for row in self._normalized_runtime_artifacts(
+                            connection,
+                            project_id=project_id,
+                            artifact_ids=inherited,
+                        )
+                    ]
                     created_at = contexts.get(
                         generation, ([], project_row["created_at"])
                     )[1]
@@ -882,6 +925,67 @@ class DevelopmentStateStore:
                 "COALESCE(base_project_head_manifest_sha256, ?) WHERE project_id = ?",
                 (active["project_head_id"], active["manifest_sha256"], project_id),
             )
+
+    def _repair_active_project_head_membership(self, project_id: str) -> None:
+        """Advance an invalid active Head without mutating historical authority."""
+
+        workspace = self._workspace_head_authority(project_id)
+        with self._lock, self._connection(emit_event=False) as connection:
+            active = connection.execute(
+                "SELECT head.* FROM development_project_head_streams AS stream "
+                "JOIN development_project_heads AS head "
+                "ON head.project_head_id = stream.active_project_head_id "
+                "WHERE stream.project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if active is None:
+                raise StateConflictError("Project has no active Project Head")
+            artifact_ids = list(json.loads(active["artifact_ids_json"]))
+            normalized_ids = [
+                row["artifact_id"]
+                for row in self._normalized_runtime_artifacts(
+                    connection,
+                    project_id=project_id,
+                    artifact_ids=artifact_ids,
+                )
+            ]
+            if (
+                len(normalized_ids) == len(artifact_ids)
+                and set(normalized_ids) == set(artifact_ids)
+            ):
+                return
+            next_generation = connection.execute(
+                "SELECT COALESCE(MAX(generation), -1) + 1 AS generation "
+                "FROM development_project_heads WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()["generation"]
+            now = utc_now()
+            repaired = self._insert_project_head(
+                connection,
+                project_id=project_id,
+                generation=next_generation,
+                predecessor_project_head_id=active["project_head_id"],
+                source_evolution_run_id=None,
+                artifact_ids=normalized_ids,
+                workspace=workspace,
+                created_at=now,
+            )
+            connection.execute(
+                "UPDATE development_project_head_streams "
+                "SET active_project_head_id = ?, updated_at = ? WHERE project_id = ?",
+                (repaired["project_head_id"], now, project_id),
+            )
+            connection.execute(
+                "UPDATE development_evolution_artifacts_v2 SET promoted = 0 "
+                "WHERE project_id = ? AND artifact_type != 'report'",
+                (project_id,),
+            )
+            if normalized_ids:
+                connection.execute(
+                    f"UPDATE development_evolution_artifacts_v2 SET promoted = 1 "
+                    f"WHERE artifact_id IN ({','.join('?' for _ in normalized_ids)})",
+                    tuple(normalized_ids),
+                )
 
     def project_head(self, project_head_id: str) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
@@ -1872,17 +1976,11 @@ class DevelopmentStateStore:
             artifact_ids = json.loads(row["artifact_ids_json"])
             if not artifact_ids:
                 raise StateConflictError("Evolution Run produced no candidate artifacts")
-            artifacts = connection.execute(
-                f"SELECT artifact_id, project_id, target_id, artifact_type "
-                f"FROM development_evolution_artifacts_v2 "
-                f"WHERE artifact_id IN ({','.join('?' for _ in artifact_ids)})",
-                tuple(artifact_ids),
-            ).fetchall()
-            if {item["artifact_id"] for item in artifacts} != set(artifact_ids):
-                raise StateConflictError("Evolution Run candidate artifacts are incomplete")
-            if any(item["project_id"] != row["project_id"] for item in artifacts):
-                raise StateConflictError("Evolution Run candidate belongs to another Project")
-            runtime_artifacts = [item for item in artifacts if item["artifact_type"] != "report"]
+            runtime_artifacts = self._normalized_runtime_artifacts(
+                connection,
+                project_id=row["project_id"],
+                artifact_ids=artifact_ids,
+            )
             active_head = connection.execute(
                 "SELECT head.* FROM development_project_head_streams AS stream "
                 "JOIN development_project_heads AS head "
@@ -1899,29 +1997,28 @@ class DevelopmentStateStore:
                 )
             base_artifact_ids = list(json.loads(active_head["artifact_ids_json"]))
             replaced_target_ids = {item["target_id"] for item in runtime_artifacts}
-            inherited_artifact_ids: list[str] = []
-            if base_artifact_ids:
-                base_rows = connection.execute(
-                    f"SELECT artifact_id, target_id FROM development_evolution_artifacts_v2 "
-                    f"WHERE artifact_id IN ({','.join('?' for _ in base_artifact_ids)})",
-                    tuple(base_artifact_ids),
-                ).fetchall()
-                target_by_artifact = {
-                    item["artifact_id"]: item["target_id"] for item in base_rows
-                }
-                inherited_artifact_ids = [
-                    artifact_id
-                    for artifact_id in base_artifact_ids
-                    if target_by_artifact.get(artifact_id) not in replaced_target_ids
-                ]
+            base_artifacts = self._normalized_runtime_artifacts(
+                connection,
+                project_id=row["project_id"],
+                artifact_ids=base_artifact_ids,
+            )
+            inherited_artifact_ids = [
+                artifact["artifact_id"]
+                for artifact in base_artifacts
+                if artifact["target_id"] not in replaced_target_ids
+            ]
             runtime_artifact_ids = [
                 item["artifact_id"]
-                for item in sorted(
-                    runtime_artifacts,
-                    key=lambda item: (item["target_id"], item["artifact_id"]),
+                for item in runtime_artifacts
+            ]
+            next_artifact_ids = [
+                artifact["artifact_id"]
+                for artifact in self._normalized_runtime_artifacts(
+                    connection,
+                    project_id=row["project_id"],
+                    artifact_ids=[*inherited_artifact_ids, *runtime_artifact_ids],
                 )
             ]
-            next_artifact_ids = [*inherited_artifact_ids, *runtime_artifact_ids]
             next_head = self._insert_project_head(
                 connection,
                 project_id=row["project_id"],
