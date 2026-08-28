@@ -6988,9 +6988,9 @@ pre.json {
 
 /* Evolution uses the quieter, list-led interaction language of a working studio. */
 .evolution-workspace-v2 {
-  --evolution-line: color-mix(in srgb, var(--line) 88%, #c8d3ce);
-  --evolution-hover: #f5f7f6;
-  --evolution-selected: #eef3f1;
+  --evolution-line: #e4e8e5;
+  --evolution-hover: #f7f9f8;
+  --evolution-selected: #f5f8f7;
   gap: 0;
 }
 
@@ -7023,22 +7023,23 @@ pre.json {
   min-width: 230px;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--evolution-line);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--surface-soft) 72%, var(--surface));
-  box-shadow: 0 1px 2px rgb(25 42 34 / 4%);
+  gap: 9px;
+  padding: 5px 0 5px 16px;
+  border: 0;
+  border-left: 1px solid var(--evolution-line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .evolution-head-context-icon {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   place-items: center;
-  border-radius: 10px;
+  border-radius: 9px;
   color: var(--accent);
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent-soft) 62%, transparent);
 }
 
 .evolution-head-context > span:last-child,
@@ -7074,13 +7075,14 @@ pre.json {
   top: -1px;
   z-index: 8;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 4px;
+  gap: 14px;
   margin: 0 0 6px;
-  padding: 4px;
-  border: 1px solid var(--evolution-line);
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 96%, transparent);
-  box-shadow: 0 1px 3px rgb(21 38 30 / 5%);
+  padding: 4px 0;
+  border: 0;
+  border-bottom: 1px solid var(--evolution-line);
+  border-radius: 0;
+  background: color-mix(in srgb, #fafbfa 94%, transparent);
+  box-shadow: none;
   backdrop-filter: blur(14px);
 }
 
@@ -7093,7 +7095,7 @@ pre.json {
   gap: 9px;
   padding: 8px 10px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 5px 5px 0 0;
   color: var(--muted);
   background: transparent;
 }
@@ -7105,8 +7107,8 @@ pre.json {
 
 .evolution-workspace-v2 .evolution-stepper button.active {
   color: var(--ink);
-  background: var(--evolution-selected);
-  box-shadow: inset 0 0 0 1px rgb(37 66 55 / 3%);
+  background: transparent;
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .evolution-workspace-v2 .evolution-stepper button > span {
@@ -7115,14 +7117,14 @@ pre.json {
   border: 0;
   border-radius: 9px;
   color: var(--muted);
-  background: #e9edeb;
+  background: transparent;
 }
 
 .evolution-workspace-v2 .evolution-stepper button.complete > span,
 .evolution-workspace-v2 .evolution-stepper button.active > span {
   border: 0;
   color: var(--accent);
-  background: var(--accent-soft);
+  background: color-mix(in srgb, var(--accent-soft) 58%, transparent);
 }
 
 .evolution-workspace-v2 .evolution-stepper button strong {
@@ -7165,20 +7167,22 @@ pre.json {
 
 .evolution-workspace-v2 .panel-heading .muted-pill {
   min-height: 30px;
-  padding: 0 10px;
-  border-color: var(--evolution-line);
-  border-radius: 9px;
-  background: var(--surface);
-  box-shadow: 0 1px 2px rgb(25 42 34 / 3%);
+  padding: 0 2px;
+  border-color: transparent;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .evolution-section-body {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--evolution-line);
-  border-radius: 14px;
+  border: 0;
+  border-top: 1px solid var(--evolution-line);
+  border-bottom: 1px solid var(--evolution-line);
+  border-radius: 0;
   background: var(--surface);
-  box-shadow: 0 1px 3px rgb(21 38 30 / 4%);
+  box-shadow: none;
 }
 
 .evolution-methods-body,
@@ -7209,12 +7213,12 @@ pre.json {
 
 .evolution-workspace-v2 .session-evolution-options article.selected {
   border-color: var(--evolution-line);
-  background: var(--evolution-selected);
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--evolution-selected) 42%, var(--surface));
+  box-shadow: none;
 }
 
 .evolution-workspace-v2 .session-evolution-options article > label {
-  min-height: 58px;
+  min-height: 54px;
   align-items: center;
   gap: 12px;
   padding: 9px 15px;
@@ -7303,7 +7307,7 @@ pre.json {
 }
 
 .evolution-workspace-v2 .v2-target-list > article:first-child {
-  border-radius: 13px 13px 0 0;
+  border-radius: 0;
 }
 
 .evolution-workspace-v2 .v2-target-list > article:hover {
@@ -7311,8 +7315,8 @@ pre.json {
 }
 
 .evolution-workspace-v2 .v2-target-list > article.enabled {
-  background: color-mix(in srgb, var(--evolution-selected) 68%, var(--surface));
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--evolution-selected) 36%, var(--surface));
+  box-shadow: none;
 }
 
 .evolution-workspace-v2 .v2-target-toggle {
@@ -7413,8 +7417,8 @@ pre.json {
   margin: 0;
   padding: 12px 15px;
   border-top: 1px solid var(--evolution-line);
-  border-radius: 0 0 13px 13px;
-  background: color-mix(in srgb, var(--surface-soft) 76%, var(--surface));
+  border-radius: 0;
+  background: color-mix(in srgb, var(--surface-soft) 42%, var(--surface));
 }
 
 .evolution-workspace-v2 .v2-primary-row .primary-button,
@@ -7454,8 +7458,8 @@ pre.json {
 
 .evolution-workspace-v2 .v2-evolution-run-selector > button.active {
   border-color: var(--evolution-line);
-  background: var(--evolution-selected);
-  box-shadow: inset 3px 0 0 var(--accent);
+  background: color-mix(in srgb, var(--evolution-selected) 56%, var(--surface));
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 68%, transparent);
 }
 
 .evolution-workspace-v2 .v2-evolution-run-selector > button:focus-visible {
@@ -7502,7 +7506,7 @@ pre.json {
   padding: 0;
   overflow: visible;
   border: 0;
-  border-radius: 14px;
+  border-radius: 0;
   background: transparent;
 }
 
@@ -7528,9 +7532,11 @@ pre.json {
 .evolution-workspace-v2 .v2-evolution-head-flow {
   margin: 12px 15px;
   padding: 10px 12px;
-  border-color: var(--evolution-line);
-  border-radius: 10px;
-  background: var(--evolution-hover);
+  border: 0;
+  border-top: 1px solid var(--evolution-line);
+  border-bottom: 1px solid var(--evolution-line);
+  border-radius: 0;
+  background: color-mix(in srgb, var(--evolution-hover) 62%, var(--surface));
 }
 
 .evolution-workspace-v2 .v2-evolution-job-error {
@@ -7548,7 +7554,7 @@ pre.json {
   gap: 2px;
   padding: 8px;
   border-right: 1px solid var(--evolution-line);
-  background: color-mix(in srgb, var(--surface-soft) 74%, var(--surface));
+  background: color-mix(in srgb, var(--surface-soft) 42%, var(--surface));
 }
 
 .evolution-workspace-v2 .v2-current-evolution-tabs button {
@@ -7567,8 +7573,8 @@ pre.json {
 .evolution-workspace-v2 .v2-current-evolution-tabs button.active {
   border: 0;
   color: var(--ink);
-  background: var(--surface);
-  box-shadow: 0 1px 3px rgb(21 38 30 / 8%);
+  background: var(--evolution-selected);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 72%, transparent);
 }
 
 .evolution-workspace-v2 .v2-current-evolution-tabs button:focus-visible {
@@ -7596,19 +7602,20 @@ pre.json {
 
 .evolution-workspace-v2 .v2-current-evolution-viewer .segmented-control {
   width: max-content;
-  padding: 3px;
-  border-radius: 9px;
-  background: #eef1ef;
+  padding: 0;
+  border-bottom: 1px solid var(--evolution-line);
+  border-radius: 0;
+  background: transparent;
 }
 
 .evolution-workspace-v2 .v2-current-evolution-viewer .segmented-control button {
   min-height: 30px;
-  border-radius: 7px;
+  border-radius: 0;
 }
 
 .evolution-workspace-v2 .v2-current-evolution-viewer .segmented-control button.active {
-  background: var(--surface);
-  box-shadow: 0 1px 2px rgb(20 38 29 / 10%);
+  background: transparent;
+  box-shadow: inset 0 -2px 0 var(--accent);
 }
 
 .evolution-workspace-v2 .v2-current-evolution-empty {
@@ -7621,8 +7628,8 @@ pre.json {
 .evolution-workspace-v2 .v2-evolution-apply-bar {
   margin: 0;
   padding: 13px 15px;
-  border-radius: 0 0 14px 14px;
-  background: color-mix(in srgb, var(--surface-soft) 82%, var(--surface));
+  border-radius: 0;
+  background: color-mix(in srgb, var(--surface-soft) 44%, var(--surface));
   box-shadow: none;
   backdrop-filter: none;
 }
@@ -7681,6 +7688,9 @@ pre.json {
 
   .evolution-head-context {
     width: 100%;
+    padding: 10px 0 0;
+    border-left: 0;
+    border-top: 1px solid var(--evolution-line);
   }
 
   .evolution-workspace-v2 .evolution-stepper button {
