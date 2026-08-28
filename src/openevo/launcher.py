@@ -1554,10 +1554,10 @@ def open_browser(url: str) -> bool:
 
     try:
         if os.name != "nt" and os.environ.get("WSL_DISTRO_NAME"):
-            explorer = shutil.which("explorer.exe")
-            if explorer:
+            url_handler = shutil.which("rundll32.exe")
+            if url_handler:
                 return subprocess.run(
-                    [explorer, url],
+                    [url_handler, "url.dll,FileProtocolHandler", url],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

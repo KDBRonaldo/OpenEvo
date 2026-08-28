@@ -74,6 +74,51 @@ def test_cli_dispatches_webui_to_formal_launcher(monkeypatch: pytest.MonkeyPatch
     ]
 
 
+def test_wsl_browser_open_uses_the_windows_url_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    browser_url = (
+        "http://127.0.0.1:8765/openevo"
+        "#browser-bootstrap=25b017319452639d41d7ce13c2fcabdc3"
+    )
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr(
+        launcher.shutil,
+        "which",
+        lambda executable: (
+            "/mnt/c/Windows/system32/rundll32.exe"
+            if executable == "rundll32.exe"
+            else None
+        ),
+    )
+
+    class Result:
+        returncode = 0
+
+    def run(command: list[str], **_: object) -> Result:
+        calls.append(command)
+        return Result()
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    monkeypatch.setattr(
+        launcher.webbrowser,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("WSL must use the Windows URL handler"),
+    )
+
+    assert launcher.open_browser(browser_url) is True
+    assert calls == [
+        [
+            "/mnt/c/Windows/system32/rundll32.exe",
+            "url.dll,FileProtocolHandler",
+            browser_url,
+        ]
+    ]
+
+
 def test_historical_launcher_is_a_thin_compatibility_entrypoint() -> None:
     wrapper = (
         Path(__file__).resolve().parents[2]
