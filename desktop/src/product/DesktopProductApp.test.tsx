@@ -1706,16 +1706,22 @@ describe("Desktop v2 product renderer", () => {
     );
     root = await render(provider);
 
-    const switcher = document.querySelector<HTMLSelectElement>(
+    const switcher = document.querySelector<HTMLButtonElement>(
       "#v2-project-switcher",
     )!;
-    expect([...switcher.options].map((option) => option.textContent)).toEqual(
+    await act(async () => {
+      switcher.click();
+      await Promise.resolve();
+    });
+    expect([...document.querySelectorAll('[role="option"]')].map((option) => option.textContent)).toEqual(
       expect.arrayContaining(["Protein study", "Second protein study"]),
     );
-
     await act(async () => {
-      switcher.value = "project:project-2";
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+      [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')]
+        .find((option) => option.textContent?.includes("Second protein study"))!
+        .click();
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
     expect(provider.activateProject).toHaveBeenCalledWith(
@@ -1781,22 +1787,12 @@ describe("Desktop v2 product renderer", () => {
     firstList.scrollTop = 120;
     firstList.dispatchEvent(new Event("scroll"));
 
-    const switcher = document.querySelector<HTMLSelectElement>("#v2-project-switcher")!;
-    await act(async () => {
-      switcher.value = "project:project-2";
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    const switcher = document.querySelector<HTMLButtonElement>("#v2-project-switcher")!;
+    await selectProject("Second protein study");
     await vi.waitFor(() => expect(switcher.disabled).toBe(false));
     await click("Second project session");
 
-    await act(async () => {
-      switcher.value = "project:project-1";
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await selectProject("Protein study");
     await vi.waitFor(() => expect(switcher.disabled).toBe(false));
     await vi.waitFor(() => expect(
       document.querySelector<HTMLButtonElement>('button[title="Review evidence"]')?.classList.contains("active"),
@@ -1993,7 +1989,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Daemon started the managed Task attempt.",
     );
-    expect(document.body.textContent).toContain("Agent is working");
+    expect(document.body.textContent).toContain("Running");
     expect(document.body.textContent).toContain("Cancel session");
     expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeTruthy();
     expect(document.body.textContent).not.toContain("Technical details");
@@ -2622,6 +2618,21 @@ async function click(label: string): Promise<void> {
   await act(async () => {
     button(label).click();
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function selectProject(label: string): Promise<void> {
+  await act(async () => {
+    document.querySelector<HTMLButtonElement>("#v2-project-switcher")?.click();
+    await Promise.resolve();
+  });
+  const option = [...document.querySelectorAll<HTMLButtonElement>('[role="option"]')]
+    .find((candidate) => candidate.textContent?.trim().includes(label));
+  if (!option) throw new Error(`project option not found: ${label}`);
+  await act(async () => {
+    option.click();
     await Promise.resolve();
     await Promise.resolve();
   });

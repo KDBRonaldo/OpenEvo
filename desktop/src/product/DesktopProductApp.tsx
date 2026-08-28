@@ -1587,9 +1587,11 @@ function ProjectExplorerV2({
   const [fileQuery, setFileQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
+  const [projectSwitcherOpen, setProjectSwitcherOpen] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const folderUploadInputRef = useRef<HTMLInputElement>(null);
   const uploadMenuRef = useRef<HTMLDivElement>(null);
+  const projectSwitcherRef = useRef<HTMLDivElement>(null);
   const fileTree = useMemo(() => buildProjectFileTreeV2(entries), [entries]);
   const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
   const visibleFileTree = useMemo(
@@ -1601,6 +1603,7 @@ function ProjectExplorerV2({
     setFileQuery("");
     setSearchOpen(false);
     setUploadMenuOpen(false);
+    setProjectSwitcherOpen(false);
   }, [activeProject?.project_id]);
   useEffect(() => {
     folderUploadInputRef.current?.setAttribute("webkitdirectory", "");
@@ -1621,6 +1624,24 @@ function ProjectExplorerV2({
       globalThis.document.removeEventListener("keydown", closeOnEscape);
     };
   }, [uploadMenuOpen]);
+  useEffect(() => {
+    if (!projectSwitcherOpen) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (!projectSwitcherRef.current?.contains(event.target as Node)) setProjectSwitcherOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setProjectSwitcherOpen(false);
+    };
+    globalThis.document.addEventListener("pointerdown", closeOnOutsidePointer);
+    globalThis.document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      globalThis.document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      globalThis.document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectSwitcherOpen]);
+  useEffect(() => {
+    if (busy || switching) setProjectSwitcherOpen(false);
+  }, [busy, switching]);
   const submitUploadSelection = (selectedFiles: readonly File[], preserveHierarchy: boolean): void => {
     const uploads = selectedFiles.map((file) => {
       const browserPath = preserveHierarchy && file.webkitRelativePath ? file.webkitRelativePath : file.name;
@@ -1677,12 +1698,45 @@ function ProjectExplorerV2({
   return (
     <aside className="project-explorer" aria-label="Project explorer">
       <div className="explorer-heading"><span>Project</span><button type="button" aria-label="Create project" title="Create project" disabled={busy || switching} onClick={onCreateProject}><Plus size={15} /></button></div>
-      <div className={`project-switcher-shell${switching ? " switching" : ""}`}>
-        <select id="v2-project-switcher" aria-label="Select project" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || switching || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
-          {projects.length === 0 ? <option value="">No projects</option> : null}
-          {projects.map((project) => <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>)}
-        </select>
-        {switching ? <span className="project-switching-indicator" role="status"><LoaderCircle className="spin" size={14} /> Switching</span> : null}
+      <div ref={projectSwitcherRef} className={`project-switcher-shell${projectSwitcherOpen ? " open" : ""}${switching ? " switching" : ""}`}>
+        <button
+          id="v2-project-switcher"
+          type="button"
+          className="project-switcher-trigger"
+          aria-label="Select project"
+          aria-haspopup="listbox"
+          aria-expanded={projectSwitcherOpen}
+          disabled={busy || switching || projects.length === 0}
+          onClick={() => setProjectSwitcherOpen((current) => !current)}
+        >
+          <span title={activeProject?.display_name}>{activeProject?.display_name ?? "No projects"}</span>
+          {switching ? <LoaderCircle className="spin" size={15} /> : <ChevronDown size={15} />}
+        </button>
+        {projectSwitcherOpen ? (
+          <div className="project-switcher-menu" role="listbox" aria-label="Projects">
+            {projects.map((project) => {
+              const selected = project.project_id === activeProject?.project_id;
+              return (
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  className={selected ? "selected" : ""}
+                  key={project.project_id}
+                  title={project.display_name}
+                  onClick={() => {
+                    setProjectSwitcherOpen(false);
+                    if (!selected) onSelectProject(project.project_id);
+                  }}
+                >
+                  <span>{project.display_name}</span>
+                  {selected ? <CheckCircle2 size={15} /> : null}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+        {switching ? <span className="project-switching-indicator" role="status">Switching</span> : null}
       </div>
       <div className="explorer-files-header">
         <div className="explorer-files-title"><span className="explorer-files-mark"><FolderTree size={17} /></span><span><strong>Workspace</strong><small>{files.length} {files.length === 1 ? "file" : "files"}</small></span></div>
@@ -1826,11 +1880,8 @@ function StartingSessionChatV2({
             <article className="user" aria-label="You"><span aria-hidden="true">You</span><p>{session.task.objective}</p></article>
           </div>
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="starting-session-activity">
-            <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
-            <div className="v2-agent-activity-copy">
-              <strong>Agent is starting<span className="v2-thinking-dots"><span>.</span><span>.</span><span>.</span></span></strong>
-              <p>{phaseDetail}</p>
-            </div>
+            <span className="v2-agent-running-dot" aria-hidden="true" />
+            <p className="v2-agent-running-text"><strong>Starting Session</strong><span>{phaseDetail}</span></p>
           </div>
         </section>
         <div className="session-chat-composer" aria-label="Session is starting">
@@ -2494,11 +2545,8 @@ function TaskAuthorityCardV2({
         {visibleTranscript.length ? <div className="v2-transcript">{visibleTranscript.map((entry, index) => <article key={`${entry.speaker}-${"sequence" in entry ? String(entry.sequence) : index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
-            <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
-            <div className="v2-agent-activity-copy">
-              <strong>{task.state === "cancelling" ? "Stopping the agent" : "Agent is working"}<span className="v2-thinking-dots"><span>.</span><span>.</span><span>.</span></span></strong>
-              <p>{activityStage}</p>
-            </div>
+            <span className="v2-agent-running-dot" aria-hidden="true" />
+            <p className="v2-agent-running-text"><strong>{task.state === "cancelling" ? "Stopping" : "Running"}</strong><span>{activityStage}</span></p>
             {active ? <button type="button" className="danger-button" disabled={busy || task.state === "cancelling"} onClick={onCancel}>{task.state === "cancelling" ? "Cancelling" : "Cancel session"}</button> : null}
           </div>
         ) : null}
