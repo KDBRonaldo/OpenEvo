@@ -3096,20 +3096,10 @@ function EvolutionWorkspaceV2({
       resultSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }
   }, [latestRun?.runId, latestRun?.state]);
-  const scrollToEvolutionStep = (id: string): void => {
-    globalThis.document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  };
   return (
     <div className="workspace-stack evolution-workspace-v2" data-testid="evolution-workspace">
       <div className="evolution-atmosphere" aria-hidden="true"><span /><span /><span /></div>
       <div className="workspace-heading evolution-workspace-heading"><div><p className="eyebrow"><CircleDot size={11} /> Evolution system online</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p><div className="evolution-telemetry" aria-hidden="true"><span>Evidence mesh</span><i /><span>Context synthesis</span><i /><span>Project Head</span></div></div>{project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Active Project Head</small><strong>Project Head {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by the next Session</em></span></div> : null}</div>
-      {standaloneAvailable ? <nav className="evolution-stepper" aria-label="Evolution workflow">
-        <button type="button" className={selectedTaskIds.length > 0 ? "complete" : "active"} onClick={() => scrollToEvolutionStep("evolution-evidence")}><span><BookOpen size={15} /></span><div><strong>Evidence</strong><small>{selectedTaskIds.length > 0 ? `${selectedTaskIds.length} Sessions selected` : "Choose Sessions"}</small></div></button>
-        <ArrowRight size={15} />
-        <button type="button" className={enabledSelections.length > 0 ? "complete" : selectedTaskIds.length > 0 ? "active" : ""} onClick={() => scrollToEvolutionStep("evolution-methods")}><span><Settings size={15} /></span><div><strong>Methods</strong><small>{enabledSelections.length > 0 ? `${enabledSelections.length} targets enabled` : "Configure targets"}</small></div></button>
-        <ArrowRight size={15} />
-        <button type="button" className={latestRun !== undefined ? "active" : ""} onClick={() => scrollToEvolutionStep("evolution-result")}><span><Sparkles size={15} /></span><div><strong>Result</strong><small>{latestRun === undefined ? "Run Evolution" : evolutionRunStateLabel(latestRun.state)}</small></div></button>
-      </nav> : null}
       {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section" data-step="01">
         <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
         <div className="evolution-section-body">{completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task, index) => {

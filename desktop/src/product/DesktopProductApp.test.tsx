@@ -1934,6 +1934,7 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Evolution");
 
+    expect(document.querySelector(".evolution-stepper")).toBeNull();
     const method = document.querySelector<HTMLButtonElement>(
       ".v2-target-list .soft-select-trigger",
     );

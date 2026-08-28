@@ -7849,10 +7849,11 @@ pre.json {
 
 .evolution-workspace-heading h1 {
   max-width: 700px;
+  padding: 0 0 5px;
   font-size: clamp(28px, 3vw, 42px);
   font-weight: 740;
   letter-spacing: -.045em;
-  line-height: 1.03;
+  line-height: 1.14;
   background: linear-gradient(100deg, #18231f 8%, #285f53 53%, #4b58aa 100%);
   background-clip: text;
   -webkit-text-fill-color: transparent;
@@ -7997,13 +7998,11 @@ pre.json {
 .evolution-workspace-v2 .evolution-step-section {
   position: relative;
   margin-top: 24px;
-  overflow: hidden;
-  border: 1px solid transparent;
+  overflow: visible;
+  border: 0;
   border-radius: 22px;
-  background:
-    linear-gradient(rgb(253 254 254 / 92%), rgb(250 252 251 / 92%)) padding-box,
-    linear-gradient(125deg, rgb(43 139 118 / 25%), rgb(218 227 224 / 70%) 44%, rgb(104 117 232 / 18%)) border-box;
-  box-shadow: 0 18px 50px rgb(19 61 51 / 7%), inset 0 1px 0 white;
+  background: linear-gradient(145deg, rgb(255 255 255 / 82%), rgb(247 251 249 / 76%));
+  box-shadow: 0 18px 52px rgb(19 61 51 / 6%), inset 0 1px 0 rgb(255 255 255 / 78%);
   scroll-margin-top: 92px;
 }
 
@@ -8063,9 +8062,9 @@ pre.json {
 .evolution-section-body {
   position: relative;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
   border: 0;
-  border-top: 1px solid var(--evolution-line);
+  border-top: 1px solid rgb(55 89 80 / 8%);
   border-radius: 0;
   background: rgb(252 254 253 / 70%);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 80%);
@@ -8086,13 +8085,12 @@ pre.json {
   min-width: 0;
   padding: 0;
   overflow: hidden;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 16px;
   background:
-    radial-gradient(280px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 9%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 86%), rgb(247 250 249 / 78%)) padding-box,
-    linear-gradient(135deg, rgb(65 119 106 / 15%), rgb(255 255 255 / 90%)) border-box;
-  box-shadow: 0 8px 22px rgb(20 60 50 / 4%);
+    radial-gradient(280px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 8%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 76%), rgb(241 248 245 / 64%));
+  box-shadow: 0 8px 24px rgb(20 60 50 / 4%), inset 0 1px 0 rgb(255 255 255 / 75%);
   transition: transform 180ms ease, box-shadow 180ms ease, filter 180ms ease;
 }
 
@@ -8112,19 +8110,17 @@ pre.json {
 .evolution-workspace-v2 .session-evolution-options article:hover {
   z-index: 1;
   background:
-    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 17%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 95%), rgb(243 250 248 / 88%)) padding-box,
-    linear-gradient(135deg, rgb(50 164 140 / 40%), rgb(104 117 232 / 16%)) border-box;
-  box-shadow: 0 16px 34px rgb(22 74 62 / 10%);
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 90%), rgb(238 248 244 / 76%));
+  box-shadow: 0 16px 36px rgb(22 74 62 / 9%), inset 0 1px 0 white;
   transform: translateY(-2px);
 }
 
 .evolution-workspace-v2 .session-evolution-options article.selected {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 18%), transparent 62%) padding-box,
-    linear-gradient(135deg, rgb(240 251 247 / 96%), rgb(245 246 255 / 84%)) padding-box,
-    linear-gradient(120deg, rgb(45 162 137 / 58%), rgb(104 117 232 / 28%)) border-box;
-  box-shadow: 0 12px 28px rgb(31 117 98 / 10%), inset 0 1px 0 white;
+    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 62%),
+    linear-gradient(135deg, rgb(237 249 245 / 82%), rgb(242 244 253 / 70%));
+  box-shadow: 0 12px 30px rgb(31 117 98 / 8%), inset 2px 0 0 rgb(52 166 141 / 42%), inset 0 1px 0 white;
 }
 
 .evolution-workspace-v2 .session-evolution-options article.selected::before {
@@ -8222,6 +8218,19 @@ pre.json {
   padding: 12px;
 }
 
+#evolution-methods {
+  z-index: 5;
+}
+
+#evolution-methods .evolution-methods-body,
+#evolution-methods .v2-target-list {
+  overflow: visible;
+}
+
+#evolution-methods .v2-target-list > article:has(.soft-select.open) {
+  z-index: 90;
+}
+
 .evolution-workspace-v2 .v2-target-list > article {
   --evolution-pointer-x: 50%;
   --evolution-pointer-y: 50%;
@@ -8234,13 +8243,12 @@ pre.json {
   gap: 18px;
   padding: 16px;
   overflow: visible;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 17px;
   background:
-    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(104 117 232 / 6%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 90%), rgb(247 249 249 / 82%)) padding-box,
-    linear-gradient(135deg, rgb(53 115 101 / 15%), rgb(255 255 255 / 88%)) border-box;
-  box-shadow: 0 10px 26px rgb(19 57 48 / 5%);
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(104 117 232 / 5%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 78%), rgb(241 247 245 / 66%));
+  box-shadow: 0 10px 28px rgb(19 57 48 / 4%), inset 0 1px 0 rgb(255 255 255 / 78%);
   transition: transform 190ms ease, box-shadow 190ms ease, background 190ms ease;
 }
 
@@ -8259,19 +8267,17 @@ pre.json {
 
 .evolution-workspace-v2 .v2-target-list > article:hover {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 15%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 96%), rgb(243 249 247 / 88%)) padding-box,
-    linear-gradient(135deg, rgb(47 164 139 / 42%), rgb(104 117 232 / 22%)) border-box;
-  box-shadow: 0 18px 38px rgb(19 72 59 / 11%);
+    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 13%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 91%), rgb(238 248 244 / 76%));
+  box-shadow: 0 18px 40px rgb(19 72 59 / 9%), inset 0 1px 0 white;
   transform: translateY(-3px);
 }
 
 .evolution-workspace-v2 .v2-target-list > article.enabled {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 18%), transparent 60%) padding-box,
-    linear-gradient(135deg, rgb(239 251 247 / 96%), rgb(245 246 255 / 88%)) padding-box,
-    linear-gradient(125deg, rgb(43 163 137 / 58%), rgb(104 117 232 / 32%)) border-box;
-  box-shadow: 0 15px 34px rgb(30 111 93 / 11%), inset 0 1px 0 white;
+    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 60%),
+    linear-gradient(135deg, rgb(237 249 245 / 84%), rgb(242 244 253 / 72%));
+  box-shadow: 0 15px 36px rgb(30 111 93 / 8%), inset 2px 0 0 rgb(52 166 141 / 38%), inset 0 1px 0 white;
 }
 
 .evolution-workspace-v2 .v2-target-toggle {
@@ -8399,33 +8405,30 @@ pre.json {
   width: 100%;
   min-height: 88px;
   padding: 13px 14px;
-  border: 1px solid transparent;
+  border: 0;
   border-radius: 16px;
   background:
-    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 8%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 90%), rgb(248 250 249 / 82%)) padding-box,
-    linear-gradient(135deg, rgb(52 114 101 / 15%), rgb(255 255 255 / 90%)) border-box;
-  box-shadow: 0 9px 24px rgb(20 60 50 / 5%);
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 7%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 78%), rgb(242 248 246 / 68%));
+  box-shadow: 0 9px 26px rgb(20 60 50 / 4%), inset 0 1px 0 rgb(255 255 255 / 78%);
   transition: transform 180ms ease, box-shadow 180ms ease, background 180ms ease;
 }
 
 .evolution-workspace-v2 .v2-evolution-run-selector > button:hover {
   border-color: transparent;
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 17%), transparent 58%) padding-box,
-    linear-gradient(145deg, rgb(255 255 255 / 96%), rgb(243 249 247 / 88%)) padding-box,
-    linear-gradient(135deg, rgb(45 161 136 / 44%), rgb(104 117 232 / 20%)) border-box;
-  box-shadow: 0 17px 36px rgb(20 72 59 / 11%);
+    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 13%), transparent 58%),
+    linear-gradient(145deg, rgb(255 255 255 / 91%), rgb(238 248 244 / 76%));
+  box-shadow: 0 17px 38px rgb(20 72 59 / 9%), inset 0 1px 0 white;
   transform: translateY(-2px);
 }
 
 .evolution-workspace-v2 .v2-evolution-run-selector > button.active {
   border-color: transparent;
   background:
-    radial-gradient(340px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 17%), transparent 60%) padding-box,
-    linear-gradient(135deg, rgb(239 251 247 / 96%), rgb(245 246 255 / 88%)) padding-box,
-    linear-gradient(125deg, rgb(43 163 137 / 58%), rgb(104 117 232 / 32%)) border-box;
-  box-shadow: 0 14px 30px rgb(29 108 91 / 11%);
+    radial-gradient(340px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 60%),
+    linear-gradient(135deg, rgb(237 249 245 / 84%), rgb(242 244 253 / 72%));
+  box-shadow: 0 14px 32px rgb(29 108 91 / 8%), inset 2px 0 0 rgb(52 166 141 / 40%);
 }
 
 .evolution-workspace-v2 .v2-evolution-run-selector .v2-evolution-job-state,
