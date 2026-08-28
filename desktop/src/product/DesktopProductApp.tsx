@@ -2081,10 +2081,22 @@ function ResearchWorkspaceV2({
     initialSessionEvolutionTargets,
   );
   useEffect(() => {
+    if (visibleStartingSession !== null) {
+      setTaskTitle(visibleStartingSession.task.title);
+      setTaskObjective(visibleStartingSession.task.objective);
+      return;
+    }
     setTaskTitle(project.config.task.title);
     setTaskObjective(project.config.task.objective);
     setSelectedEvolutionTargets(initialSessionEvolutionTargets());
-  }, [initialSessionEvolutionTargets, project.project_id, project.project_config_sha256]);
+  }, [
+    initialSessionEvolutionTargets,
+    project.project_id,
+    project.project_config_sha256,
+    visibleStartingSession?.projectId,
+    visibleStartingSession?.task.title,
+    visibleStartingSession?.task.objective,
+  ]);
   useEffect(() => {
     if (availableProjectHeads.some((head) => head.project_head_id === selectedProjectHeadId)) return;
     setSelectedProjectHeadId(project.active_project_head?.project_head_id ?? "");
@@ -2098,6 +2110,8 @@ function ResearchWorkspaceV2({
     title: taskTitle.trim(),
     objective: taskObjective.trim(),
   };
+  const displayedTaskTitle = visibleStartingSession?.task.title ?? taskTitle;
+  const displayedTaskObjective = visibleStartingSession?.task.objective ?? taskObjective;
   const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
   const canStartDraft = !formBusy
     && !sessionStartBlocked
@@ -2201,7 +2215,7 @@ function ResearchWorkspaceV2({
               <span>Task title</span>
               <input
                 maxLength={256}
-                value={taskTitle}
+                value={displayedTaskTitle}
                 placeholder="Name this Session"
                 disabled={formBusy || sessionStartBlocked}
                 onChange={(event) => setTaskTitle(event.target.value)}
@@ -2212,7 +2226,7 @@ function ResearchWorkspaceV2({
               <textarea
                 rows={4}
                 maxLength={65_536}
-                value={taskObjective}
+                value={displayedTaskObjective}
                 placeholder="What should the Agent do next?"
                 disabled={formBusy || sessionStartBlocked}
                 onChange={(event) => setTaskObjective(event.target.value)}

@@ -1450,8 +1450,26 @@ describe("Desktop v2 product renderer", () => {
     expect(submit).toBeTruthy();
 
     setAriaTextarea("Message for the next Session", "Check the revised report\nand list any remaining gaps.");
+    let resumeRefresh = (): void => undefined;
+    provider.refresh.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { resumeRefresh = resolve; });
+      return { status: "fresh" as const, snapshot };
+    });
     await act(async () => {
       submit!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector<HTMLInputElement>('input[placeholder="Name this Session"]')?.value)
+      .toBe("Check the revised report");
+    expect(document.querySelector<HTMLTextAreaElement>('textarea[placeholder="What should the Agent do next?"]')?.value)
+      .toBe("Check the revised report\nand list any remaining gaps.");
+
+    await act(async () => {
+      resumeRefresh();
+      await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
