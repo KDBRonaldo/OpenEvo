@@ -13,6 +13,7 @@ import {
   FolderTree,
   FolderOpen,
   FileText,
+  FolderUp,
   History,
   LoaderCircle,
   PanelLeft,
@@ -73,6 +74,11 @@ type StartingSessionV2 = {
   readonly projectHeadGeneration: number;
   readonly task: ScienceProjectConfigV2["task"];
   readonly phase: "validating" | "admitting";
+};
+
+type BrowserWorkspaceUploadV2 = {
+  readonly file: File;
+  readonly path: string;
 };
 
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
@@ -644,25 +650,25 @@ export function DesktopProductApp({
     })();
   };
 
-  const uploadWorkspaceFiles = (files: readonly File[], overwrite: boolean): void => {
+  const uploadWorkspaceFiles = (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean): void => {
     if (displayedProject === null) return;
     void act(
       async () => {
         if (!provider.uploadWorkspaceFile) throw new Error("This backend does not support workspace uploads.");
-        for (const file of files) {
+        for (const upload of uploads) {
           await provider.uploadWorkspaceFile(
             displayedProject.project_id,
             {
-              path: file.name,
-              data: file,
-              mediaType: file.type || "application/octet-stream",
+              path: upload.path,
+              data: upload.file,
+              mediaType: upload.file.type || "application/octet-stream",
               overwrite,
             },
             intentFor(snapshot, "upload-workspace-file"),
           );
         }
       },
-      `${files.length} workspace file${files.length === 1 ? "" : "s"} uploaded to the remote server.`,
+      `${uploads.length} workspace file${uploads.length === 1 ? "" : "s"} uploaded to the remote server.`,
     );
   };
 
@@ -1596,7 +1602,7 @@ function ProjectExplorerV2({
   readonly onSelectProject: (projectId: string) => void;
   readonly onCreateProject: () => void;
   readonly onSelectFile: (path: string) => void;
-  readonly onUpload: (files: readonly File[], overwrite: boolean) => void;
+  readonly onUpload: (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean) => void;
   readonly generation: number;
   readonly paneWidth: number;
   readonly onResizePane: (width: number) => void;
@@ -1606,7 +1612,10 @@ function ProjectExplorerV2({
   const [collapsedDirectories, setCollapsedDirectories] = useState<ReadonlySet<string>>(new Set());
   const [fileQuery, setFileQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
+  const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
+  const folderUploadInputRef = useRef<HTMLInputElement>(null);
+  const uploadMenuRef = useRef<HTMLDivElement>(null);
   const fileTree = useMemo(() => buildProjectFileTreeV2(entries), [entries]);
   const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
   const visibleFileTree = useMemo(
@@ -1617,7 +1626,39 @@ function ProjectExplorerV2({
     setCollapsedDirectories(new Set());
     setFileQuery("");
     setSearchOpen(false);
+    setUploadMenuOpen(false);
   }, [activeProject?.project_id]);
+  useEffect(() => {
+    folderUploadInputRef.current?.setAttribute("webkitdirectory", "");
+    folderUploadInputRef.current?.setAttribute("directory", "");
+  }, []);
+  useEffect(() => {
+    if (!uploadMenuOpen) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (!uploadMenuRef.current?.contains(event.target as Node)) setUploadMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setUploadMenuOpen(false);
+    };
+    globalThis.document.addEventListener("pointerdown", closeOnOutsidePointer);
+    globalThis.document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      globalThis.document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      globalThis.document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [uploadMenuOpen]);
+  const submitUploadSelection = (selectedFiles: readonly File[], preserveHierarchy: boolean): void => {
+    const uploads = selectedFiles.map((file) => {
+      const browserPath = preserveHierarchy && file.webkitRelativePath ? file.webkitRelativePath : file.name;
+      const path = browserPath.replaceAll("\\", "/").split("/").filter((part) => part !== "" && part !== ".").join("/");
+      return { file, path };
+    }).filter((upload) => upload.path !== "");
+    if (uploads.length === 0) return;
+    const existingPaths = new Set(files.map((file) => file.path));
+    const collisionCount = uploads.filter((upload) => existingPaths.has(upload.path)).length;
+    if (collisionCount > 0 && !globalThis.confirm(`${collisionCount} selected workspace ${collisionCount === 1 ? "file already exists" : "files already exist"}. Replace ${collisionCount === 1 ? "it" : "them"}?`)) return;
+    onUpload(uploads, collisionCount > 0);
+  };
   const renderTreeNodes = (nodes: readonly ProjectFileTreeNodeV2[], level = 1): ReactNode => nodes.map((node) => {
     const directory = node.kind === "directory";
     const selected = node.kind === "file" && node.path === selectedPath;
@@ -1674,12 +1715,12 @@ function ProjectExplorerV2({
         <div className="explorer-files-actions"><button type="button" className={searchOpen ? "active" : ""} aria-label="Search files" title="Search files" aria-pressed={searchOpen} onClick={() => { setSearchOpen((current) => !current); if (searchOpen) setFileQuery(""); }}><Search size={15} /></button>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
-        if (selectedFiles.length === 0) return;
-        const existingPaths = new Set(files.map((file) => file.path));
-        const hasCollision = selectedFiles.some((file) => existingPaths.has(file.name));
-        if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
-        onUpload(selectedFiles, hasCollision);
-      }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={15} /></button></> : null}</div>
+        submitUploadSelection(selectedFiles, false);
+      }} /><input ref={folderUploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose folder to upload" onChange={(event) => {
+        const selectedFiles = Array.from(event.currentTarget.files ?? []);
+        event.currentTarget.value = "";
+        submitUploadSelection(selectedFiles, true);
+      }} /><div className="explorer-upload-menu" ref={uploadMenuRef}><button type="button" className={uploadMenuOpen ? "active" : ""} aria-label="Upload to workspace" title="Upload" aria-haspopup="menu" aria-expanded={uploadMenuOpen} disabled={busy || activeProject === null} onClick={() => setUploadMenuOpen((current) => !current)}><Upload size={15} /></button>{uploadMenuOpen ? <div className="explorer-upload-popover" role="menu"><button type="button" role="menuitem" onClick={() => { setUploadMenuOpen(false); uploadInputRef.current?.click(); }}><Upload size={14} /><span>Upload files</span></button><button type="button" role="menuitem" onClick={() => { setUploadMenuOpen(false); folderUploadInputRef.current?.click(); }}><FolderUp size={14} /><span>Upload folder</span></button></div> : null}</div></> : null}</div>
       </div>
       {searchOpen ? <label className="explorer-file-search"><Search size={14} /><input autoFocus type="search" aria-label="Filter workspace files" placeholder="Filter files" value={fileQuery} onChange={(event) => setFileQuery(event.target.value)} />{fileQuery ? <button type="button" aria-label="Clear file search" onClick={() => setFileQuery("")}><X size={13} /></button> : null}</label> : null}
       <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">

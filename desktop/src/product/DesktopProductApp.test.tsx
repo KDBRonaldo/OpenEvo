@@ -802,6 +802,56 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".session-explorer")).toBeTruthy();
   });
 
+  it("uploads a selected folder while preserving its relative file paths", async () => {
+    const uploadWorkspaceFile = vi.fn(async () => undefined);
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      uploadWorkspaceFile,
+      downloadWorkspaceFile: vi.fn(async () => ({
+        fileName: "unused.txt",
+        mediaType: "text/plain",
+        data: new Blob(),
+      })),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    const uploadButton = document.querySelector<HTMLButtonElement>('[aria-label="Upload to workspace"]');
+    expect(uploadButton).toBeTruthy();
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+    await act(async () => uploadButton!.click());
+    const uploadOptions = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+    expect(uploadOptions.map((option) => option.textContent?.trim())).toEqual(["Upload files", "Upload folder"]);
+    await act(async () => uploadOptions[1]!.click());
+    expect(document.querySelector('[role="menu"]')).toBeNull();
+
+    const folderInput = document.querySelector<HTMLInputElement>('[aria-label="Choose folder to upload"]');
+    expect(folderInput).toBeTruthy();
+    expect(folderInput?.hasAttribute("webkitdirectory")).toBe(true);
+    const pythonFile = new File(["print('OpenEvo')\n"], "main.py", { type: "text/x-python" });
+    const markdownFile = new File(["# Notes\n"], "notes.md", { type: "text/markdown" });
+    Object.defineProperty(pythonFile, "webkitRelativePath", { value: "research/src/main.py" });
+    Object.defineProperty(markdownFile, "webkitRelativePath", { value: "research/docs/notes.md" });
+    Object.defineProperty(folderInput!, "files", { configurable: true, value: [pythonFile, markdownFile] });
+
+    await act(async () => {
+      folderInput!.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(2));
+    expect(uploadWorkspaceFile).toHaveBeenNthCalledWith(
+      1,
+      "project-1",
+      expect.objectContaining({ path: "research/src/main.py", data: pythonFile, overwrite: false }),
+      expect.anything(),
+    );
+    expect(uploadWorkspaceFile).toHaveBeenNthCalledWith(
+      2,
+      "project-1",
+      expect.objectContaining({ path: "research/docs/notes.md", data: markdownFile, overwrite: false }),
+      expect.anything(),
+    );
+  });
+
   it("keeps one authoritative event subscription across the initial refresh", async () => {
     const provider = providerFixture(baseSnapshot());
     root = await render(provider);
