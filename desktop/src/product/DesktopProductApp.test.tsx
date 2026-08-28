@@ -1107,27 +1107,20 @@ describe("Desktop v2 product renderer", () => {
     expect(actionLabels).not.toContain("Retry disconnect");
   });
 
-  it("distinguishes task, admission, attempt, project head, evolution, runtime, and execution identities", async () => {
+  it("keeps internal execution identities out of the Session inspector", async () => {
     root = await render(providerFixture(authoritySnapshot()));
 
     await click("Review evidence");
 
-    expect(document.body.textContent).toContain("Task task-1");
-    expect(document.body.textContent).toContain("Task Admission");
-    expect(document.body.textContent).toContain("task-admission-1");
-    expect(document.body.textContent).toContain("Attempt 2");
-    expect(document.body.textContent).toContain("attempt-2");
-    expect(document.body.textContent).toContain("Project Head");
-    expect(document.body.textContent).toContain("project-head-7");
-    expect(document.body.textContent).toContain("Generation 7");
-    expect(document.body.textContent).toContain("Evolution Revision");
-    expect(document.body.textContent).toContain("evolution-revision-1");
-    expect(document.body.textContent).toContain("Runtime Context Snapshot");
-    expect(document.body.textContent).toContain("runtime-context-1");
-    expect(document.body.textContent).toContain("Effective Execution Snapshot");
-    expect(document.body.textContent).toContain("effective-execution-1");
-    expect(document.body.textContent).toContain("Successor Transition");
-    expect(document.body.textContent).toContain("successor-transition-8");
+    expect(document.body.textContent).toContain("Project Head 7");
+    expect(document.body.textContent).not.toContain("Technical details");
+    expect(document.body.textContent).not.toContain("task-admission-1");
+    expect(document.body.textContent).not.toContain("attempt-2");
+    expect(document.body.textContent).not.toContain("project-head-7");
+    expect(document.body.textContent).not.toContain("evolution-revision-1");
+    expect(document.body.textContent).not.toContain("runtime-context-1");
+    expect(document.body.textContent).not.toContain("effective-execution-1");
+    expect(document.body.textContent).not.toContain("successor-transition-8");
   });
 
   it("opens one Task as a result detail with transcript, files, artifacts, and transition", async () => {
@@ -1153,21 +1146,21 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Applied Evolution Context");
     expect(document.body.textContent).toContain("Available for Evolution");
     expect(document.body.textContent).toContain("Project Head 7");
-    expect(document.body.textContent).toContain("04 / Execution trace");
+    expect(document.body.textContent).not.toContain("Technical details");
     expect(document.body.textContent).toContain("Memory · Update");
     expect(document.body.textContent).toContain("Skill · Update");
     expect(document.body.textContent).toContain("Agent system · Update");
     expect(document.body.textContent).not.toContain("artifact-memory-2");
     expect(document.body.textContent).toContain("Previous research memory");
     expect(document.body.textContent).toContain("Previous evidence skill");
-    expect(document.body.textContent).toContain("authoritative · closed");
-    expect(document.body.textContent).toContain("superseded");
-    expect(document.body.textContent).toContain("successor-transition-8");
+    expect(document.body.textContent).not.toContain("authoritative · closed");
+    expect(document.body.textContent).not.toContain("superseded");
+    expect(document.body.textContent).not.toContain("successor-transition-8");
     expect(
       [...document.querySelectorAll("[data-session-priority]")].map((node) =>
         node.getAttribute("data-session-priority"),
       ),
-    ).toEqual(["conversation", "outputs", "workspace", "context", "evolution", "technical"]);
+    ).toEqual(["conversation", "outputs", "workspace", "context", "evolution"]);
 
     await click("Memory · Update");
     expect(
@@ -1857,9 +1850,9 @@ describe("Desktop v2 product renderer", () => {
       ),
     ).toBe(false);
     expect(button("Retry successor transition")).toBeTruthy();
-    expect(document.body.textContent).toContain("Build successor Project Head");
-    expect(document.body.textContent).toContain("Successor state: failed");
-    expect(document.body.textContent).toContain("2 of 5 items");
+    expect(document.body.textContent).toContain("Project Head update failed");
+    expect(document.body.textContent).not.toContain("Technical details");
+    expect(document.body.textContent).not.toContain("Successor state: failed");
     expect(provider.submitTask).not.toHaveBeenCalled();
   });
 
@@ -1895,7 +1888,7 @@ describe("Desktop v2 product renderer", () => {
     expect(provider.submitTask).not.toHaveBeenCalled();
   });
 
-  it("renders an active Task through the shared long-operation presentation", async () => {
+  it("keeps an active Session focused on Agent activity and cancellation", async () => {
     const snapshot = authoritySnapshot();
     const runningTask = {
       ...snapshot.tasks[0]!,
@@ -1927,11 +1920,6 @@ describe("Desktop v2 product renderer", () => {
 
     root = await render(provider);
 
-    expect(document.body.textContent).toContain("Run science Task");
-    expect(document.body.textContent).toContain("Task state: running");
-    expect(document.body.textContent).toContain(
-      "Working — progress is not measurable for this phase",
-    );
     expect(loadTaskLogs).toHaveBeenCalledWith("task-1", { limit: 100 });
     expect(document.body.textContent).toContain(
       "Daemon started the managed Task attempt.",
@@ -1939,7 +1927,8 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Agent is working");
     expect(document.body.textContent).toContain("Cancel session");
     expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeTruthy();
-    expect(document.body.textContent).toContain("Task state");
+    expect(document.body.textContent).not.toContain("Technical details");
+    expect(document.body.textContent).not.toContain("Task state:");
   });
 
   it("cancels an active Session from the chat and keeps the control on the project overview", async () => {

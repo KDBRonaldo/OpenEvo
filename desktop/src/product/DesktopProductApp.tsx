@@ -57,8 +57,6 @@ import {
   diagnosticPanelModelV2,
   lifecycleOperationPanelModelV2,
   servicePanelModelV2,
-  taskPanelModelV2,
-  transitionPanelModelV2,
 } from "./LifecycleOperationPanelV2";
 import {
   unavailableDesktopProductProviderV2,
@@ -798,7 +796,6 @@ export function DesktopProductApp({
               project={displayedProject}
               tasks={snapshot.tasks}
               transitions={snapshot.transitions}
-              timelines={snapshot.timelines}
               taskLogs={taskLogs}
               artifacts={snapshot.artifacts}
               capability={snapshot.capability}
@@ -832,18 +829,6 @@ export function DesktopProductApp({
                 },
                 "The failed Evolution method is running again with the original Session inputs.",
               )}
-              onLoadTaskLogs={async (taskId) => {
-                setBusy(true);
-                setActionError(null);
-                try {
-                  const page = await provider.loadTaskLogs(taskId, { limit: 100 });
-                  setTaskLogs((current) => ({ ...current, [taskId]: page.items }));
-                } catch (error) {
-                  setActionError(userMessageV2(error));
-                } finally {
-                  setBusy(false);
-                }
-              }}
               onRetryTransition={(transition) => void act(
                 () => provider.retryTransition(transition.transition.successor_transition_id, intentFor(snapshot, "retry-transition")),
                 "Successor transition retry requested.",
@@ -1878,7 +1863,6 @@ function ResearchWorkspaceV2({
   project,
   tasks,
   transitions,
-  timelines,
   taskLogs,
   artifacts,
   capability,
@@ -1895,14 +1879,12 @@ function ResearchWorkspaceV2({
   onCancelTask,
   onRetryTask,
   onRetryEvolutionJob,
-  onLoadTaskLogs,
   onRetryTransition,
   onAbandonTransition,
 }: {
   readonly project: ProjectV2;
   readonly tasks: readonly TaskV2[];
   readonly transitions: Readonly<Record<string, SuccessorTransitionV2>>;
-  readonly timelines: DesktopProductSnapshotV2["timelines"];
   readonly taskLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
   readonly capability: DesktopProductSnapshotV2["capability"];
@@ -1923,7 +1905,6 @@ function ResearchWorkspaceV2({
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
-  readonly onLoadTaskLogs: (taskId: string) => void | Promise<void>;
   readonly onRetryTransition: (transition: SuccessorTransitionV2) => void;
   readonly onAbandonTransition: (transition: SuccessorTransitionV2) => void;
 }) {
@@ -2042,7 +2023,6 @@ function ResearchWorkspaceV2({
           artifacts={artifacts}
           artifactPresentation={runtimePresentation?.artifacts}
           transition={transition}
-          timeline={timelines[selectedTask.task_id] ?? []}
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
           canContinue={ready && activeTask === null && !sessionStartBlocked}
@@ -2052,7 +2032,6 @@ function ResearchWorkspaceV2({
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
           onRetryEvolutionJob={onRetryEvolutionJob}
-          onLoadLogs={() => onLoadTaskLogs(selectedTask.task_id)}
           onRetryTransition={() => transition && onRetryTransition(transition)}
           onAbandonTransition={() => transition && onAbandonTransition(transition)}
         />
@@ -2272,19 +2251,6 @@ function saveBrowserDownload(data: Blob, fileName: string): void {
   globalThis.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function TaskPinnedAuthorityCardsV2({ task }: { readonly task: TaskV2 }) {
-  const head = task.admission.predecessor_project_head;
-  return (
-    <section className="v2-authority-grid" aria-label="Session pinned immutable authority">
-      <IdentityCard title="Project Head" id={head.project_head_id} detail={`Generation ${head.generation}`} digest={head.manifest_sha256} />
-      <IdentityCard title="Evolution Revision" id={head.evolution_revision.evolution_revision_id} detail={`${head.evolution_revision.artifact_count} artifacts`} digest={head.evolution_revision.manifest_sha256} />
-      <IdentityCard title="Runtime Context Snapshot" id={head.runtime_context_snapshot.runtime_context_snapshot_id} detail="Pinned session context" digest={head.runtime_context_snapshot.manifest_sha256} />
-      <IdentityCard title="Effective Execution Snapshot" id={head.effective_execution_snapshot.effective_execution_snapshot_id} detail={`Producer ${head.effective_execution_snapshot.producer_id}`} digest={head.effective_execution_snapshot.snapshot_sha256} />
-      <IdentityCard title="Workspace Snapshot" id={head.workspace_snapshot.workspace_snapshot_id} detail={`${head.workspace_snapshot.entry_count} entries`} digest={head.workspace_snapshot.manifest_sha256} />
-    </section>
-  );
-}
-
 function AuthorityCardsV2({ project }: { readonly project: ProjectV2 }) {
   const head = project.active_project_head!;
   return (
@@ -2413,7 +2379,6 @@ function TaskAuthorityCardV2({
   artifacts,
   artifactPresentation,
   transition,
-  timeline,
   logs,
   busy,
   canContinue,
@@ -2421,7 +2386,6 @@ function TaskAuthorityCardV2({
   onCancel,
   onRetry,
   onRetryEvolutionJob,
-  onLoadLogs,
   onRetryTransition,
   onAbandonTransition,
 }: {
@@ -2431,7 +2395,6 @@ function TaskAuthorityCardV2({
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
   readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
   readonly transition: SuccessorTransitionV2 | null;
-  readonly timeline: DesktopProductSnapshotV2["timelines"][string];
   readonly logs: readonly LogEntryV2[];
   readonly busy: boolean;
   readonly canContinue: boolean;
@@ -2439,7 +2402,6 @@ function TaskAuthorityCardV2({
   readonly onCancel: () => void;
   readonly onRetry: () => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
-  readonly onLoadLogs: () => void | Promise<void>;
   readonly onRetryTransition: () => void;
   readonly onAbandonTransition: () => void;
 }) {
@@ -2469,6 +2431,8 @@ function TaskAuthorityCardV2({
   const outputFiles = presentation?.outputFiles ?? [];
   const evolutionEvidenceAvailable = presentation?.evolutionEvidenceReady
     ?? task.state === "closed";
+  const taskNeedsRecovery = task.state === "failed";
+  const transitionNeedsRecovery = transition?.state === "failed";
   const [selectedResult, setSelectedResult] = useState<
     | { readonly kind: "artifact"; readonly artifactId: string }
     | { readonly kind: "output"; readonly fileName: string }
@@ -2593,30 +2557,10 @@ function TaskAuthorityCardV2({
         {presentation?.selectedEvolution?.length ? <EvolutionJobStatusCollectionV2 selections={presentation.selectedEvolution} jobs={presentation.evolutionJobs ?? []} errors={presentation.evolutionErrors ?? []} busy={busy} onRetry={onRetryEvolutionJob} /> : null}
         {producedArtifacts.length ? <EvolutionResultCollection artifacts={producedArtifacts} artifactPresentation={artifactPresentation} jobs={presentation?.evolutionJobs ?? []} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /> : null}
       </section>
-      <details className="session-troubleshooting-disclosure" data-session-priority="technical">
-      <summary><span><Activity size={17} /><span><strong>Technical details</strong><small>IDs, attempts, logs, pinned authority, and recovery controls</small></span></span><ChevronDown size={16} /></summary>
-      <section className="v2-session-technical-details v2-session-module">
-        <SessionModuleHeadingV2 index="04" label="Execution trace" title="Technical details" description="Execution status and immutable identifiers for troubleshooting." metric={task.state.replaceAll("_", " ")} icon={Activity} tone="technical" />
-      <div className="v2-task-authority"><div><span>Task</span><code>Task {task.task_id}</code><small>{task.state.replaceAll("_", " ")}</small></div><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
-      <div className="v2-attempt-list">{task.attempts.map((attempt) => {
-        const authoritative = attempt.attempt_id === task.authoritative_attempt_id;
-        return <div key={attempt.attempt_id}><strong>Attempt {attempt.ordinal}</strong><code>{attempt.attempt_id}</code><small>{formatTimeV2(attempt.created_at)}</small><span className="muted-pill">{authoritative ? `authoritative · ${task.state.replaceAll("_", " ")}` : "superseded"}</span></div>;
-      })}</div>
-      <LifecycleOperationPanelV2
-        model={taskPanelModelV2(task, timeline, logs)}
-        onCancel={active ? onCancel : undefined}
-      />
-      {transition !== null && transition.state !== "committed" ? (
-        <LifecycleOperationPanelV2 model={transitionPanelModelV2(transition, timeline)} />
-      ) : null}
-      {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
-      <details className="v2-authority-details session-pinned-authority">
-        <summary>View pinned Project and runtime authority</summary>
-        <TaskPinnedAuthorityCardsV2 task={task} />
-      </details>
-      <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadLogs()}>Refresh task logs</button>{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
-      </section>
-      </details>
+      {taskNeedsRecovery || transitionNeedsRecovery ? <section className="session-recovery-card" data-session-priority="recovery" role="alert">
+        <AlertCircle size={18} />
+        <div><strong>{taskNeedsRecovery ? "Session failed" : "Project Head update failed"}</strong><p>{taskNeedsRecovery ? "OpenEvo could not complete this Session. You can retry it with the same pinned context." : transition?.error?.message ?? "OpenEvo could not prepare the next Project Head."}</p><div className="session-recovery-actions">{taskNeedsRecovery ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Retry Session</button> : null}{transitionNeedsRecovery ? <><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Discard evolution result</button></> : null}</div></div>
+      </section> : null}
       </>}
       </aside>
     </article>

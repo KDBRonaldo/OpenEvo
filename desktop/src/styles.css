@@ -4671,8 +4671,7 @@ pre.json {
 }
 
 .session-inspector-pane .v2-evolution-priority,
-.session-inspector-pane .v2-supporting-module,
-.session-inspector-pane .v2-session-technical-details {
+.session-inspector-pane .v2-supporting-module {
   gap: 10px;
   margin-top: 18px;
   padding-top: 18px;
@@ -4858,64 +4857,36 @@ pre.json {
   color: var(--accent-strong);
 }
 
-.session-troubleshooting-disclosure {
-  margin-top: 18px;
-  padding-top: 4px;
-  border-top: 1px solid var(--line);
-}
-
-.session-troubleshooting-disclosure > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 2px;
-  color: var(--muted);
-  cursor: pointer;
-  list-style: none;
-}
-
-.session-troubleshooting-disclosure > summary::-webkit-details-marker {
-  display: none;
-}
-
-.session-troubleshooting-disclosure > summary > span {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.session-troubleshooting-disclosure > summary > span > span {
+.session-recovery-card {
   display: grid;
-  gap: 2px;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid #e6c9c3;
+  border-radius: 8px;
+  background: #fff8f6;
+  color: #a24d3f;
 }
 
-.session-troubleshooting-disclosure > summary strong {
-  color: var(--ink);
+.session-recovery-card > div > strong {
+  display: block;
+  color: #71382f;
   font-size: 12px;
 }
 
-.session-troubleshooting-disclosure > summary small {
-  font-size: 9px;
+.session-recovery-card p {
+  margin: 4px 0 0;
+  color: #805c55;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
-.session-troubleshooting-disclosure > summary > svg {
-  flex: 0 0 auto;
-  transition: transform 160ms ease;
-}
-
-.session-troubleshooting-disclosure[open] > summary > svg {
-  transform: rotate(180deg);
-}
-
-.session-inspector-pane .session-troubleshooting-disclosure .v2-session-technical-details {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
-}
-
-.session-pinned-authority {
-  margin-top: 4px;
+.session-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
 }
 
 .session-conversation-pane .v2-agent-activity {
