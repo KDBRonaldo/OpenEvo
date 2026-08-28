@@ -1183,7 +1183,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Unsupported conclusions are marked as hypotheses",
     );
-    expect(document.body.textContent).not.toContain("Session draft");
+    expect(document.body.textContent).not.toContain("What should the Agent do next?");
     expect(document.querySelector(".session-explorer")).toBeTruthy();
 
     await click("Back to Protein study");
@@ -1191,7 +1191,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
-    expect(document.body.textContent).toContain("Session draft");
+    expect(document.body.textContent).toContain("What should the Agent do next?");
     expect(document.querySelector(".session-explorer-list")).toBeTruthy();
   });
 
@@ -1843,7 +1843,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
-    expect(document.body.textContent).not.toContain("Session draft");
+    expect(document.body.textContent).not.toContain("What should the Agent do next?");
     expect(
       [...document.querySelectorAll("button")].some((candidate) =>
         candidate.textContent?.includes("Start session"),

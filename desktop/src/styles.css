@@ -198,7 +198,7 @@ pre.json {
   display: flex;
   height: 58px;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 18px;
   padding: 0 22px;
   border-bottom: 1px solid var(--line);
@@ -313,68 +313,6 @@ pre.json {
 .danger-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.connection-badge {
-  display: grid;
-  grid-template-columns: 9px auto auto;
-  height: 31px;
-  align-items: center;
-  gap: 7px;
-  padding: 0 9px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  color: var(--muted);
-  background: var(--surface-soft);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.connection-badge strong {
-  color: var(--ink);
-  font-weight: 650;
-}
-
-.connection-badge.success {
-  border-color: #bcd7cc;
-  background: #eff8f4;
-}
-
-.connection-badge.warning {
-  border-color: #ebd4a9;
-  background: var(--warning-soft);
-}
-
-.connection-badge.progress {
-  border-color: #bed0e0;
-  background: var(--blue-soft);
-}
-
-.status-dot,
-.service-indicator {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: #a4aca7;
-}
-
-.connection-badge.success .status-dot,
-.service-indicator.healthy {
-  background: #318268;
-  box-shadow: 0 0 0 3px #dcefe7;
-}
-
-.connection-badge.warning .status-dot,
-.service-indicator.degraded,
-.service-indicator.starting {
-  background: #c2801d;
-  box-shadow: 0 0 0 3px #faeccf;
-}
-
-.service-indicator.failed {
-  background: var(--danger);
-  box-shadow: 0 0 0 3px var(--danger-soft);
 }
 
 .product-main {
@@ -515,7 +453,7 @@ pre.json {
 
 .workspace-heading {
   display: flex;
-  min-height: 68px;
+  min-height: 42px;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
@@ -968,26 +906,13 @@ pre.json {
   font-weight: 500;
 }
 
-.brief-footer {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-}
-
-.product-v2-shell .task-panel > .brief-footer {
-  margin: 0 20px;
-  padding-bottom: 16px;
-}
-
 .session-draft-actions {
   position: sticky;
   z-index: 2;
   bottom: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 16px;
   padding: 13px 20px;
   border-top: 1px solid var(--line);
@@ -996,54 +921,8 @@ pre.json {
   backdrop-filter: blur(8px);
 }
 
-.session-draft-actions > div {
-  min-width: 0;
-}
-
-.session-draft-actions strong,
-.session-draft-actions span {
-  display: block;
-}
-
-.session-draft-actions strong {
-  color: var(--ink);
-  font-size: 11px;
-}
-
-.session-draft-actions span {
-  margin-top: 2px;
-  color: var(--muted);
-  font-size: 10px;
-}
-
 .session-draft-actions .primary-button {
   min-width: 126px;
-}
-
-.brief-footer div {
-  min-width: 0;
-}
-
-.brief-footer span,
-.brief-footer strong {
-  display: block;
-  overflow-wrap: anywhere;
-}
-
-.brief-footer span { white-space: nowrap; }
-.brief-footer strong { white-space: normal; }
-
-.brief-footer span {
-  margin-bottom: 3px;
-  color: var(--subtle);
-  font-size: 10px;
-  font-weight: 650;
-  text-transform: uppercase;
-}
-
-.brief-footer strong {
-  font-size: 12px;
-  font-weight: 650;
 }
 
 .state-pill {
@@ -2200,23 +2079,6 @@ pre.json {
 .session-state-dot.preparing,
 .session-state-dot.admitted {
   background: #346797;
-}
-
-.workspace-breadcrumb {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 7px;
-  color: #747e78;
-  font-size: 12px;
-}
-
-.workspace-breadcrumb strong {
-  min-width: 0;
-  overflow: hidden;
-  color: #29332d;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .project-file-editor {
@@ -3952,10 +3814,6 @@ pre.json {
   .product-main {
     padding-right: 18px;
     padding-left: 18px;
-  }
-
-  .connection-badge > span:not(.status-dot) {
-    display: none;
   }
 
   .research-grid {

@@ -743,7 +743,6 @@ export function DesktopProductApp({
 
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : startingSession?.task.title ?? displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
           <div className="topbar-actions">
             {displayedProject === null && connectedProfiles.length > 0 ? (
               <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
@@ -751,10 +750,7 @@ export function DesktopProductApp({
               </button>
             ) : null}
             {activeProfile && activeProfile.profile_kind === "system_openssh" ? (
-              <>
-                <div className={`connection-badge ${activeProfile.connection_state === "connected" ? "success" : "neutral"}`} title={`${activeProfile.display_name}: ${connectionLabel(activeProfile.connection_state)}`}><span className="status-dot" /><span>{activeProfile.display_name}</span><strong>{connectionLabel(activeProfile.connection_state)}</strong></div>
-                <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
-              </>
+              <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
             ) : (
               <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> Add remote workspace</button>
             )}
@@ -764,14 +760,6 @@ export function DesktopProductApp({
         <main className="product-main">
           {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
           {actionError ? <Notice tone="error" title="Action not completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
-          {developmentAgentBridge ? (
-            <Notice
-              tone="info"
-              title="Remote Agent mode"
-              detail="Replies come from the remote Codex CLI. Project and Session history are persisted by the remote daemon."
-              compact
-            />
-          ) : null}
           {actionStatus ? <Notice tone="success" title="Action completed" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
           {snapshot.stream.status !== "fresh" ? (
             <Notice tone="warning" title="Synchronizing remote state" detail="Write actions remain paused until synchronization completes." compact />
@@ -2042,7 +2030,7 @@ function ResearchWorkspaceV2({
   return (
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
-        <div><p className="eyebrow">Research workspace</p><h1>{project.display_name}</h1><p>Define a task, choose the Project Head to apply, and start a new Session.</p></div>
+        <div><h1>{project.display_name}</h1></div>
         <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button></div>
       </div>
       {visibleStartingSession ? (
@@ -2069,7 +2057,7 @@ function ResearchWorkspaceV2({
       ) : null}
       <div className="research-grid">
       <section className="product-panel task-panel" aria-busy={visibleStartingSession !== null}>
-        <div className="panel-heading"><div><span className="panel-kicker">Session draft</span><h2>What should the Agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "Ready" : "Preparing"}</span></div>
+        <div className="panel-heading"><div><h2>What should the Agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "Ready" : "Preparing"}</span></div>
         <div className="next-task-fields">
           <label>Task title<input maxLength={256} value={taskTitle} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
           <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
@@ -2078,7 +2066,6 @@ function ResearchWorkspaceV2({
               {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}</option>)}
             </select>
           </label>
-          <p className="form-help">This Session pins the selected Project Head and applies its evolved artifacts. Choosing a historical version does not change existing Sessions.</p>
         </div>
         {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
           <legend>Evolution after this session <span>Optional · formal contract</span></legend>
@@ -2086,14 +2073,12 @@ function ResearchWorkspaceV2({
           <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
         </fieldset> : null}
         {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex subscription" : "Self-hosted"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? `${selectedEvolutionCount} selected` : "Run separately"}</strong></div></div>
         <div className="session-draft-actions">
-          <div><strong>{selectedProjectHead ? `Project Head ${selectedProjectHead.generation}` : "No Project Head selected"}</strong><span>{sessionStartBlocked ? "Unavailable while Evolution is running" : "Your draft is preserved if startup fails"}</span></div>
           <button type="button" className="primary-button" disabled={formBusy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}>{formBusy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} {sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting" : "Start session"}</button>
         </div>
       </section>
       <section className="product-panel active-run-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected Session" : "Session status"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No Session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">Ready</span>}</div>
+        <div className="panel-heading"><div><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No Session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">Ready</span>}</div>
         {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Session admission</strong></div><span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "No task instructions are available for this historical Session."}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "Open live Session" : "Open Session result"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>Cancel Session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>Start a Session when the remote workspace is ready.</p></div>}
       </section>
       </div>

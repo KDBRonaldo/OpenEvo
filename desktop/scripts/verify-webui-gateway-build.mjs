@@ -21,9 +21,9 @@ for (const forbidden of ["OpenEvo Observability", "Sync Workspace", "Start Servi
   }
 }
 for (const required of [
-  "Remote Agent mode",
   "What should the Agent do next?",
-  "Run separately",
+  "Evolution context",
+  "Start session",
   "Run Evolution",
   "desktop/v2",
   "openevo-dev-agent/v1",

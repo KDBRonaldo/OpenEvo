@@ -27,7 +27,5 @@ describe("Desktop product responsive CSS", () => {
   it("keeps history state visible and wraps long research metadata at compact widths", () => {
     expect(styles).toMatch(/\.session-table-head\s*>\s*span:last-child,\s*\.session-table-row\s*>\s*span:last-child\s*{\s*display:\s*none;/);
     expect(styles).not.toMatch(/\.session-table-row\s+span:last-child\s*{\s*display:\s*none;/);
-    expect(styles).toMatch(/\.brief-footer strong\s*{\s*white-space:\s*normal;\s*}/);
-    expect(styles).toMatch(/\.brief-footer span,\s*\.brief-footer strong\s*{[\s\S]*?overflow-wrap:\s*anywhere;/);
   });
 });
