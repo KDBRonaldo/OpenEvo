@@ -207,6 +207,9 @@ const taskPresentationPageV2Schema = z.object({
 const evolutionRunSchema = z.object({
   run_id: z.string().min(1),
   project_id: z.string().min(1),
+  base_project_head_id: z.string().min(1).nullable().optional(),
+  base_project_head_manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable().optional(),
+  applied_project_head_id: z.string().min(1).nullable().optional(),
   source_session_ids: z.array(z.string().min(1)).min(1),
   selections: z.array(z.object({
     target_id: z.string().min(1),
@@ -232,6 +235,9 @@ const evolutionRunV2Schema = z.object({
   run_id: z.string().min(1),
   action_id: z.string().min(1),
   project_id: z.string().min(1),
+  base_project_head_id: z.string().min(1).nullable().default(null),
+  base_project_head_manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable().default(null),
+  applied_project_head_id: z.string().min(1).nullable().default(null),
   source_task_ids: z.array(z.string().min(1)).min(1).max(128),
   selections: z.array(evolutionSelectionV2Schema).min(1).max(64),
   state: z.enum(["running", "candidate_ready", "applied", "failed"]),
@@ -343,7 +349,24 @@ const capabilityResponseSchema = z.object({
 const developmentStateV2Schema = z.object({
   schema_version: z.literal("2"),
   active_project_id: z.string().min(1).nullable(),
-  projects: z.array(projectSchema.extend({ schema_version: z.literal("2") }).strict()).max(1_000),
+  projects: z.array(projectSchema.extend({
+    schema_version: z.literal("2"),
+    active_project_head_id: z.string().min(1).nullable().default(null),
+  }).strict()).max(1_000),
+  project_heads: z.array(z.object({
+    schema_version: z.literal("2"),
+    project_head_id: z.string().min(1),
+    project_id: z.string().min(1),
+    generation: z.number().int().nonnegative(),
+    predecessor_project_head_id: z.string().min(1).nullable(),
+    source_evolution_run_id: z.string().min(1).nullable(),
+    artifact_ids: z.array(z.string().min(1)).max(256),
+    workspace_manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    workspace_entry_count: z.number().int().nonnegative(),
+    workspace_byte_size: z.number().int().nonnegative(),
+    manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    created_at: z.string().min(1),
+  }).strict()).max(10_000).default([]),
 }).strict();
 
 const capabilityResponseV2Schema = z.object({
@@ -553,6 +576,9 @@ export function createDevelopmentAgentProvider(
         runs.push({
           run_id: item.run_id,
           project_id: item.project_id,
+          base_project_head_id: item.base_project_head_id,
+          base_project_head_manifest_sha256: item.base_project_head_manifest_sha256,
+          applied_project_head_id: item.applied_project_head_id,
           source_session_ids: item.source_task_ids,
           selections: item.selections.map((selection) => ({
             target_id: selection.target_id,
@@ -799,7 +825,11 @@ export function createDevelopmentAgentProvider(
             return stateSchema.parse({
               schema_version: "1",
               active_project_id: state.active_project_id,
-              projects: state.projects.map(({ schema_version: _version, ...project }) => project),
+              projects: state.projects.map(({
+                schema_version: _version,
+                active_project_head_id: _activeHeadId,
+                ...project
+              }) => project),
               sessions: [], artifacts: [], evolution_jobs: [], evolution_runs: [], workspaces: [],
             });
           }),
@@ -898,6 +928,8 @@ export function createDevelopmentAgentProvider(
         evolutionRuns: evolutionRuns.map((run) => ({
           runId: run.run_id,
           projectId: run.project_id,
+          baseProjectHeadId: run.base_project_head_id ?? undefined,
+          appliedProjectHeadId: run.applied_project_head_id ?? null,
           sourceSessionIds: run.source_session_ids,
           selections: run.selections.map((selection) => ({
             targetId: selection.target_id,
@@ -970,7 +1002,7 @@ export function createDevelopmentAgentProvider(
         jsonRequest("POST", { schema_version: "1" }),
       );
     },
-    startEvolutionRun: async (projectId, sourceSessionIds, selections) => {
+    startEvolutionRun: async (projectId, sourceSessionIds, selections, baseProjectHead) => {
       const serializedSelections = selections.map((selection) => ({
         target_id: selection.targetId,
         method: selection.method,
@@ -982,11 +1014,18 @@ export function createDevelopmentAgentProvider(
           jsonRequest("POST", {
             schema_version: "1",
             project_id: projectId,
+            ...(baseProjectHead === undefined ? {} : {
+              base_project_head_id: baseProjectHead.projectHeadId,
+              base_project_head_manifest_sha256: baseProjectHead.manifestSha256,
+            }),
             session_ids: sourceSessionIds,
             selections: serializedSelections,
           }),
         );
         return;
+      }
+      if (baseProjectHead === undefined) {
+        throw new Error("Evolution Run requires an immutable Base Project Head.");
       }
       const actionId = globalThis.crypto.randomUUID();
       const created = evolutionRunV2Schema.parse(await requestEvolutionV2(
@@ -995,6 +1034,8 @@ export function createDevelopmentAgentProvider(
           schema_version: "2",
           action_id: actionId,
           project_id: projectId,
+          base_project_head_id: baseProjectHead.projectHeadId,
+          base_project_head_manifest_sha256: baseProjectHead.manifestSha256,
           source_task_ids: sourceSessionIds,
           selections: serializedSelections.map((selection) => ({
             schema_version: "2",

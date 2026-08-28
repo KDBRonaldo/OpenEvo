@@ -1391,10 +1391,13 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    base_head = store.active_project_head(project_id)
     request_body = {
         "schema_version": "2",
         "action_id": action_id,
         "project_id": project_id,
+        "base_project_head_id": base_head["project_head_id"],
+        "base_project_head_manifest_sha256": base_head["manifest_sha256"],
         "source_task_ids": [task_id],
         "selections": [
             {
@@ -1415,6 +1418,7 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
         with urllib.request.urlopen(create, timeout=5) as response:
             created = json.loads(response.read())
         assert created["action_id"] == action_id
+        assert created["base_project_head_id"] == base_head["project_head_id"]
         run_id = created["run_id"]
         assert evolution_started.wait(5)
 
@@ -1472,6 +1476,7 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
         with urllib.request.urlopen(apply, timeout=5) as response:
             applied = json.loads(response.read())
         assert applied["state"] == "applied"
+        assert applied["applied_project_head_id"] == f"{project_id}-head-1"
     finally:
         release_evolution.set()
         server.shutdown()
@@ -1481,6 +1486,12 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
     restored = MODULE.DevelopmentStateStore(database)
     restored_run = restored.evolution_run_v2(run_id)
     assert restored_run.state == "applied"
+    assert restored_run.base_project_head_id == base_head["project_head_id"]
+    assert restored_run.applied_project_head_id == f"{project_id}-head-1"
+    active_head = restored.active_project_head(project_id)
+    assert active_head["project_head_id"] == restored_run.applied_project_head_id
+    assert active_head["predecessor_project_head_id"] == base_head["project_head_id"]
+    assert active_head["artifact_ids"] == list(restored_run.artifact_ids)
     restored.start_session(
         "development-task-after-v2-evolution",
         {
@@ -1496,6 +1507,7 @@ def test_daemon_v2_evolution_run_is_idempotent_applied_and_used_by_next_session(
         if session["session_id"] == "development-task-after-v2-evolution"
     )
     assert next_session["context_artifact_ids"] == list(restored_run.artifact_ids)
+    assert next_session["project_head_id"] == restored_run.applied_project_head_id
 
 
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:

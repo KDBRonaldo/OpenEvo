@@ -201,12 +201,28 @@ class SqliteSessionStore:
                 )
             project_head_id = request.get("project_head_id")
             if project_head_id is None:
-                completed_count = connection.execute(
-                    "SELECT COUNT(*) AS count FROM development_sessions "
-                    "WHERE project_id = ? AND state = 'completed'",
-                    (request["project_id"],),
-                ).fetchone()["count"]
-                project_head_id = f"{request['project_id']}-head-{completed_count}"
+                head_stream_table = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'development_project_head_streams'"
+                ).fetchone()
+                active_head = (
+                    None
+                    if head_stream_table is None
+                    else connection.execute(
+                        "SELECT active_project_head_id "
+                        "FROM development_project_head_streams WHERE project_id = ?",
+                        (request["project_id"],),
+                    ).fetchone()
+                )
+                if active_head is not None:
+                    project_head_id = active_head["active_project_head_id"]
+                else:
+                    completed_count = connection.execute(
+                        "SELECT COUNT(*) AS count FROM development_sessions "
+                        "WHERE project_id = ? AND state = 'completed'",
+                        (request["project_id"],),
+                    ).fetchone()["count"]
+                    project_head_id = f"{request['project_id']}-head-{completed_count}"
             context_artifact_ids = self._context_artifact_ids_for_head(
                 connection,
                 project_id=request["project_id"],
@@ -263,41 +279,36 @@ class SqliteSessionStore:
         project_id: str,
         project_head_id: str | None,
     ) -> list[str]:
-        """Resolve an immutable historical context snapshot for one Project Head.
-
-        A head already used by a Session reuses that Session's pinned artifact
-        inventory. The current synthetic bridge head resolves to the promoted
-        context at admission time. Legacy callers without a head retain the
-        previous current-context behavior.
-        """
+        """Resolve the immutable artifact membership owned by a Project Head."""
 
         if project_head_id is not None:
+            head_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'development_project_heads'"
+            ).fetchone()
+            if head_table is not None:
+                head = connection.execute(
+                    "SELECT project_id, artifact_ids_json "
+                    "FROM development_project_heads WHERE project_head_id = ?",
+                    (project_head_id,),
+                ).fetchone()
+                if head is None or head["project_id"] != project_id:
+                    raise SessionConflictError(
+                        "project_head_id is not an available Project Head for this Project"
+                    )
+                return list(json.loads(head["artifact_ids_json"]))
+
             historical = connection.execute(
-                """
-                SELECT context_artifact_ids_json
-                FROM development_sessions
-                WHERE project_id = ? AND project_head_id = ?
-                ORDER BY created_at, session_id
-                LIMIT 1
-                """,
+                "SELECT context_artifact_ids_json FROM development_sessions "
+                "WHERE project_id = ? AND project_head_id = ? "
+                "ORDER BY created_at, session_id LIMIT 1",
                 (project_id, project_head_id),
             ).fetchone()
-            if historical is not None:
-                return list(json.loads(historical["context_artifact_ids_json"]))
-
-            completed_count = connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM development_sessions
-                WHERE project_id = ? AND state = 'completed'
-                """,
-                (project_id,),
-            ).fetchone()["count"]
-            current_project_head_id = f"{project_id}-head-{completed_count}"
-            if project_head_id != current_project_head_id:
+            if historical is None:
                 raise SessionConflictError(
                     "project_head_id is not an available Project Head for this Project"
                 )
+            return list(json.loads(historical["context_artifact_ids_json"]))
 
         context_rows = connection.execute(
             """

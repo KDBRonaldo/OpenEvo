@@ -36,6 +36,10 @@ class EvolutionStore(Protocol):
 
     def latest_artifact(self, project_id: str, target_id: str) -> dict[str, Any] | None: ...
 
+    def artifact_for_project_head_target(
+        self, project_id: str, project_head_id: str, target_id: str
+    ) -> dict[str, Any] | None: ...
+
     def start_evolution_job(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def get_evolution_job(self, job_id: str) -> dict[str, Any]: ...
@@ -405,6 +409,7 @@ class EvolutionOrchestrator:
             current_session_id=session_id,
             prior_dataset_ids=prior_dataset_ids,
             selections=selected,
+            base_project_head_id=None,
             store=store,
             cancellation=cancellation,
             promote_outputs=True,
@@ -514,6 +519,7 @@ class EvolutionOrchestrator:
             current_session_id=current_session_id,
             prior_dataset_ids=[f"dataset-{session_id}" for session_id in session_ids[:-1]],
             selections=run["selections"],
+            base_project_head_id=run["base_project_head_id"],
             store=store,
             cancellation=None,
             promote_outputs=False,
@@ -528,6 +534,7 @@ class EvolutionOrchestrator:
         current_session_id: str,
         prior_dataset_ids: list[str],
         selections: list[dict[str, Any]],
+        base_project_head_id: str | None,
         store: EvolutionStore,
         cancellation: HarnessCancellation | None,
         promote_outputs: bool,
@@ -553,7 +560,13 @@ class EvolutionOrchestrator:
             )
             job_suffix = current_session_id if run_id is None else run_id
             job_id = f"job-{target_id.replace('_', '-')}-{job_suffix}"
-            previous = store.latest_artifact(project_id, target_id)
+            previous = (
+                store.latest_artifact(project_id, target_id)
+                if base_project_head_id is None
+                else store.artifact_for_project_head_target(
+                    project_id, base_project_head_id, target_id
+                )
+            )
             attempt = store.start_evolution_job(
                 job_id=job_id,
                 session_id=current_session_id,

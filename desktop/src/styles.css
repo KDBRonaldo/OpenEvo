@@ -4449,8 +4449,11 @@ pre.json {
 }
 
 .session-inspector-section {
-  padding: 16px 2px;
-  border-bottom: 1px solid var(--line);
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid #d8e1dd;
+  border-radius: 10px;
+  background: #fff;
 }
 
 .session-inspector-section-heading {
@@ -4621,8 +4624,11 @@ pre.json {
 }
 
 .session-evolution-availability {
-  padding: 16px 2px;
-  border-bottom: 1px solid var(--line);
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid #dddff2;
+  border-radius: 10px;
+  background: #fff;
 }
 
 .session-evolution-availability-heading {
@@ -5872,6 +5878,47 @@ pre.json {
 .v2-current-evolution-run {
   margin-top: 14px;
   padding: 18px;
+}
+
+.v2-evolution-head-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  margin: 14px 0;
+  padding: 11px 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.v2-evolution-head-flow > span {
+  display: grid;
+  gap: 2px;
+}
+
+.v2-evolution-head-flow > span:last-child {
+  text-align: right;
+}
+
+.v2-evolution-head-flow small {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.v2-evolution-head-flow strong {
+  font-size: 12px;
+}
+
+.v2-evolution-head-flow .created strong {
+  color: var(--accent);
+}
+
+.v2-evolution-head-flow .pending strong {
+  color: var(--muted);
 }
 
 .v2-current-evolution-result {

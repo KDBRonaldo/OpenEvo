@@ -62,6 +62,8 @@ export interface RuntimePresentationV2 {
   readonly evolutionRuns?: readonly {
     readonly runId: string;
     readonly projectId: string;
+    readonly baseProjectHeadId?: string;
+    readonly appliedProjectHeadId?: string | null;
     readonly sourceTaskIds: readonly string[];
     readonly selections: readonly {
       readonly targetId: string;
@@ -252,6 +254,7 @@ export interface DesktopProductProviderV2 {
       readonly config: Readonly<Record<string, unknown>>;
     }[],
     intent: ProductMutationIntentV2,
+    baseProjectHead?: ProjectHeadRefV2,
   ): Promise<void>;
   applyEvolutionRun?(runId: string, intent: ProductMutationIntentV2): Promise<void>;
   uploadWorkspaceFile?(

@@ -115,14 +115,31 @@ class DevelopmentProjectAuthorityV2(StrictDevelopmentModelV2):
     project_id: core.OpaqueId
     display_name: str = Field(min_length=1, max_length=512)
     config: core.ScienceProjectConfigV2
+    active_project_head_id: core.OpaqueId | None = None
     created_at: core.UtcTimestamp
     updated_at: core.UtcTimestamp
+
+
+class DevelopmentProjectHeadV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    project_head_id: core.OpaqueId
+    project_id: core.OpaqueId
+    generation: int = Field(ge=0, le=core.MAX_JAVASCRIPT_SAFE_INTEGER)
+    predecessor_project_head_id: core.OpaqueId | None = None
+    source_evolution_run_id: core.OpaqueId | None = None
+    artifact_ids: list[core.OpaqueId] = Field(max_length=256)
+    workspace_manifest_sha256: core.Sha256Digest
+    workspace_entry_count: int = Field(ge=0, le=core.MAX_JAVASCRIPT_SAFE_INTEGER)
+    workspace_byte_size: int = Field(ge=0, le=core.MAX_SNAPSHOT_BYTES)
+    manifest_sha256: core.Sha256Digest
+    created_at: core.UtcTimestamp
 
 
 class DevelopmentStateV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     active_project_id: core.OpaqueId | None = None
     projects: list[DevelopmentProjectAuthorityV2] = Field(max_length=1_000)
+    project_heads: list[DevelopmentProjectHeadV2] = Field(default_factory=list, max_length=10_000)
 
 
 class DevelopmentProjectCreateV2(StrictDevelopmentModelV2):
@@ -359,6 +376,8 @@ class DevelopmentEvolutionRunCreateV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     action_id: core.OpaqueId
     project_id: core.OpaqueId
+    base_project_head_id: core.OpaqueId | None = None
+    base_project_head_manifest_sha256: core.Sha256Digest | None = None
     source_task_ids: list[core.OpaqueId] = Field(min_length=1, max_length=128)
     selections: list[DevelopmentEvolutionSelectionV2] = Field(min_length=1, max_length=64)
 
@@ -381,6 +400,9 @@ class DevelopmentEvolutionRunV2(StrictDevelopmentModelV2):
     run_id: core.OpaqueId
     action_id: core.OpaqueId
     project_id: core.OpaqueId
+    base_project_head_id: core.OpaqueId | None = None
+    base_project_head_manifest_sha256: core.Sha256Digest | None = None
+    applied_project_head_id: core.OpaqueId | None = None
     source_task_ids: list[core.OpaqueId] = Field(min_length=1, max_length=128)
     selections: list[DevelopmentEvolutionSelectionV2] = Field(min_length=1, max_length=64)
     state: Literal["running", "candidate_ready", "applied", "failed"]

@@ -195,6 +195,7 @@ export interface DevelopmentAgentBackend {
     projectId: string,
     sourceSessionIds: readonly string[],
     selections: readonly PersistedDevelopmentEvolutionSelection[],
+    baseProjectHead?: { readonly projectHeadId: string; readonly manifestSha256: string },
   ): Promise<void>;
   applyEvolutionRun(runId: string): Promise<void>;
   uploadWorkspaceFile(
@@ -477,8 +478,11 @@ function createRemoteBackedDesktopProductProvider(
       notifySubscribers();
       schedulePolling();
     },
-    startEvolutionRun: async (projectId, sourceTaskIds, selections) => {
+    startEvolutionRun: async (projectId, sourceTaskIds, selections, _intent, baseProjectHead) => {
       await ensureDevelopmentState();
+      const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
+      const head = baseProjectHead ?? project?.active_project_head;
+      if (head === undefined || head === null) throw new Error("Project has no active Project Head.");
       await options.developmentBackend.startEvolutionRun(
         projectId,
         sourceTaskIds,
@@ -487,6 +491,10 @@ function createRemoteBackedDesktopProductProvider(
           method: selection.method,
           config: selection.config,
         })),
+        {
+          projectHeadId: head.project_head_id,
+          manifestSha256: head.manifest_sha256,
+        },
       );
       await ensureDevelopmentState(true);
       notifySubscribers();

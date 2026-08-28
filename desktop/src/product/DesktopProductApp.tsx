@@ -856,6 +856,7 @@ export function DesktopProductApp({
                     sourceTaskIds,
                     selections,
                     intentFor(snapshot, "start-evolution-run"),
+                    displayedProject.active_project_head ?? undefined,
                   );
                 },
                 "Evolution Run started. Its outputs remain candidates until you apply them.",
@@ -2945,6 +2946,7 @@ function EvolutionWorkspaceV2({
         <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Current Evolution Result</h2></div><span className="muted-pill">{runs.length} total run{runs.length === 1 ? "" : "s"}</span></div>
         {latestRun === undefined ? <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div> : <article className={`v2-evolution-job v2-current-evolution-run ${latestRun.state}`}>
           <header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${latestRun.state}`} aria-hidden="true">{latestRun.state === "running" ? <LoaderCircle className="spin" size={16} /> : latestRun.state === "applied" || latestRun.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{latestRun.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{latestRun.sourceTaskIds.length} Session{latestRun.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(latestRun.createdAt)}</small></div></div><span className={`state-pill ${latestRun.state}`}>{evolutionRunStateLabel(latestRun.state)}</span></header>
+          {latestRun.baseProjectHeadId ? <div className="v2-evolution-head-flow"><span><small>Base Head</small><strong>{projectHeadDisplayName(latestRun.baseProjectHeadId)}</strong></span><ArrowRight size={16} /><span className={latestRun.appliedProjectHeadId ? "created" : "pending"}><small>{latestRun.appliedProjectHeadId ? "Created Head" : "On apply"}</small><strong>{latestRun.appliedProjectHeadId ? projectHeadDisplayName(latestRun.appliedProjectHeadId) : "New Project Head"}</strong></span></div> : null}
           {latestRun.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{latestRun.error}</p></div> : null}
           {latestRun.state === "running" ? <div className="v2-current-evolution-empty"><LoaderCircle className="spin" size={18} /><span>Producing the current candidate…</span></div> : null}
           {latestRunArtifacts.length ? <div className="v2-current-evolution-result">
@@ -3218,6 +3220,11 @@ function evolutionRunStateLabel(state: "running" | "candidate_ready" | "applied"
     failed: "Failed",
   } as const;
   return labels[state];
+}
+
+function projectHeadDisplayName(projectHeadId: string): string {
+  const generation = projectHeadId.match(/-head-(\d+)$/)?.[1];
+  return generation === undefined ? projectHeadId : `Project Head ${generation}`;
 }
 
 function evolutionTargetLabel(targetId: string): string {

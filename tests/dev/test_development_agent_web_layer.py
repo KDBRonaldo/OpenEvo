@@ -38,6 +38,7 @@ class FakeDaemonClient:
             "artifacts": [],
             "evolution_jobs": [],
             "evolution_runs": [],
+            "project_heads": [],
             "workspaces": [],
         }
         self.events: list[dict[str, object]] = []
@@ -116,6 +117,10 @@ class FakeDaemonClient:
                 "projects": [
                     {"schema_version": "2", **project}
                     for project in self.state["projects"]
+                ],
+                "project_heads": [
+                    {"schema_version": "2", **head}
+                    for head in self.state["project_heads"]
                 ],
             }
         if parsed.path == "/development/capabilities":
@@ -1331,6 +1336,49 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
     assert fake.task_observation_requests == 0
+
+
+def test_provider_projects_daemon_project_heads_without_session_count_synthesis() -> None:
+    fake = FakeDaemonClient()
+    project_id = "project-durable-head"
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [{
+                "project_id": project_id,
+                "display_name": "Durable Head project",
+                "config": _config(),
+                "created_at": "2026-08-22T00:00:00Z",
+                "updated_at": "2026-08-22T00:00:00Z",
+            }],
+            "project_heads": [{
+                "project_head_id": f"{project_id}-head-4",
+                "project_id": project_id,
+                "generation": 4,
+                "predecessor_project_head_id": f"{project_id}-head-3",
+                "source_evolution_run_id": "evolution-run-4",
+                "artifact_ids": ["artifact-memory-4"],
+                "workspace_manifest_sha256": "b" * 64,
+                "workspace_entry_count": 3,
+                "workspace_byte_size": 128,
+                "manifest_sha256": "c" * 64,
+                "created_at": "2026-08-22T00:04:00Z",
+            }],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    project = provider.invoke("getDesktopProjectV2", {"project_id": project_id})
+    head = provider.invoke(
+        "getDesktopProjectHeadV2",
+        {"project_head_id": f"{project_id}-head-4"},
+    )
+
+    assert project.active_project_head.project_head_id == f"{project_id}-head-4"
+    assert project.active_project_head.generation == 4
+    assert head.manifest_sha256 == "c" * 64
+    assert head.workspace_snapshot.entry_count == 3
+    assert head.evolution_revision.artifact_count == 1
 
 
 def test_provider_submits_session_against_selected_historical_project_head() -> None:

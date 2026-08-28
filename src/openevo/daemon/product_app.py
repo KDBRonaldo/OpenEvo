@@ -90,6 +90,7 @@ from openevo.daemon.contracts import (
     DevelopmentProjectActivateV2,
     DevelopmentProjectAuthorityV2,
     DevelopmentProjectCreateV2,
+    DevelopmentProjectHeadV2,
     DevelopmentProjectUpdateV2,
     DevelopmentStateV2,
     DevelopmentTaskCancelV2,
@@ -391,6 +392,27 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_evolution_runs_project_created
                     ON development_evolution_runs(project_id, created_at, run_id);
+                CREATE TABLE IF NOT EXISTS development_project_heads (
+                    project_head_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    generation INTEGER NOT NULL CHECK (generation >= 0),
+                    predecessor_project_head_id TEXT REFERENCES development_project_heads(project_head_id),
+                    source_evolution_run_id TEXT,
+                    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                    workspace_manifest_sha256 TEXT NOT NULL,
+                    workspace_entry_count INTEGER NOT NULL CHECK (workspace_entry_count >= 0),
+                    workspace_byte_size INTEGER NOT NULL CHECK (workspace_byte_size >= 0),
+                    manifest_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, generation)
+                );
+                CREATE INDEX IF NOT EXISTS development_project_heads_project_generation
+                    ON development_project_heads(project_id, generation);
+                CREATE TABLE IF NOT EXISTS development_project_head_streams (
+                    project_id TEXT PRIMARY KEY REFERENCES development_projects(project_id),
+                    active_project_head_id TEXT NOT NULL REFERENCES development_project_heads(project_head_id),
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS development_evolution_jobs (
                     job_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL REFERENCES development_sessions(session_id),
@@ -447,6 +469,19 @@ class DevelopmentStateStore:
                 connection.execute(
                     "UPDATE development_evolution_runs "
                     "SET action_id = 'legacy-' || run_id WHERE action_id IS NULL"
+                )
+            if "base_project_head_id" not in evolution_run_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_runs ADD COLUMN base_project_head_id TEXT"
+                )
+            if "base_project_head_manifest_sha256" not in evolution_run_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_runs "
+                    "ADD COLUMN base_project_head_manifest_sha256 TEXT"
+                )
+            if "applied_project_head_id" not in evolution_run_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_runs ADD COLUMN applied_project_head_id TEXT"
                 )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS "
@@ -647,6 +682,7 @@ class DevelopmentStateStore:
             ]
         for project_id in project_ids:
             self.workspaces.ensure_project(project_id)
+            self._ensure_project_head_history(project_id)
         try:
             path.chmod(0o600)
         except OSError:
@@ -671,6 +707,232 @@ class DevelopmentStateStore:
 
     def _emit_project_event(self, project_id: str) -> None:
         self.event_journal.emit(project_id)
+
+    def _workspace_head_authority(self, project_id: str) -> dict[str, Any]:
+        snapshot = self.workspaces.authoritative_snapshot_v2(project_id)
+        return {
+            "manifest_sha256": snapshot["manifest_sha256"],
+            "entry_count": len(snapshot["entries"]),
+            "byte_size": sum(
+                entry["byte_size"]
+                for entry in snapshot["entries"]
+                if entry["kind"] == "file"
+            ),
+        }
+
+    @staticmethod
+    def _project_head_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "project_head_id": row["project_head_id"],
+            "project_id": row["project_id"],
+            "generation": row["generation"],
+            "predecessor_project_head_id": row["predecessor_project_head_id"],
+            "source_evolution_run_id": row["source_evolution_run_id"],
+            "artifact_ids": json.loads(row["artifact_ids_json"]),
+            "workspace_manifest_sha256": row["workspace_manifest_sha256"],
+            "workspace_entry_count": row["workspace_entry_count"],
+            "workspace_byte_size": row["workspace_byte_size"],
+            "manifest_sha256": row["manifest_sha256"],
+            "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _insert_project_head(
+        connection: sqlite3.Connection,
+        *,
+        project_id: str,
+        generation: int,
+        predecessor_project_head_id: str | None,
+        source_evolution_run_id: str | None,
+        artifact_ids: list[str],
+        workspace: dict[str, Any],
+        created_at: str,
+    ) -> dict[str, Any]:
+        project_head_id = f"{project_id}-head-{generation}"
+        authority = {
+            "project_head_id": project_head_id,
+            "project_id": project_id,
+            "generation": generation,
+            "predecessor_project_head_id": predecessor_project_head_id,
+            "source_evolution_run_id": source_evolution_run_id,
+            "artifact_ids": artifact_ids,
+            "workspace_manifest_sha256": workspace["manifest_sha256"],
+            "workspace_entry_count": workspace["entry_count"],
+            "workspace_byte_size": workspace["byte_size"],
+        }
+        manifest_sha256 = hashlib.sha256(
+            canonical_json(authority).encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            """
+            INSERT INTO development_project_heads(
+                project_head_id, project_id, generation, predecessor_project_head_id,
+                source_evolution_run_id, artifact_ids_json, workspace_manifest_sha256,
+                workspace_entry_count, workspace_byte_size, manifest_sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_head_id,
+                project_id,
+                generation,
+                predecessor_project_head_id,
+                source_evolution_run_id,
+                canonical_json(artifact_ids),
+                workspace["manifest_sha256"],
+                workspace["entry_count"],
+                workspace["byte_size"],
+                manifest_sha256,
+                created_at,
+            ),
+        )
+        return {**authority, "manifest_sha256": manifest_sha256, "created_at": created_at}
+
+    def _ensure_project_head_history(self, project_id: str) -> None:
+        """Migrate the former Session-count bridge into durable immutable Heads."""
+
+        workspace = self._workspace_head_authority(project_id)
+        with self._lock, self._connection(emit_event=False) as connection:
+            existing = connection.execute(
+                "SELECT * FROM development_project_heads WHERE project_id = ? "
+                "ORDER BY generation",
+                (project_id,),
+            ).fetchall()
+            if not existing:
+                project_row = connection.execute(
+                    "SELECT created_at FROM development_projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if project_row is None:
+                    raise KeyError(project_id)
+                session_rows = connection.execute(
+                    "SELECT project_head_id, context_artifact_ids_json, created_at "
+                    "FROM development_sessions WHERE project_id = ? "
+                    "ORDER BY created_at, session_id",
+                    (project_id,),
+                ).fetchall()
+                prefix = f"{project_id}-head-"
+                contexts: dict[int, tuple[list[str], str]] = {}
+                for session in session_rows:
+                    head_id = session["project_head_id"]
+                    if (
+                        isinstance(head_id, str)
+                        and head_id.startswith(prefix)
+                        and head_id[len(prefix) :].isdigit()
+                    ):
+                        contexts.setdefault(
+                            int(head_id[len(prefix) :]),
+                            (json.loads(session["context_artifact_ids_json"]), session["created_at"]),
+                        )
+                completed_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM development_sessions "
+                    "WHERE project_id = ? AND state = 'completed'",
+                    (project_id,),
+                ).fetchone()["count"]
+                maximum_generation = max([0, completed_count, *contexts.keys()])
+                promoted_ids = [
+                    row["artifact_id"]
+                    for row in connection.execute(
+                        "SELECT artifact.artifact_id "
+                        "FROM development_evolution_artifacts_v2 AS artifact "
+                        "JOIN (SELECT target_id, MAX(created_at || artifact_id) AS latest "
+                        "FROM development_evolution_artifacts_v2 WHERE project_id = ? "
+                        "AND artifact_type != 'report' AND promoted = 1 GROUP BY target_id) "
+                        "AS selected ON selected.target_id = artifact.target_id "
+                        "AND selected.latest = artifact.created_at || artifact.artifact_id "
+                        "WHERE artifact.project_id = ? ORDER BY artifact.target_id",
+                        (project_id, project_id),
+                    )
+                ]
+                inherited: list[str] = []
+                predecessor: str | None = None
+                for generation in range(maximum_generation + 1):
+                    if generation in contexts:
+                        inherited = list(contexts[generation][0])
+                    if generation == maximum_generation:
+                        inherited = promoted_ids
+                    created_at = contexts.get(
+                        generation, ([], project_row["created_at"])
+                    )[1]
+                    record = self._insert_project_head(
+                        connection,
+                        project_id=project_id,
+                        generation=generation,
+                        predecessor_project_head_id=predecessor,
+                        source_evolution_run_id=None,
+                        artifact_ids=list(inherited),
+                        workspace=workspace,
+                        created_at=created_at,
+                    )
+                    predecessor = record["project_head_id"]
+                existing = connection.execute(
+                    "SELECT * FROM development_project_heads WHERE project_id = ? "
+                    "ORDER BY generation",
+                    (project_id,),
+                ).fetchall()
+            active = existing[-1]
+            connection.execute(
+                "INSERT INTO development_project_head_streams(project_id, active_project_head_id, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(project_id) DO NOTHING",
+                (project_id, active["project_head_id"], utc_now()),
+            )
+            connection.execute(
+                "UPDATE development_evolution_runs "
+                "SET base_project_head_id = COALESCE(base_project_head_id, ?), "
+                "base_project_head_manifest_sha256 = "
+                "COALESCE(base_project_head_manifest_sha256, ?) WHERE project_id = ?",
+                (active["project_head_id"], active["manifest_sha256"], project_id),
+            )
+
+    def project_head(self, project_head_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_project_heads WHERE project_head_id = ?",
+                (project_head_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(project_head_id)
+        return self._project_head_record(row)
+
+    def project_heads(self, project_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM development_project_heads WHERE project_id = ? "
+                "ORDER BY generation DESC",
+                (project_id,),
+            ).fetchall()
+        return [self._project_head_record(row) for row in rows]
+
+    def active_project_head(self, project_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT head.* FROM development_project_head_streams AS stream "
+                "JOIN development_project_heads AS head "
+                "ON head.project_head_id = stream.active_project_head_id "
+                "WHERE stream.project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(project_id)
+        return self._project_head_record(row)
+
+    def artifact_for_project_head_target(
+        self, project_id: str, project_head_id: str, target_id: str
+    ) -> dict[str, Any] | None:
+        head = self.project_head(project_head_id)
+        if head["project_id"] != project_id:
+            raise StateConflictError("Project Head belongs to another Project")
+        artifact_ids = head["artifact_ids"]
+        if not artifact_ids:
+            return None
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                f"SELECT * FROM development_evolution_artifacts_v2 "
+                f"WHERE target_id = ? AND artifact_id IN "
+                f"({','.join('?' for _ in artifact_ids)}) "
+                f"ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+                (target_id, *artifact_ids),
+            ).fetchone()
+        return None if row is None else self._artifact_record(row)
 
     def read_events(
         self,
@@ -747,19 +1009,36 @@ class DevelopmentStateStore:
     def state_v2(self) -> DevelopmentStateV2:
         with self._lock, self._connection() as connection:
             catalog_state = self.project_catalog.read_state(connection)
+            active_head_ids = {
+                row["project_id"]: row["active_project_head_id"]
+                for row in connection.execute(
+                    "SELECT project_id, active_project_head_id "
+                    "FROM development_project_head_streams"
+                )
+            }
             projects = [
                 DevelopmentProjectAuthorityV2(
                     project_id=project.project_id,
                     display_name=project.display_name,
                     config=project.config,
+                    active_project_head_id=active_head_ids.get(project.project_id),
                     created_at=project.created_at,
                     updated_at=project.updated_at,
                 )
                 for project in catalog_state.projects
             ]
+            project_heads = [
+                DevelopmentProjectHeadV2.model_validate(
+                    {"schema_version": "2", **self._project_head_record(row)}
+                )
+                for row in connection.execute(
+                    "SELECT * FROM development_project_heads ORDER BY project_id, generation"
+                )
+            ]
         return DevelopmentStateV2(
             active_project_id=catalog_state.active_project_id,
             projects=projects,
+            project_heads=project_heads,
         )
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -769,6 +1048,7 @@ class DevelopmentStateStore:
             raise StateConflictError(str(exc)) from exc
         if created:
             self.workspaces.ensure_project(request["project_id"])
+            self._ensure_project_head_history(request["project_id"])
         return project.as_dict()
 
     def workspace_path(self, project_id: str) -> Path:
@@ -940,10 +1220,79 @@ class DevelopmentStateStore:
         self.task_journal.backfill(connection)
 
     def start_session(self, session_id: str, request: dict[str, str]) -> None:
+        requested_head_id = request.get("project_head_id")
+        if requested_head_id is not None:
+            self._materialize_legacy_requested_head(
+                request["project_id"], requested_head_id
+            )
         try:
             self.session_store.start(session_id, request)
         except SessionConflictError as exc:
             raise StateConflictError(str(exc)) from exc
+
+    def _materialize_legacy_requested_head(
+        self, project_id: str, project_head_id: str
+    ) -> None:
+        """Accept the former next-completed-Session Head during wire migration."""
+
+        prefix = f"{project_id}-head-"
+        if not project_head_id.startswith(prefix) or not project_head_id[len(prefix) :].isdigit():
+            return
+        generation = int(project_head_id[len(prefix) :])
+        workspace = self._workspace_head_authority(project_id)
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_project_heads WHERE project_head_id = ?",
+                (project_head_id,),
+            ).fetchone() is not None:
+                return
+            active = connection.execute(
+                "SELECT head.* FROM development_project_head_streams AS stream "
+                "JOIN development_project_heads AS head "
+                "ON head.project_head_id = stream.active_project_head_id "
+                "WHERE stream.project_id = ?",
+                (project_id,),
+            ).fetchone()
+            completed_count = connection.execute(
+                "SELECT COUNT(*) AS count FROM development_sessions "
+                "WHERE project_id = ? AND state = 'completed'",
+                (project_id,),
+            ).fetchone()["count"]
+            if (
+                active is None
+                or generation != active["generation"] + 1
+                or generation != completed_count
+            ):
+                return
+            artifact_ids = [
+                row["artifact_id"]
+                for row in connection.execute(
+                    "SELECT artifact.artifact_id "
+                    "FROM development_evolution_artifacts_v2 AS artifact "
+                    "JOIN (SELECT target_id, MAX(created_at || artifact_id) AS latest "
+                    "FROM development_evolution_artifacts_v2 WHERE project_id = ? "
+                    "AND artifact_type != 'report' AND promoted = 1 GROUP BY target_id) "
+                    "AS selected ON selected.target_id = artifact.target_id "
+                    "AND selected.latest = artifact.created_at || artifact.artifact_id "
+                    "WHERE artifact.project_id = ? ORDER BY artifact.target_id",
+                    (project_id, project_id),
+                )
+            ]
+            head = self._insert_project_head(
+                connection,
+                project_id=project_id,
+                generation=generation,
+                predecessor_project_head_id=active["project_head_id"],
+                source_evolution_run_id=None,
+                artifact_ids=artifact_ids,
+                workspace=workspace,
+                created_at=utc_now(),
+            )
+            connection.execute(
+                "UPDATE development_project_head_streams "
+                "SET active_project_head_id = ?, updated_at = ? WHERE project_id = ?",
+                (head["project_head_id"], head["created_at"], project_id),
+            )
 
     def complete_session(self, session_id: str, result: dict[str, Any]) -> None:
         try:
@@ -1267,6 +1616,16 @@ class DevelopmentStateStore:
                 record = self._evolution_run_record(existing)
                 if (
                     record["project_id"] != request["project_id"]
+                    or (
+                        request.get("base_project_head_id") is not None
+                        and record["base_project_head_id"]
+                        != request["base_project_head_id"]
+                    )
+                    or (
+                        request.get("base_project_head_manifest_sha256") is not None
+                        and record["base_project_head_manifest_sha256"]
+                        != request["base_project_head_manifest_sha256"]
+                    )
                     or record["source_session_ids"] != session_ids
                     or record["selections"] != request["selections"]
                 ):
@@ -1274,6 +1633,30 @@ class DevelopmentStateStore:
                         "Evolution action_id is already bound to another request"
                     )
                 return record
+            active_head = connection.execute(
+                "SELECT head.* FROM development_project_head_streams AS stream "
+                "JOIN development_project_heads AS head "
+                "ON head.project_head_id = stream.active_project_head_id "
+                "WHERE stream.project_id = ?",
+                (request["project_id"],),
+            ).fetchone()
+            if active_head is None:
+                raise KeyError(request["project_id"])
+            base_project_head_id = (
+                request.get("base_project_head_id") or active_head["project_head_id"]
+            )
+            base_project_head_manifest_sha256 = (
+                request.get("base_project_head_manifest_sha256")
+                or active_head["manifest_sha256"]
+            )
+            base_head = connection.execute(
+                "SELECT * FROM development_project_heads WHERE project_head_id = ?",
+                (base_project_head_id,),
+            ).fetchone()
+            if base_head is None or base_head["project_id"] != request["project_id"]:
+                raise StateConflictError("Base Project Head is unavailable for this Project")
+            if base_head["manifest_sha256"] != base_project_head_manifest_sha256:
+                raise StateConflictError("Base Project Head changed before Evolution admission")
             if (
                 connection.execute(
                     "SELECT 1 FROM development_projects WHERE project_id = ?",
@@ -1324,8 +1707,10 @@ class DevelopmentStateStore:
                 """
                 INSERT INTO development_evolution_runs(
                     run_id, action_id, project_id, source_session_ids_json, selections_json,
-                    state, artifact_ids_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
+                    state, artifact_ids_json, error, created_at, updated_at,
+                    base_project_head_id, base_project_head_manifest_sha256,
+                    applied_project_head_id
+                ) VALUES (?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?, ?, ?, NULL)
                 """,
                 (
                     run_id,
@@ -1335,6 +1720,8 @@ class DevelopmentStateStore:
                     canonical_json(request["selections"]),
                     now,
                     now,
+                    base_project_head_id,
+                    base_project_head_manifest_sha256,
                 ),
             )
             row = connection.execute(
@@ -1360,6 +1747,10 @@ class DevelopmentStateStore:
         record = self._evolution_run_record(row)
         if (
             record["project_id"] != request["project_id"]
+            or (
+                request.get("base_project_head_id") is not None
+                and record["base_project_head_id"] != request["base_project_head_id"]
+            )
             or record["source_session_ids"] != request["session_ids"]
             or record["selections"] != request["selections"]
         ):
@@ -1460,6 +1851,14 @@ class DevelopmentStateStore:
     def apply_evolution_run(self, run_id: str) -> dict[str, Any]:
         now = utc_now()
         with self._lock, self._connection() as connection:
+            initial = connection.execute(
+                "SELECT project_id, state FROM development_evolution_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if initial is None:
+            raise KeyError(run_id)
+        workspace = self._workspace_head_authority(initial["project_id"])
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM development_evolution_runs WHERE run_id = ?",
                 (run_id,),
@@ -1484,25 +1883,77 @@ class DevelopmentStateStore:
             if any(item["project_id"] != row["project_id"] for item in artifacts):
                 raise StateConflictError("Evolution Run candidate belongs to another Project")
             runtime_artifacts = [item for item in artifacts if item["artifact_type"] != "report"]
-            if runtime_artifacts:
-                target_ids = sorted({item["target_id"] for item in runtime_artifacts})
-                runtime_artifact_ids = [item["artifact_id"] for item in runtime_artifacts]
-                connection.execute(
-                    f"UPDATE development_evolution_artifacts_v2 SET promoted = 0 "
-                    f"WHERE project_id = ? AND target_id IN "
-                    f"({','.join('?' for _ in target_ids)})",
-                    (row["project_id"], *target_ids),
+            active_head = connection.execute(
+                "SELECT head.* FROM development_project_head_streams AS stream "
+                "JOIN development_project_heads AS head "
+                "ON head.project_head_id = stream.active_project_head_id "
+                "WHERE stream.project_id = ?",
+                (row["project_id"],),
+            ).fetchone()
+            if active_head is None:
+                raise StateConflictError("Project has no active Project Head")
+            if active_head["project_head_id"] != row["base_project_head_id"]:
+                raise StateConflictError(
+                    "Active Project Head changed after this Evolution Run started; "
+                    "run Evolution again against the current Head"
                 )
+            base_artifact_ids = list(json.loads(active_head["artifact_ids_json"]))
+            replaced_target_ids = {item["target_id"] for item in runtime_artifacts}
+            inherited_artifact_ids: list[str] = []
+            if base_artifact_ids:
+                base_rows = connection.execute(
+                    f"SELECT artifact_id, target_id FROM development_evolution_artifacts_v2 "
+                    f"WHERE artifact_id IN ({','.join('?' for _ in base_artifact_ids)})",
+                    tuple(base_artifact_ids),
+                ).fetchall()
+                target_by_artifact = {
+                    item["artifact_id"]: item["target_id"] for item in base_rows
+                }
+                inherited_artifact_ids = [
+                    artifact_id
+                    for artifact_id in base_artifact_ids
+                    if target_by_artifact.get(artifact_id) not in replaced_target_ids
+                ]
+            runtime_artifact_ids = [
+                item["artifact_id"]
+                for item in sorted(
+                    runtime_artifacts,
+                    key=lambda item: (item["target_id"], item["artifact_id"]),
+                )
+            ]
+            next_artifact_ids = [*inherited_artifact_ids, *runtime_artifact_ids]
+            next_head = self._insert_project_head(
+                connection,
+                project_id=row["project_id"],
+                generation=active_head["generation"] + 1,
+                predecessor_project_head_id=active_head["project_head_id"],
+                source_evolution_run_id=run_id,
+                artifact_ids=next_artifact_ids,
+                workspace=workspace,
+                created_at=now,
+            )
+            connection.execute(
+                "UPDATE development_project_head_streams "
+                "SET active_project_head_id = ?, updated_at = ? WHERE project_id = ?",
+                (next_head["project_head_id"], now, row["project_id"]),
+            )
+            connection.execute(
+                "UPDATE development_evolution_artifacts_v2 SET promoted = 0 "
+                "WHERE project_id = ? AND artifact_type != 'report'",
+                (row["project_id"],),
+            )
+            if next_artifact_ids:
                 connection.execute(
                     f"UPDATE development_evolution_artifacts_v2 SET promoted = 1 "
                     f"WHERE artifact_id IN "
-                    f"({','.join('?' for _ in runtime_artifact_ids)})",
-                    tuple(runtime_artifact_ids),
+                    f"({','.join('?' for _ in next_artifact_ids)})",
+                    tuple(next_artifact_ids),
                 )
             connection.execute(
-                "UPDATE development_evolution_runs SET state = 'applied', updated_at = ? "
+                "UPDATE development_evolution_runs SET state = 'applied', updated_at = ?, "
+                "applied_project_head_id = ? "
                 "WHERE run_id = ?",
-                (now, run_id),
+                (now, next_head["project_head_id"], run_id),
             )
             updated = connection.execute(
                 "SELECT * FROM development_evolution_runs WHERE run_id = ?",
@@ -2173,6 +2624,11 @@ class DevelopmentStateStore:
         record = {
             "run_id": row["run_id"],
             "project_id": row["project_id"],
+            "base_project_head_id": row["base_project_head_id"],
+            "base_project_head_manifest_sha256": row[
+                "base_project_head_manifest_sha256"
+            ],
+            "applied_project_head_id": row["applied_project_head_id"],
             "source_session_ids": json.loads(row["source_session_ids_json"]),
             "selections": normalize_selected_evolution(json.loads(row["selections_json"])),
             "state": row["state"],
@@ -2195,6 +2651,11 @@ class DevelopmentStateStore:
                 "run_id": record["run_id"],
                 "action_id": record["action_id"],
                 "project_id": record["project_id"],
+                "base_project_head_id": record["base_project_head_id"],
+                "base_project_head_manifest_sha256": record[
+                    "base_project_head_manifest_sha256"
+                ],
+                "applied_project_head_id": record["applied_project_head_id"],
                 "source_task_ids": record["source_session_ids"],
                 "selections": [
                     {"schema_version": "2", **selection} for selection in record["selections"]
@@ -3670,6 +4131,10 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                     {
                         "action_id": request.action_id,
                         "project_id": request.project_id,
+                        "base_project_head_id": request.base_project_head_id,
+                        "base_project_head_manifest_sha256": (
+                            request.base_project_head_manifest_sha256
+                        ),
                         "session_ids": request.source_task_ids,
                         "selections": [
                             {

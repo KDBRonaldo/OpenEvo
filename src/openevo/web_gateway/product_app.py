@@ -477,7 +477,7 @@ class DevelopmentAgentDesktopV2Provider:
             raise HTTPException(status_code=404, detail="profile not found")
         return self._profile_model(self._remote_state())
 
-    def _head(
+    def _legacy_head(
         self, project_id: str, config: core.ScienceProjectConfigV2, generation: int = 0
     ) -> core.ProjectHeadRefV2:
         predecessor = None if generation == 0 else f"{project_id}-head-{generation - 1}"
@@ -531,26 +531,109 @@ class DevelopmentAgentDesktopV2Provider:
             }
         )
 
+    def _head_from_authority(
+        self,
+        raw: Mapping[str, object],
+        config: core.ScienceProjectConfigV2,
+    ) -> core.ProjectHeadRefV2:
+        project_id = str(raw["project_id"])
+        generation = int(raw["generation"])
+        artifact_ids = [str(item) for item in raw.get("artifact_ids", [])]
+        evolution_manifest = _canonical_digest(
+            [project_id, generation, "evolution", artifact_ids]
+        )
+        revision_id = f"{project_id}-evolution-{generation}"
+        return core.ProjectHeadRefV2.model_validate(
+            {
+                "schema_version": "2",
+                "project_head_id": raw["project_head_id"],
+                "project_id": project_id,
+                "generation": generation,
+                "predecessor_project_head_id": raw.get("predecessor_project_head_id"),
+                "workspace_snapshot": {
+                    "schema_version": "2",
+                    "workspace_snapshot_id": f"{project_id}-workspace-{generation}",
+                    "project_id": project_id,
+                    "manifest_sha256": raw["workspace_manifest_sha256"],
+                    "entry_count": raw["workspace_entry_count"],
+                    "byte_size": raw["workspace_byte_size"],
+                },
+                "evolution_revision": {
+                    "schema_version": "2",
+                    "evolution_revision_id": revision_id,
+                    "project_id": project_id,
+                    "manifest_sha256": evolution_manifest,
+                    "artifact_count": len(artifact_ids),
+                },
+                "runtime_context_snapshot": {
+                    "schema_version": "2",
+                    "runtime_context_snapshot_id": f"{project_id}-context-{generation}",
+                    "project_id": project_id,
+                    "evolution_revision_id": revision_id,
+                    "evolution_revision_manifest_sha256": evolution_manifest,
+                    "registry_sha256": DIGEST,
+                    "runtime_contract_sha256": _canonical_digest(
+                        [project_id, generation, "runtime", artifact_ids]
+                    ),
+                    "manifest_sha256": _canonical_digest(
+                        [project_id, generation, "context", artifact_ids]
+                    ),
+                },
+                "effective_execution_snapshot": {
+                    "schema_version": "2",
+                    "effective_execution_snapshot_id": f"{project_id}-execution-{generation}",
+                    "project_id": project_id,
+                    "execution_mode": config.execution.mode,
+                    "capture_mode": config.execution.capture_mode,
+                    "token_level_metrics_available": config.execution.token_level_metrics_available,
+                    "producer_id": "development-daemon",
+                    "snapshot_sha256": _canonical_digest(
+                        [project_id, generation, "execution"]
+                    ),
+                },
+                "registry_sha256": DIGEST,
+                "manifest_sha256": raw["manifest_sha256"],
+            }
+        )
+
     def _project_models(
         self,
         state: Mapping[str, object],
         observations: list[DevelopmentTaskObservationV2],
     ) -> list[core.ProjectV2]:
         result = []
+        raw_heads = list(state.get("project_heads", []))
         for raw in state.get("projects", []):
             config = core.ScienceProjectConfigV2.model_validate(raw["config"])
-            sessions = [
-                item
-                for item in observations
-                if item.project_id == raw["project_id"] and item.state == "closed"
+            durable_heads = [
+                self._head_from_authority(head, config)
+                for head in raw_heads
+                if head["project_id"] == raw["project_id"]
             ]
+            if durable_heads:
+                active_head_id = raw.get("active_project_head_id")
+                active_head = next(
+                    (
+                        head
+                        for head in durable_heads
+                        if head.project_head_id == active_head_id
+                    ),
+                    max(durable_heads, key=lambda head: head.generation),
+                )
+            else:
+                sessions = [
+                    item
+                    for item in observations
+                    if item.project_id == raw["project_id"] and item.state == "closed"
+                ]
+                active_head = self._legacy_head(raw["project_id"], config, len(sessions))
             result.append(
                 core.ProjectV2(
                     project_id=raw["project_id"],
                     display_name=raw["display_name"],
                     config=config,
                     project_config_sha256=core.project_config_sha256_for(config),
-                    active_project_head=self._head(raw["project_id"], config, len(sessions)),
+                    active_project_head=active_head,
                     admission_etag=ETAG,
                     state="ready",
                     created_at=raw["created_at"],
@@ -598,8 +681,11 @@ class DevelopmentAgentDesktopV2Provider:
                 projection_generation = self._project_projection_generation
             observations = self._task_observations_v2()
             projects = self._project_models(effective_state, observations)
+            raw_heads = list(effective_state.get("project_heads", []))
             heads = {
-                project.project_id: self._available_project_heads(project, observations)
+                project.project_id: self._available_project_heads(
+                    project, observations, raw_heads
+                )
                 for project in projects
             }
             result = (projects, observations, heads)
@@ -642,7 +728,15 @@ class DevelopmentAgentDesktopV2Provider:
         self,
         project: core.ProjectV2,
         observations: list[DevelopmentTaskObservationV2],
+        raw_heads: list[Mapping[str, object]],
     ) -> list[core.ProjectHeadRefV2]:
+        durable = [
+            self._head_from_authority(raw, project.config)
+            for raw in raw_heads
+            if raw["project_id"] == project.project_id
+        ]
+        if durable:
+            return sorted(durable, key=lambda head: head.generation, reverse=True)
         active = project.active_project_head
         assert active is not None
         generation_by_id = {active.project_head_id: active.generation}
@@ -659,7 +753,7 @@ class DevelopmentAgentDesktopV2Provider:
             if observation.state == "closed":
                 legacy_generation += 1
         return [
-            self._head(project.project_id, project.config, generation)
+            self._legacy_head(project.project_id, project.config, generation)
             for _, generation in sorted(
                 generation_by_id.items(), key=lambda item: item[1], reverse=True
             )
@@ -1699,6 +1793,19 @@ def create_development_agent_web_app(
                     detail="Evolution Run request did not match the closed v2 contract",
                 ) from exc
             provider._find_project(creation.project_id)
+            if creation.base_project_head_id is not None:
+                base_head = provider._project_head(
+                    {"project_head_id": creation.base_project_head_id}
+                )
+                if (
+                    base_head.project_id != creation.project_id
+                    or base_head.manifest_sha256
+                    != creation.base_project_head_manifest_sha256
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Base Project Head changed before Evolution admission",
+                    )
             body = bytearray(creation.model_dump_json().encode("utf-8"))
         else:
             project_id = request.query_params.get("project_id")
