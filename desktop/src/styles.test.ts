@@ -35,4 +35,13 @@ describe("Desktop product responsive CSS", () => {
     expect(styles).toMatch(/\.product-v2-shell \.v2-task-result-detail\s*{[\s\S]*?grid-template-columns:[\s\S]*?gap:\s*16px;/);
     expect(styles).toMatch(/\.session-chat-composer-box\s*{[\s\S]*?min-height:\s*148px;/);
   });
+
+  it("renders Session startup as a lightweight status rail instead of a notification card", () => {
+    const statusRule = styles.match(/\.session-submit-progress\s*{([^}]*)}/)?.[1];
+    expect(statusRule).toBeDefined();
+    expect(statusRule).toMatch(/width:\s*max-content;/);
+    expect(statusRule).toMatch(/border:\s*0;/);
+    expect(statusRule).toMatch(/background:\s*transparent;/);
+    expect(styles).toMatch(/\.session-submit-progress::after\s*{[\s\S]*?linear-gradient/);
+  });
 });

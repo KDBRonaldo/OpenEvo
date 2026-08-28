@@ -738,31 +738,60 @@ pre.json {
 }
 
 .session-submit-progress {
+  position: relative;
   display: flex;
+  width: max-content;
+  max-width: 100%;
   align-items: center;
   gap: 10px;
-  padding: 10px 13px;
-  border: 1px solid #b9d6cc;
-  border-left: 3px solid var(--accent);
-  border-radius: 7px;
+  padding: 5px 8px 10px 3px;
+  border: 0;
   color: var(--accent);
-  background: #f1f8f5;
+  background: transparent;
+}
+
+.session-submit-progress::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 38px;
+  height: 1px;
+  background: linear-gradient(90deg, rgb(49 130 104 / 58%), rgb(49 130 104 / 14%) 68%, transparent);
+  content: "";
+}
+
+.session-submit-progress > svg {
+  width: 29px;
+  height: 29px;
+  flex: 0 0 auto;
+  padding: 5px;
+  border-radius: 50%;
+  background: rgb(49 130 104 / 8%);
+  filter: drop-shadow(0 0 8px rgb(49 130 104 / 24%));
+}
+
+.session-submit-progress > div {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
 }
 
 .session-submit-progress strong,
 .session-submit-progress span {
-  display: block;
+  display: inline;
 }
 
 .session-submit-progress strong {
   color: var(--ink);
   font-size: 12px;
+  letter-spacing: 0.01em;
 }
 
 .session-submit-progress span {
-  margin-top: 2px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 10.5px;
 }
 
 .product-panel {
