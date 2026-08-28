@@ -10,6 +10,7 @@ import {
   ChevronRight,
   CircleDot,
   Download,
+  FolderTree,
   FolderOpen,
   FileText,
   History,
@@ -34,6 +35,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
 } from "react";
 import { DesktopApiErrorV2 } from "../api/v2/client";
 import type { LogEntryV2 } from "../api/v2/logs";
@@ -1474,6 +1476,58 @@ type ProjectWorkspacePresentationV2 = NonNullable<
   NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["workspaces"]
 >[string];
 
+type ProjectWorkspaceEntryV2 = ProjectWorkspacePresentationV2["entries"][number];
+
+type ProjectFileTreeNodeV2 = {
+  path: string;
+  name: string;
+  kind: ProjectWorkspaceEntryV2["kind"];
+  children: ProjectFileTreeNodeV2[];
+};
+
+function buildProjectFileTreeV2(entries: readonly ProjectWorkspaceEntryV2[]): ProjectFileTreeNodeV2[] {
+  const roots: ProjectFileTreeNodeV2[] = [];
+  const nodes = new Map<string, ProjectFileTreeNodeV2>();
+  for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
+    const parts = entry.path.split("/").filter(Boolean);
+    parts.forEach((name, index) => {
+      const path = parts.slice(0, index + 1).join("/");
+      const leaf = index === parts.length - 1;
+      let node = nodes.get(path);
+      if (node === undefined) {
+        node = { path, name, kind: leaf ? entry.kind : "directory", children: [] };
+        nodes.set(path, node);
+        const parentPath = parts.slice(0, index).join("/");
+        const parent = nodes.get(parentPath);
+        if (parent) parent.children.push(node); else roots.push(node);
+      } else if (leaf) {
+        node.kind = entry.kind;
+      }
+    });
+  }
+  const sortNodes = (items: ProjectFileTreeNodeV2[]): void => {
+    items.sort((left, right) => {
+      const directoryDelta = Number(right.kind === "directory") - Number(left.kind === "directory");
+      return directoryDelta || left.name.localeCompare(right.name, undefined, { numeric: true });
+    });
+    items.forEach((item) => sortNodes(item.children));
+  };
+  sortNodes(roots);
+  return roots;
+}
+
+function filterProjectFileTreeV2(
+  nodes: readonly ProjectFileTreeNodeV2[],
+  normalizedQuery: string,
+): ProjectFileTreeNodeV2[] {
+  if (normalizedQuery === "") return [...nodes];
+  return nodes.flatMap((node) => {
+    const children = filterProjectFileTreeV2(node.children, normalizedQuery);
+    if (!node.path.toLocaleLowerCase().includes(normalizedQuery) && children.length === 0) return [];
+    return [{ ...node, children }];
+  });
+}
+
 function ProjectExplorerV2({
   projects,
   activeProject,
@@ -1505,14 +1559,63 @@ function ProjectExplorerV2({
   readonly paneWidth: number;
   readonly onResizePane: (width: number) => void;
 }) {
-  const entries = [...(workspace?.entries ?? [])].sort((left, right) => left.path.localeCompare(right.path));
+  const entries = workspace?.entries ?? [];
   const files = entries.filter((entry) => entry.kind === "file");
   const [collapsedDirectories, setCollapsedDirectories] = useState<ReadonlySet<string>>(new Set());
+  const [fileQuery, setFileQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement>(null);
-  useEffect(() => setCollapsedDirectories(new Set()), [activeProject?.project_id]);
-  const visibleEntries = entries.filter((entry) => {
-    const parts = entry.path.split("/");
-    return !parts.slice(0, -1).some((_, index) => collapsedDirectories.has(parts.slice(0, index + 1).join("/")));
+  const fileTree = useMemo(() => buildProjectFileTreeV2(entries), [entries]);
+  const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
+  const visibleFileTree = useMemo(
+    () => filterProjectFileTreeV2(fileTree, normalizedFileQuery),
+    [fileTree, normalizedFileQuery],
+  );
+  useEffect(() => {
+    setCollapsedDirectories(new Set());
+    setFileQuery("");
+    setSearchOpen(false);
+  }, [activeProject?.project_id]);
+  const renderTreeNodes = (nodes: readonly ProjectFileTreeNodeV2[], level = 1): ReactNode => nodes.map((node) => {
+    const directory = node.kind === "directory";
+    const selected = node.kind === "file" && node.path === selectedPath;
+    const collapsed = directory && collapsedDirectories.has(node.path);
+    const expanded = directory && (normalizedFileQuery !== "" || !collapsed);
+    const unavailable = !directory && node.kind !== "file";
+    return (
+      <div className={`explorer-tree-node ${directory ? "directory" : "file"}`} key={`${node.kind}:${node.path}`}>
+        <button
+          type="button"
+          role="treeitem"
+          aria-level={level}
+          aria-selected={selected}
+          aria-expanded={directory ? expanded : undefined}
+          aria-disabled={unavailable || undefined}
+          className={`${selected ? "selected" : ""}${unavailable ? " unavailable" : ""}`}
+          title={node.path}
+          onClick={() => {
+            if (directory) {
+              setCollapsedDirectories((current) => {
+                const next = new Set(current);
+                if (next.has(node.path)) next.delete(node.path); else next.add(node.path);
+                return next;
+              });
+            } else if (node.kind === "file") onSelectFile(node.path);
+          }}
+        >
+          <span className="explorer-tree-toggle" aria-hidden="true">
+            {directory ? expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : null}
+          </span>
+          <span className="explorer-tree-kind" aria-hidden="true">
+            {directory ? <FolderOpen size={15} /> : <FileText size={14} />}
+          </span>
+          <span className="explorer-tree-label">{node.name}</span>
+        </button>
+        {directory && expanded && node.children.length > 0 ? (
+          <div className="explorer-tree-branch" role="group">{renderTreeNodes(node.children, level + 1)}</div>
+        ) : null}
+      </div>
+    );
   });
   return (
     <aside className="project-explorer" aria-label="Project explorer">
@@ -1524,7 +1627,9 @@ function ProjectExplorerV2({
         </select>
         {switching ? <span className="project-switching-indicator" role="status"><LoaderCircle className="spin" size={14} /> Switching</span> : null}
       </div>
-      <div className="explorer-section-heading"><span>Files</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
+      <div className="explorer-files-header">
+        <div className="explorer-files-title"><span className="explorer-files-mark"><FolderTree size={17} /></span><span><strong>Workspace</strong><small>{files.length} {files.length === 1 ? "file" : "files"}</small></span></div>
+        <div className="explorer-files-actions"><button type="button" className={searchOpen ? "active" : ""} aria-label="Search files" title="Search files" aria-pressed={searchOpen} onClick={() => { setSearchOpen((current) => !current); if (searchOpen) setFileQuery(""); }}><Search size={15} /></button>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
         if (selectedFiles.length === 0) return;
@@ -1532,27 +1637,11 @@ function ProjectExplorerV2({
         const hasCollision = selectedFiles.some((file) => existingPaths.has(file.name));
         if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
         onUpload(selectedFiles, hasCollision);
-      }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={14} /></button></> : null}</div></div>
+      }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={15} /></button></> : null}</div>
+      </div>
+      {searchOpen ? <label className="explorer-file-search"><Search size={14} /><input autoFocus type="search" aria-label="Filter workspace files" placeholder="Filter files" value={fileQuery} onChange={(event) => setFileQuery(event.target.value)} />{fileQuery ? <button type="button" aria-label="Clear file search" onClick={() => setFileQuery("")}><X size={13} /></button> : null}</label> : null}
       <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
-        {visibleEntries.length ? visibleEntries.map((entry) => {
-          const depth = Math.max(0, entry.path.split("/").length - 1);
-          const name = entry.path.split("/").at(-1) ?? entry.path;
-          const selected = entry.kind === "file" && entry.path === selectedPath;
-          const collapsed = entry.kind === "directory" && collapsedDirectories.has(entry.path);
-          return <button type="button" role="treeitem" aria-selected={selected} aria-expanded={entry.kind === "directory" ? !collapsed : undefined} key={`${entry.kind}:${entry.path}`} className={selected ? "selected" : ""} style={{ paddingLeft: `${9 + depth * 14}px` }} onClick={() => {
-            if (entry.kind === "directory") {
-              setCollapsedDirectories((current) => {
-                const next = new Set(current);
-                if (next.has(entry.path)) next.delete(entry.path); else next.add(entry.path);
-                return next;
-              });
-            } else if (entry.kind === "file") onSelectFile(entry.path);
-          }}>
-            {entry.kind === "directory" ? collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="explorer-tree-spacer" />}
-            {entry.kind === "directory" ? <FolderOpen size={14} /> : <FileText size={14} />}
-            <span title={entry.path}>{name}</span>
-          </button>;
-        }) : <div className="explorer-empty">No files yet</div>}
+        {visibleFileTree.length ? renderTreeNodes(visibleFileTree) : <div className="explorer-empty">{entries.length ? "No matching files" : "No files yet"}</div>}
       </div>
       {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
       <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
