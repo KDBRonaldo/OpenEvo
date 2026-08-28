@@ -753,6 +753,93 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
     assert second_attempt["ordinal"] == 1
 
 
+def test_store_fails_an_interrupted_evolution_run_on_restart(tmp_path: Path) -> None:
+    database = tmp_path / "interrupted-evolution.sqlite3"
+    project_id = "development-project-interrupted-evolution"
+    session_id = "dev-session-interrupted-evolution"
+    run_id = "evolution-run-interrupted"
+    job_id = "job-memory-evolution-run-interrupted"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Interrupted Evolution project",
+            "config": {},
+        }
+    )
+    store.start_session(
+        session_id,
+        {
+            "project_id": project_id,
+            "project_name": "Interrupted Evolution project",
+            "task_title": "Collect evidence",
+            "instruction": "Return durable evidence.",
+        },
+    )
+    store.complete_session(
+        session_id,
+        {
+            "response": "Durable evidence.",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": [],
+        },
+    )
+    dataset = tmp_path / "interrupted-evolution-dataset.json"
+    dataset.write_text("{}", encoding="utf-8")
+    store.record_dataset_artifact(
+        artifact_id=f"dataset-{session_id}",
+        project_id=project_id,
+        session_id=session_id,
+        uri=dataset.resolve().as_uri(),
+        name="Interrupted Evolution evidence",
+    )
+    request = MODULE.validate_evolution_run_request(
+        {
+            "schema_version": "1",
+            "project_id": project_id,
+            "session_ids": [session_id],
+            "selections": [
+                {
+                    "target_id": "text_memory",
+                    "method": "text_memory_reflector",
+                    "config": {},
+                }
+            ],
+        }
+    )
+    store.start_evolution_run(run_id, request)
+    attempt = store.start_evolution_job(
+        job_id=job_id,
+        session_id=session_id,
+        run_id=run_id,
+        target_id="text_memory",
+        method_id="text_memory_reflector",
+        requested_method_id="text_memory_reflector",
+        resolver_input_artifact_ids=[],
+        previous_artifact_id=None,
+        config={},
+    )
+
+    restored = MODULE.DevelopmentStateStore(database).snapshot()
+    restored_run = next(item for item in restored["evolution_runs"] if item["run_id"] == run_id)
+    restored_job = next(item for item in restored["evolution_jobs"] if item["job_id"] == job_id)
+
+    assert restored_run["state"] == "failed"
+    assert restored_run["error"] == (
+        "Development daemon restarted before this Evolution Run completed."
+    )
+    assert restored_job["state"] == "failed"
+    assert restored_job["error"] == (
+        "Development daemon restarted before this evolution job completed."
+    )
+    restored_attempt = next(
+        item for item in restored_job["attempts"] if item["attempt_id"] == attempt["attempt_id"]
+    )
+    assert restored_attempt["state"] == "failed"
+    assert restored_attempt["error_code"] == "daemon_restarted"
+
+
 def test_store_repairs_duplicate_active_head_targets_with_immutable_successor(
     tmp_path: Path,
 ) -> None:

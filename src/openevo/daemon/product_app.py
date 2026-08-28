@@ -649,6 +649,17 @@ class DevelopmentStateStore:
             )
             connection.execute(
                 """
+                UPDATE development_evolution_runs
+                SET state = 'failed', error = ?, updated_at = ?
+                WHERE state = 'running'
+                """,
+                (
+                    "Development daemon restarted before this Evolution Run completed.",
+                    restarted_at,
+                ),
+            )
+            connection.execute(
+                """
                 INSERT OR IGNORE INTO development_evolution_job_attempts(
                     attempt_id, job_id, ordinal, state, stage, artifact_ids_json,
                     error_code, error_message, logs_json, created_at, started_at,
