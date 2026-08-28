@@ -6413,6 +6413,79 @@ pre.json {
   margin-top: 0;
 }
 
+.v2-evolution-run-selector {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 7px;
+  max-height: 236px;
+  margin-bottom: 14px;
+  padding: 2px 2px 14px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.v2-evolution-run-selector > button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 64px;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--ink);
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.v2-evolution-run-selector > button:hover {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--line));
+  background: color-mix(in srgb, var(--surface-soft) 76%, transparent);
+  transform: translateY(-1px);
+}
+
+.v2-evolution-run-selector > button.active {
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
+  background: color-mix(in srgb, var(--accent-soft) 58%, var(--surface));
+  box-shadow:
+    inset 3px 0 0 var(--accent),
+    0 10px 28px rgb(27 77 68 / 7%);
+}
+
+.v2-evolution-run-selector > button > span:nth-child(2),
+.v2-evolution-run-selector > button strong,
+.v2-evolution-run-selector > button small {
+  display: block;
+  min-width: 0;
+}
+
+.v2-evolution-run-selector > button strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.v2-evolution-run-selector > button small {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.v2-evolution-run-selector .state-pill {
+  font-size: 9px;
+  white-space: nowrap;
+}
+
 .v2-evolution-history,
 .v2-all-evolution-artifacts {
   margin-top: 14px;

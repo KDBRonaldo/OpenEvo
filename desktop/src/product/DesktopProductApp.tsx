@@ -3052,48 +3052,61 @@ function EvolutionWorkspaceV2({
   const runs = [...(snapshot.runtimePresentation?.evolutionRuns ?? [])
     .filter((run) => run.projectId === project.project_id)]
     .reverse();
-  const latestRun = runs[0];
+  const newestRun = runs[0];
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   useEffect(() => {
-    if (!standaloneAvailable || latestRun === undefined) return;
+    setSelectedRunId(newestRun?.runId ?? null);
+  }, [project.project_id, newestRun?.runId]);
+  const selectedRun = runs.find((run) => run.runId === selectedRunId) ?? newestRun;
+  const latestRun = selectedRun;
+  useEffect(() => {
+    if (!standaloneAvailable || newestRun === undefined) return;
     setTargets({
       ...project.config.evolution.targets,
-      ...Object.fromEntries(latestRun.selections.map((selection) => [selection.targetId, {
+      ...Object.fromEntries(newestRun.selections.map((selection) => [selection.targetId, {
         enabled: true,
         method: selection.method,
         config: selection.config as ScienceProjectConfigV2["evolution"]["targets"][string]["config"],
       }])),
     });
-  }, [latestRun?.runId, project.project_config_sha256, standaloneAvailable]);
+  }, [newestRun?.runId, project.project_config_sha256, standaloneAvailable]);
   const allJobs = Object.values(snapshot.runtimePresentation?.tasks ?? {})
     .flatMap((task) => task.evolutionJobs ?? []);
-  const latestRunArtifacts = latestRun === undefined
+  const selectedRunArtifacts = selectedRun === undefined
     ? []
-    : latestRun.artifactIds.flatMap((artifactId) => {
+    : selectedRun.artifactIds.flatMap((artifactId) => {
       const artifact = artifacts.find((candidate) => candidate.artifact_id === artifactId);
       return artifact === undefined ? [] : [artifact];
     });
-  const latestRunArtifactKey = latestRunArtifacts.map((artifact) => artifact.artifact_id).join("|");
-  const [selectedLatestArtifactId, setSelectedLatestArtifactId] = useState<string | null>(null);
-  const [latestArtifactView, setLatestArtifactView] = useState<"content" | "changes">("content");
+  const selectedRunArtifactKey = selectedRunArtifacts.map((artifact) => artifact.artifact_id).join("|");
+  const [selectedRunArtifactId, setSelectedRunArtifactId] = useState<string | null>(null);
+  const [selectedArtifactView, setSelectedArtifactView] = useState<"content" | "changes">("content");
   useEffect(() => {
-    setSelectedLatestArtifactId(latestRunArtifacts[0]?.artifact_id ?? null);
-    setLatestArtifactView("content");
-  }, [latestRun?.runId, latestRunArtifactKey]);
-  const selectedLatestArtifact = latestRunArtifacts.find(
-    (artifact) => artifact.artifact_id === selectedLatestArtifactId,
-  ) ?? latestRunArtifacts[0] ?? null;
-  const selectedLatestPreview = selectedLatestArtifact === null
+    setSelectedRunArtifactId(selectedRunArtifacts[0]?.artifact_id ?? null);
+    setSelectedArtifactView("content");
+  }, [selectedRun?.runId, selectedRunArtifactKey]);
+  const selectedArtifact = selectedRunArtifacts.find(
+    (artifact) => artifact.artifact_id === selectedRunArtifactId,
+  ) ?? selectedRunArtifacts[0] ?? null;
+  const selectedArtifactPreview = selectedArtifact === null
     ? undefined
-    : snapshot.runtimePresentation?.artifacts[selectedLatestArtifact.artifact_id];
+    : snapshot.runtimePresentation?.artifacts[selectedArtifact.artifact_id];
+  const latestRunArtifacts = selectedRunArtifacts;
+  const selectedLatestArtifact = selectedArtifact;
+  const selectedLatestPreview = selectedArtifactPreview;
+  const latestArtifactView = selectedArtifactView;
+  const setLatestArtifactView = setSelectedArtifactView;
+  const setSelectedLatestArtifactId = setSelectedRunArtifactId;
   const enabledSelections = Object.entries(targets).flatMap(([targetId, selection]) => (
     selection.enabled && selection.method
       ? [{ targetId, method: selection.method, config: selection.config }]
       : []
   ));
-  const latestArtifactsPending = latestRun !== undefined
-    && ["candidate_ready", "applied"].includes(latestRun.state)
-    && latestRun.artifactIds.length > 0
-    && latestRunArtifacts.length === 0;
+  const selectedArtifactsPending = selectedRun !== undefined
+    && ["candidate_ready", "applied"].includes(selectedRun.state)
+    && selectedRun.artifactIds.length > 0
+    && selectedRunArtifacts.length === 0;
+  const latestArtifactsPending = selectedArtifactsPending;
   const resultSectionRef = useRef<HTMLElement>(null);
   const lastResultSignature = useRef(
     latestRun === undefined ? null : `${latestRun.runId}:${latestRun.state}`,
@@ -3169,7 +3182,11 @@ function EvolutionWorkspaceV2({
         <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div>
       </section>
       {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section">
-        <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Current Evolution Result</h2></div><span className="muted-pill">{runs.length} total run{runs.length === 1 ? "" : "s"}</span></div>
+        <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Evolution History</h2></div><span className="muted-pill">{runs.length} run{runs.length === 1 ? "" : "s"}</span></div>
+        {runs.length > 0 ? <nav className="v2-evolution-run-selector" aria-label="Evolution history">{runs.map((run, index) => {
+          const selected = run.runId === latestRun?.runId;
+          return <button type="button" key={run.runId} className={selected ? "active" : ""} aria-pressed={selected} onClick={() => setSelectedRunId(run.runId)}><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={15} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}</span><span><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{index === 0 ? "Latest · " : ""}{formatTimeV2(run.createdAt)} · {run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"}</small></span><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></button>;
+        })}</nav> : null}
         {latestRun === undefined ? <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div> : <article className={`v2-evolution-job v2-current-evolution-run ${latestRun.state}`}>
           <header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${latestRun.state}`} aria-hidden="true">{latestRun.state === "running" ? <LoaderCircle className="spin" size={16} /> : latestRun.state === "applied" || latestRun.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{latestRun.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{latestRun.sourceTaskIds.length} Session{latestRun.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(latestRun.createdAt)}</small></div></div><span className={`state-pill ${latestRun.state}`}>{evolutionRunStateLabel(latestRun.state)}</span></header>
           {latestRun.baseProjectHeadId ? <div className="v2-evolution-head-flow"><span><small>Base Head</small><strong>{projectHeadDisplayName(latestRun.baseProjectHeadId)}</strong></span><ArrowRight size={16} /><span className={latestRun.appliedProjectHeadId ? "created" : "pending"}><small>{latestRun.appliedProjectHeadId ? "Created Head" : "On apply"}</small><strong>{latestRun.appliedProjectHeadId ? projectHeadDisplayName(latestRun.appliedProjectHeadId) : "New Project Head"}</strong></span></div> : null}
@@ -3186,12 +3203,8 @@ function EvolutionWorkspaceV2({
               {latestArtifactView === "content" ? <div className="v2-artifact-documents">{selectedLatestPreview?.documents.length ? selectedLatestPreview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>{document.path.endsWith(".md") ? "text/markdown" : "text/plain"}</small></div><pre>{document.content}</pre></section>) : <p className="v2-empty-copy">No readable document body is available for this result.</p>}</div> : <div className="v2-artifact-diff"><div className="v2-diff-summary"><span>Compared with <strong>{selectedLatestPreview?.previousArtifactId ?? "no previous version"}</strong></span></div>{selectedLatestPreview?.diffLines.length ? <pre>{selectedLatestPreview.diffLines.map((line, index) => <span key={`${line.kind}-${index}`} className={line.kind}>{line.kind === "added" ? "+ " : line.kind === "removed" ? "− " : "  "}{line.text}</span>)}</pre> : <p className="v2-empty-copy">No textual change preview is available.</p>}</div>}
             </div> : null}
           </div> : latestArtifactsPending ? <div className="v2-current-evolution-empty loading"><LoaderCircle className="spin" size={18} /><div><strong>Loading result artifacts</strong><span>The candidate is ready. OpenEvo is refreshing its readable artifact inventory.</span></div><button type="button" className="secondary-button" disabled={busy} onClick={onRefresh}>Refresh result</button></div> : latestRun.state !== "running" && latestRun.state !== "failed" ? <div className="v2-current-evolution-empty"><div><strong>No displayable result was published</strong><span>The run completed, but it did not declare an artifact that this WebUI can preview.</span></div></div> : null}
-          <div className="v2-evolution-apply-bar"><div><strong>{latestRun.state === "applied" ? "Applied to future Sessions" : latestRun.state === "candidate_ready" ? "Candidate ready to apply" : "Evolution Run controls"}</strong><span>{latestRun.state === "candidate_ready" ? "Applying this candidate creates the context used by the next Project Head." : latestRun.state === "applied" ? "New Sessions now use this evolved context." : "Retry only the failed methods while preserving the original evidence."}</span></div><div className="v2-card-actions">{latestRun.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy || latestArtifactsPending} onClick={() => onApplyRun(latestRun.runId)}>Apply to future Sessions</button> : null}{latestRun.state === "applied" ? <span className="muted-pill">Active context</span> : null}{allJobs.filter((job) => latestRun.jobIds.includes(job.jobId) && job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></div>
+          <div className="v2-evolution-apply-bar"><div><strong>{latestRun.state === "applied" ? latestRun.appliedProjectHeadId ? `Applied as ${projectHeadDisplayName(latestRun.appliedProjectHeadId)}` : "Applied Evolution" : latestRun.state === "candidate_ready" ? "Candidate ready to apply" : "Evolution Run controls"}</strong><span>{latestRun.state === "candidate_ready" ? "Applying this candidate creates the context used by the next Project Head." : latestRun.state === "applied" ? "This historical candidate was applied to the Project Head shown above." : "Retry only the failed methods while preserving the original evidence."}</span></div><div className="v2-card-actions">{latestRun.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy || latestArtifactsPending} onClick={() => onApplyRun(latestRun.runId)}>Apply to future Sessions</button> : null}{latestRun.state === "applied" ? <span className="muted-pill">Applied</span> : null}{allJobs.filter((job) => latestRun.jobIds.includes(job.jobId) && job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></div>
         </article>}
-        {runs.length > 1 ? <details className="v2-evolution-history"><summary><span><History size={15} /> Previous Evolution Runs</span><strong>{runs.length - 1}</strong></summary><div className="v2-evolution-job-list">{runs.slice(1).map((run) => {
-          const jobs = allJobs.filter((job) => run.jobIds.includes(job.jobId));
-          return <article className={`v2-evolution-job ${run.state}`} key={run.runId}><header><div className="v2-evolution-job-title"><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={16} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}</span><div><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"} · {formatTimeV2(run.createdAt)}</small></div></div><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></header>{run.error ? <div className="v2-evolution-job-error" role="alert"><strong>Evolution Run failed</strong><p>{run.error}</p></div> : null}<div className="v2-card-actions">{run.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy} onClick={() => onApplyRun(run.runId)}>Apply to future Sessions</button> : null}{run.state === "applied" ? <span className="muted-pill">Active context</span> : null}{jobs.filter((job) => job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></article>;
-        })}</div></details> : null}
       </section> : null}
       {standaloneAvailable && artifacts.length ? <details className="v2-all-evolution-artifacts"><summary><span><FolderOpen size={15} /> Browse all Evolution artifacts</span><strong>{artifacts.length}</strong></summary><EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} /></details> : <EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} />}
     </div>

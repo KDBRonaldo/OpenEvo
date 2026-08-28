@@ -1491,7 +1491,7 @@ describe("Desktop v2 product renderer", () => {
     expect(provider.submitTask).toHaveBeenCalled();
   });
 
-  it("shows the latest standalone Evolution result inline and collapses history", async () => {
+  it("opens every standalone Evolution run in the shared artifact viewer", async () => {
     const base = authoritySnapshot();
     const snapshot = {
       ...base,
@@ -1537,16 +1537,39 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Evolution");
 
-    expect(document.body.textContent).toContain("Current Evolution Result");
+    expect(document.body.textContent).toContain("Evolution History");
     expect(document.body.textContent).toContain(
       "Mark every unsupported conclusion as a hypothesis",
     );
-    expect(document.querySelector(".v2-evolution-history")?.hasAttribute("open")).toBe(false);
+    const historyRuns = [
+      ...document.querySelectorAll<HTMLButtonElement>(".v2-evolution-run-selector > button"),
+    ];
+    expect(historyRuns).toHaveLength(2);
+    expect(historyRuns[0]?.getAttribute("aria-pressed")).toBe("true");
     expect(document.querySelector(".v2-all-evolution-artifacts")?.hasAttribute("open")).toBe(false);
     expect(document.body.textContent).toContain("Apply to future Sessions");
 
-    await click("Skill bundle");
+    const skillArtifact = [
+      ...document.querySelectorAll<HTMLButtonElement>(".v2-current-evolution-tabs > button"),
+    ].find((candidate) => candidate.textContent?.includes("Skill bundle"));
+    await act(async () => {
+      skillArtifact?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(document.body.textContent).toContain("Enumerate claims");
+
+    await act(async () => {
+      historyRuns[1]!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const historicalViewer = document.querySelector(".v2-current-evolution-viewer");
+    expect(historyRuns[1]?.getAttribute("aria-pressed")).toBe("true");
+    expect(historicalViewer?.textContent).toContain("Previous research memory");
+    expect(historicalViewer?.textContent).toContain("Summarize the strongest conclusion");
   });
 
   it("shows a recoverable loading state while candidate artifacts refresh", async () => {
