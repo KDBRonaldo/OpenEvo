@@ -85,7 +85,7 @@ type SessionOutputFileV2 = NonNullable<
 
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
-const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width";
+const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
 const PROJECT_SESSION_SELECTIONS_KEY = "openevo.desktop.navigation.project-session-selections";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
 
@@ -2486,9 +2486,9 @@ function TaskAuthorityCardV2({
   };
   const [inspectorWidth, setInspectorWidth] = usePersistedPaneWidth(
     SESSION_INSPECTOR_WIDTH_KEY,
-    340,
-    280,
-    560,
+    420,
+    360,
+    640,
   );
   const resultInspector = selectedResult ? (
     <SessionResultInspectorV2
@@ -2557,7 +2557,7 @@ function TaskAuthorityCardV2({
       </form>
       </div>
       <aside className="session-inspector-pane" aria-label="Session inspector">
-      <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={340} minimum={280} maximum={560} onChange={setInspectorWidth} direction={-1} edge="left" />
+      <VerticalResizeHandle label="Resize Session inspector" value={inspectorWidth} defaultValue={420} minimum={360} maximum={640} onChange={setInspectorWidth} direction={-1} edge="left" />
       {selectedResult ? <div className="session-inspector-preview-mode">{resultInspector}</div> : <>
       <header className="session-inspector-heading">
         <div><span className="panel-kicker">Session details</span><h2>{taskContent?.title ?? `Task ${task.task_id}`}</h2><small>{formatTimeV2(task.updated_at)}</small></div>
@@ -2573,10 +2573,10 @@ function TaskAuthorityCardV2({
       </section> : null}
       <section className="session-inspector-section" data-session-priority="context">
         <InspectorSectionHeadingV2 icon={Sparkles} title="Applied Evolution Context" metric={usedArtifacts.length ? `${usedArtifacts.length}` : "Base only"} />
-        <div className="session-project-head-row"><CircleDot size={17} /><span><strong>Project Head {task.admission.predecessor_project_head.generation}</strong><small>Baseline pinned when this Session started</small></span></div>
+        <div className="session-project-head-row"><CircleDot size={17} /><span><strong>Project Head {task.admission.predecessor_project_head.generation}</strong></span></div>
         {usedArtifacts.length ? <div className="session-inspector-context-list">{usedArtifacts.map((artifact) => {
           const preview = artifactPresentation?.[artifact.artifact_id];
-          return <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => setSelectedResult({ kind: "artifact", artifactId: artifact.artifact_id })}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{preview?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong><small>{preview?.statusDetail || `${artifactTypeLabel(artifact.artifact_type)} · ${formatBytes(artifact.byte_size)}`}</small></span><ArrowRight size={14} /></button>;
+          return <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => setSelectedResult({ kind: "artifact", artifactId: artifact.artifact_id })}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{preview?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong></span><ArrowRight size={14} /></button>;
         })}</div> : <p className="session-inspector-empty context-empty">No evolved artifacts were added beyond the pinned Project Head.</p>}
       </section>
       <section className="session-evolution-availability" data-session-priority="evolution">

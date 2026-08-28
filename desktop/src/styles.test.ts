@@ -44,4 +44,15 @@ describe("Desktop product responsive CSS", () => {
     expect(statusRule).toMatch(/background:\s*transparent;/);
     expect(styles).toMatch(/\.session-submit-progress::after\s*{[\s\S]*?linear-gradient/);
   });
+
+  it("uses a wider, softly divided Session inspector instead of nested cards", () => {
+    const inspectorRule = styles.match(/\.session-inspector-pane\s*{([^}]*)}/)?.[1];
+    expect(inspectorRule).toBeDefined();
+    expect(inspectorRule).toMatch(/border:\s*0;/);
+    expect(inspectorRule).toMatch(/background:\s*linear-gradient/);
+    const sectionRule = styles.match(/\.session-inspector-section\s*{([^}]*)}/)?.[1];
+    expect(sectionRule).toMatch(/border:\s*0;/);
+    expect(sectionRule).toMatch(/background:\s*transparent;/);
+    expect(styles).toMatch(/--session-inspector-width,\s*420px/);
+  });
 });

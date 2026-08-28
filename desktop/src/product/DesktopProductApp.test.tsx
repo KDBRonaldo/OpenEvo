@@ -1146,6 +1146,9 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Applied Evolution Context");
     expect(document.body.textContent).toContain("Available for Evolution");
     expect(document.body.textContent).toContain("Project Head 7");
+    const sessionInspector = document.querySelector(".session-inspector-pane");
+    expect(sessionInspector?.textContent).not.toContain("Baseline pinned when this Session started");
+    expect(sessionInspector?.textContent).not.toContain("Applied. The real");
     expect(document.body.textContent).not.toContain("Technical details");
     expect(document.body.textContent).toContain("Memory · Update");
     expect(document.body.textContent).toContain("Skill · Update");

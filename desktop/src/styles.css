@@ -4332,7 +4332,7 @@ pre.json {
 .product-v2-shell .v2-task-result-detail {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(420px, 1fr) var(--session-inspector-width, 340px);
+  grid-template-columns: minmax(420px, 1fr) var(--session-inspector-width, 420px);
   align-items: start;
   gap: 16px;
   overflow: visible;
@@ -4427,82 +4427,103 @@ pre.json {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 18px 16px 22px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: #f7f9f7;
+  padding: 22px 22px 28px;
+  border: 0;
+  border-radius: 0;
+  background: linear-gradient(90deg, rgb(239 244 241 / 78%), rgb(249 251 250 / 92%) 18px, rgb(249 251 250 / 72%));
+  box-shadow: inset 1px 0 rgb(188 204 197 / 58%);
 }
 
 .session-inspector-heading {
+  position: relative;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
-  padding: 0 2px 14px;
-  border-bottom: 1px solid var(--line);
+  padding: 0 2px 20px;
+  border-bottom: 0;
+}
+
+.session-inspector-heading::after,
+.session-inspector-section::before,
+.session-evolution-availability::before {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, rgb(111 143 130 / 32%), rgb(111 143 130 / 12%) 70%, transparent);
+  content: "";
 }
 
 .session-inspector-heading h2 {
-  margin: 4px 0 0;
-  font-size: 15px;
+  margin: 6px 0 0;
+  font-size: 19px;
   line-height: 1.3;
 }
 
 .session-inspector-heading small {
   display: block;
   max-width: 230px;
-  margin-top: 5px;
+  margin-top: 7px;
   overflow: hidden;
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-inspector-section {
-  margin-top: 12px;
-  padding: 14px;
-  border: 1px solid #d8e1dd;
-  border-radius: 10px;
-  background: #fff;
+  position: relative;
+  margin-top: 0;
+  padding: 22px 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.session-inspector-section::before,
+.session-evolution-availability::before {
+  top: 0;
+  bottom: auto;
 }
 
 .session-inspector-section-heading {
   display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) auto;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 14px;
 }
 
 .session-inspector-section-heading > span {
   display: grid;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   place-items: center;
-  border: 1px solid #d8e4df;
-  border-radius: 7px;
-  background: #fff;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--accent-strong);
 }
 
 .session-inspector-section-heading h3 {
   margin: 0;
   color: var(--ink);
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 750;
   letter-spacing: 0.01em;
 }
 
 .session-inspector-section-heading > strong {
   min-width: 24px;
-  padding: 3px 7px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: #fff;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   text-align: center;
 }
@@ -4521,7 +4542,7 @@ pre.json {
   align-items: center;
   gap: 9px;
   width: 100%;
-  padding: 9px 10px;
+  padding: 12px 8px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
@@ -4533,8 +4554,8 @@ pre.json {
 
 .session-inspector-output-list button:hover,
 .session-inspector-context-list button:hover {
-  border-color: #d5e3dd;
-  background: #fff;
+  border-color: transparent;
+  background: linear-gradient(90deg, rgb(49 130 104 / 8%), transparent);
   color: var(--accent-strong);
 }
 
@@ -4552,7 +4573,7 @@ pre.json {
   display: block;
   overflow: hidden;
   color: var(--ink);
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 650;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -4567,7 +4588,7 @@ pre.json {
   margin-top: 2px;
   overflow: hidden;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.4;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4607,27 +4628,27 @@ pre.json {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 10px;
-  margin-bottom: 6px;
-  padding: 10px;
-  border: 1px solid #d6e5df;
-  border-radius: 7px;
-  background: #eef5f2;
+  margin-bottom: 8px;
+  padding: 11px 8px;
+  border: 0;
+  border-radius: 0;
+  background: linear-gradient(90deg, rgb(49 130 104 / 8%), transparent 78%);
   color: var(--accent-strong);
 }
 
 .session-inspector-context-list .v2-artifact-type {
-  width: 68px;
+  width: 82px;
   overflow: hidden;
-  font-size: 8px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .session-inspector-empty {
   margin: 0;
-  padding: 4px 10px 2px 36px;
+  padding: 6px 8px 2px 32px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.5;
 }
 
@@ -4636,11 +4657,12 @@ pre.json {
 }
 
 .session-evolution-availability {
-  margin-top: 12px;
-  padding: 14px;
-  border: 1px solid #dddff2;
-  border-radius: 10px;
-  background: #fff;
+  position: relative;
+  margin-top: 0;
+  padding: 22px 2px 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .session-evolution-availability-heading {
@@ -4667,13 +4689,13 @@ pre.json {
 
 .session-evolution-availability-heading strong {
   color: var(--ink);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .session-evolution-availability-heading small {
   margin-top: 3px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.4;
 }
 
