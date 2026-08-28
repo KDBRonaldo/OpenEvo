@@ -37,6 +37,7 @@ import {
   useState,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
 import { DesktopApiErrorV2 } from "../api/v2/client";
@@ -2960,6 +2961,12 @@ function EvolutionResultCollection({
   );
 }
 
+function trackEvolutionSpotlight(event: ReactPointerEvent<HTMLElement>): void {
+  const bounds = event.currentTarget.getBoundingClientRect();
+  event.currentTarget.style.setProperty("--evolution-pointer-x", `${Math.round(event.clientX - bounds.left)}px`);
+  event.currentTarget.style.setProperty("--evolution-pointer-y", `${Math.round(event.clientY - bounds.top)}px`);
+}
+
 function EvolutionWorkspaceV2({
   project,
   snapshot,
@@ -3094,7 +3101,8 @@ function EvolutionWorkspaceV2({
   };
   return (
     <div className="workspace-stack evolution-workspace-v2" data-testid="evolution-workspace">
-      <div className="workspace-heading evolution-workspace-heading"><div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p></div>{project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Active Project Head</small><strong>Project Head {project.active_project_head.generation}</strong><em>Used by the next Session</em></span></div> : null}</div>
+      <div className="evolution-atmosphere" aria-hidden="true"><span /><span /><span /></div>
+      <div className="workspace-heading evolution-workspace-heading"><div><p className="eyebrow"><CircleDot size={11} /> Evolution system online</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p><div className="evolution-telemetry" aria-hidden="true"><span>Evidence mesh</span><i /><span>Context synthesis</span><i /><span>Project Head</span></div></div>{project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Active Project Head</small><strong>Project Head {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by the next Session</em></span></div> : null}</div>
       {standaloneAvailable ? <nav className="evolution-stepper" aria-label="Evolution workflow">
         <button type="button" className={selectedTaskIds.length > 0 ? "complete" : "active"} onClick={() => scrollToEvolutionStep("evolution-evidence")}><span><BookOpen size={15} /></span><div><strong>Evidence</strong><small>{selectedTaskIds.length > 0 ? `${selectedTaskIds.length} Sessions selected` : "Choose Sessions"}</small></div></button>
         <ArrowRight size={15} />
@@ -3102,17 +3110,17 @@ function EvolutionWorkspaceV2({
         <ArrowRight size={15} />
         <button type="button" className={latestRun !== undefined ? "active" : ""} onClick={() => scrollToEvolutionStep("evolution-result")}><span><Sparkles size={15} /></span><div><strong>Result</strong><small>{latestRun === undefined ? "Run Evolution" : evolutionRunStateLabel(latestRun.state)}</small></div></button>
       </nav> : null}
-      {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section">
+      {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section" data-step="01">
         <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
-        <div className="evolution-section-body">{completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task) => {
+        <div className="evolution-section-body">{completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task, index) => {
           const selected = selectedTaskIds.includes(task.task_id);
           const evidenceReady = snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionEvidenceReady === true;
           const title = snapshot.runtimePresentation?.tasks[task.task_id]?.instruction?.title ?? task.task_id;
-          return <article key={task.task_id} className={selected ? "selected" : ""}><label><input type="checkbox" checked={selected} disabled={busy || !evidenceReady} onChange={(event) => setSelectedTaskIds((current) => event.target.checked ? [...current, task.task_id] : current.filter((id) => id !== task.task_id))} /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)} · {evidenceReady ? "transcript evidence" : "evidence unavailable"}</small></span></label></article>;
+          return <article key={task.task_id} className={selected ? "selected" : ""} data-evidence-state={evidenceReady ? "ready" : "unavailable"} onPointerMove={trackEvolutionSpotlight}><label><span className="evolution-session-index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</span><input type="checkbox" checked={selected} disabled={busy || !evidenceReady} onChange={(event) => setSelectedTaskIds((current) => event.target.checked ? [...current, task.task_id] : current.filter((id) => id !== task.task_id))} /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)} · {evidenceReady ? "transcript evidence" : "evidence unavailable"}</small></span><em><CircleDot size={9} /> {evidenceReady ? "Ready" : "Unavailable"}</em></label></article>;
         })}</div>}
         {completedTasks.length > evidenceTasks.length ? <Notice tone="warning" title="Some Sessions are unavailable" detail="Their transcript datasets were not sealed. Restart the updated development daemon to repair recoverable legacy Sessions; unavailable entries cannot be selected." /> : null}</div>
       </section> : null}
-      <section id="evolution-methods" className="product-panel task-panel evolution-step-section">
+      <section id="evolution-methods" className="product-panel task-panel evolution-step-section" data-step="02">
         <div className="panel-heading"><div><span className="panel-kicker">{standaloneAvailable ? "Step 2 · Methods" : "Verified remote registry"}</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
         <div className="evolution-section-body evolution-methods-body">{capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
@@ -3131,7 +3139,7 @@ function EvolutionWorkspaceV2({
           const selectedResolver = resolvers.find((resolver) => resolver.selection_value === methodId);
           const selectionAccepted = target.accepted_methods.some((method) => method.method_id === methodId)
             || selectedResolver?.supported === true;
-          return <article key={target.target_id} className={current.enabled ? "enabled" : ""}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} disabled={busy} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><div className="soft-select-field compact"><span>Method</span><SoftSelectV2 ariaLabel={`${target.display_name} method`} value={methodId} disabled={busy || !current.enabled} options={[
+          return <article key={target.target_id} className={current.enabled ? "enabled" : ""} data-target-id={target.target_id} onPointerMove={trackEvolutionSpotlight}><label className="v2-target-toggle"><span className="evolution-target-glyph" aria-hidden="true">{evolutionTargetGlyph(target.target_id)}</span><input type="checkbox" checked={current.enabled} disabled={busy} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><div className="soft-select-field compact"><span>Method</span><SoftSelectV2 ariaLabel={`${target.display_name} method`} value={methodId} disabled={busy || !current.enabled} options={[
             { key: "default", value: "", label: "No supported default" },
             ...resolvers.map((resolver) => ({ key: `resolver:${resolver.selection_value}`, value: resolver.selection_value, label: resolver.display_name, disabled: !resolver.supported })),
             ...methods.map((method) => ({ key: `method:${method.method_id}`, value: method.method_id, label: method.display_name })),
@@ -3144,12 +3152,12 @@ function EvolutionWorkspaceV2({
         })}</div>}
         <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div></div>
       </section>
-      {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section">
+      {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section" data-step="03">
         {resultView === "history" ? <>
           <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Evolution History</h2></div><span className="muted-pill">{runs.length} run{runs.length === 1 ? "" : "s"}</span></div>
           <div className="evolution-section-body evolution-history-body">{runs.length > 0 ? <nav className="v2-evolution-run-selector" aria-label="Evolution history">{runs.map((run, index) => {
           const selected = run.runId === latestRun?.runId;
-          return <button type="button" key={run.runId} className={selected ? "active" : ""} aria-pressed={selected} onClick={() => { setSelectedRunId(run.runId); setResultView("detail"); }}><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={15} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}</span><span><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{index === 0 ? "Latest · " : ""}{formatTimeV2(run.createdAt)} · {run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"}</small></span><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></button>;
+          return <button type="button" key={run.runId} className={selected ? "active" : ""} data-run-state={run.state} aria-pressed={selected} onPointerMove={trackEvolutionSpotlight} onClick={() => { setSelectedRunId(run.runId); setResultView("detail"); }}><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={15} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}</span><span><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{index === 0 ? "Latest · " : ""}{formatTimeV2(run.createdAt)} · {run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"}</small></span><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></button>;
           })}</nav> : <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div>}</div>
         </> : latestRun === undefined ? <div className="empty-row">No Evolution Run yet. Session evidence remains available until you choose to use it.</div> : <>
           <div className="panel-heading v2-evolution-detail-heading"><div><button type="button" className="v2-evolution-history-back" onClick={() => setResultView("history")}><ArrowLeft size={14} /> Evolution History</button><h2>Evolution Details</h2></div><span className="muted-pill">{runs.findIndex((run) => run.runId === latestRun.runId) === 0 ? "Latest run" : formatTimeV2(latestRun.createdAt)}</span></div>
@@ -3385,6 +3393,12 @@ function evolutionTargetLabel(targetId: string): string {
   if (targetId in known) return known[targetId as keyof typeof known];
   const words = targetId.replaceAll("_", " ");
   return words.length === 0 ? targetId : `${words[0]!.toUpperCase()}${words.slice(1)}`;
+}
+
+function evolutionTargetGlyph(targetId: string): ReactNode {
+  if (targetId === "agent_system") return <Activity size={16} />;
+  if (targetId === "skill_bundle") return <Sparkles size={16} />;
+  return <History size={16} />;
 }
 
 function formatBytes(bytes: number): string {
