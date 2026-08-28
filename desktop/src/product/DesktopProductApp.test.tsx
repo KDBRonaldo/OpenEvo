@@ -2299,7 +2299,7 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
-  it("keeps diagnostic collection observable as its own Core resource", async () => {
+  it("keeps existing diagnostics observable without a System workspace", async () => {
     const snapshot = authoritySnapshot();
     const diagnostic = {
       schema_version: "2" as const,
@@ -2312,76 +2312,18 @@ describe("Desktop v2 product renderer", () => {
       updated_at: NOW,
       etag: ETAG,
     };
-    const createDiagnostic = vi.fn(async () => diagnostic);
     const provider = {
       ...providerFixture(snapshot),
       listDiagnostics: () => [diagnostic],
-      createDiagnostic,
     } satisfies DesktopProductProviderV2;
 
     root = await render(provider);
-    await click("System");
 
+    expect(
+      [...document.querySelectorAll<HTMLButtonElement>(".product-nav-item")]
+        .map((candidate) => candidate.textContent?.trim()),
+    ).toEqual(["Research", "Evolution"]);
     expect(document.body.textContent).toContain("Diagnostic status: running");
-    await click("Collect system diagnostics");
-    expect(createDiagnostic).toHaveBeenCalledWith(
-      { scope: "system", resource_id: null },
-      expect.objectContaining({ streamEpoch: 1 }),
-    );
-  });
-
-  it("loads remote service output and starts idempotent safe-cache cleanup", async () => {
-    const base = authoritySnapshot();
-    const service = {
-      schema_version: "2" as const,
-      service_id: "service-daemon-1",
-      kind: "daemon" as const,
-      status: "ready" as const,
-      updated_at: NOW,
-      etag: ETAG,
-    };
-    const snapshot: DesktopProductSnapshotV2 = { ...base, services: [service] };
-    const loadServiceLogs = vi.fn(async () => ({
-      schema_version: "2" as const,
-      items: [
-        {
-          sequence: 1,
-          occurred_at: NOW,
-          stream: "stdout" as const,
-          message: "Daemon registry is ready",
-        },
-      ],
-      next_cursor: null,
-      has_more: false,
-    }));
-    const cleanupCaches = vi.fn(async () => ({
-      schema_version: "2" as const,
-      operation_id: "core-cache-cleanup-1",
-      kind: "cache_cleanup" as const,
-      status: "queued" as const,
-      progress_completed: 0,
-      progress_total: 0,
-      error: null,
-      created_at: NOW,
-      updated_at: NOW,
-      etag: ETAG,
-    }));
-    const provider = {
-      ...providerFixture(snapshot),
-      loadServiceLogs,
-      cleanupCaches,
-    } satisfies DesktopProductProviderV2;
-
-    root = await render(provider);
-    await click("System");
-    await click("View logs");
-
-    expect(document.body.textContent).toContain("Daemon registry is ready");
-    expect(document.body.textContent).toContain("Service output");
-    await click("Clean safe caches");
-    expect(cleanupCaches).toHaveBeenCalledWith(
-      expect.objectContaining({ streamEpoch: 1 }),
-    );
   });
 
   it("creates a project with the release-owned Self-Deployed execution profile", async () => {

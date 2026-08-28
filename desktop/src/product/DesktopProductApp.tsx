@@ -57,7 +57,6 @@ import {
   coreOperationPanelModelV2,
   diagnosticPanelModelV2,
   lifecycleOperationPanelModelV2,
-  servicePanelModelV2,
 } from "./LifecycleOperationPanelV2";
 import {
   unavailableDesktopProductProviderV2,
@@ -66,7 +65,7 @@ import {
   type ProductMutationIntentV2,
 } from "./providerV2";
 
-type Workspace = "research" | "evolution" | "system";
+type Workspace = "research" | "evolution";
 
 type StartingSessionV2 = {
   readonly projectId: string;
@@ -300,7 +299,6 @@ export function DesktopProductApp({
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectEditing, setProjectEditing] = useState(false);
   const [taskLogs, setTaskLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
-  const [serviceLogs, setServiceLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const readyReported = useRef(false);
   const initialFailureReported = useRef(false);
   const refreshRequestSequence = useRef(0);
@@ -700,7 +698,6 @@ export function DesktopProductApp({
         <nav className="product-nav" aria-label="Workspace views">
           <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>Research</WorkspaceButton>
           <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
-          <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>System</WorkspaceButton>
         </nav>
         <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
       </aside>
@@ -823,7 +820,7 @@ export function DesktopProductApp({
                 "The successor Evolution result was abandoned.",
               )}
             />
-          ) : workspace === "evolution" ? (
+          ) : (
             <EvolutionWorkspaceV2
               project={displayedProject}
               snapshot={snapshot}
@@ -861,41 +858,6 @@ export function DesktopProductApp({
                 "Evolution method retry started with the same evidence.",
               )}
               onRefresh={() => { void refresh(); }}
-            />
-          ) : (
-            <SystemWorkspaceV2
-              snapshot={snapshot}
-              activeProfile={activeProfile}
-              busy={busy}
-              onOpenConnections={() => setConnectionOpen(true)}
-              onRestartService={(serviceId) => void act(
-                () => provider.restartService(serviceId, intentFor(snapshot, "restart-service")),
-                "Service restart requested.",
-              )}
-              serviceLogs={serviceLogs}
-              onLoadServiceLogs={async (serviceId) => {
-                setBusy(true);
-                setActionError(null);
-                try {
-                  const page = await provider.loadServiceLogs(serviceId, { limit: 100 });
-                  setServiceLogs((current) => ({ ...current, [serviceId]: page.items }));
-                } catch (error) {
-                  setActionError(userMessageV2(error));
-                } finally {
-                  setBusy(false);
-                }
-              }}
-              onCleanupCaches={() => void act(
-                () => provider.cleanupCaches(intentFor(snapshot, "cleanup-caches")),
-                "Safe remote cache cleanup requested.",
-              )}
-              onCreateDiagnostic={() => void act(
-                () => provider.createDiagnostic(
-                  { scope: "system", resource_id: null },
-                  intentFor(snapshot, "collect-system-diagnostic"),
-                ),
-                "System diagnostic collection requested.",
-              )}
             />
           )}
         </main>
@@ -3243,64 +3205,6 @@ function EvolutionArtifactBrowserV2({ artifacts, presentation, provider }: {
   const selected = artifacts.find((artifact) => artifact.artifact_id === selectedId) ?? null;
   const preview = selectedId === null ? undefined : presentation?.[selectedId];
   return <section className="v2-evolution-results">{artifacts.length === 0 ? <div className="empty-row">No textual evolution artifacts have been published for this project yet.</div> : <div className="artifact-layout"><aside className="artifact-list" aria-label="Evolution artifacts"><div className="artifact-list-heading"><span>Evolution results</span><strong>{artifacts.length} selected</strong></div>{artifacts.map((artifact) => { const item = presentation?.[artifact.artifact_id]; return <button type="button" key={artifact.artifact_id} className={`artifact-list-item ${artifact.artifact_id === selectedId ? "active" : ""}`} aria-pressed={artifact.artifact_id === selectedId} onClick={() => { setSelectedId(artifact.artifact_id); setView("content"); }}><span className={`artifact-icon ${artifact.artifact_type}`}><Sparkles size={15} /></span><span><strong>{item?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong><small>{item?.statusDetail ?? `${artifactTypeLabel(artifact.artifact_type)} · ${formatTimeV2(artifact.created_at)}`}</small></span><ArrowRight size={14} /></button>; })}</aside>{selected ? <section className="artifact-viewer"><div className="artifact-viewer-head"><div><span className="panel-kicker">{artifactTypeLabel(selected.artifact_type)}</span><h2>{preview?.title ?? selected.artifact_id}</h2><p>{preview?.statusDetail ?? "The authoritative artifact metadata is available; readable content is not exposed by the current contract."}</p></div><div className="artifact-meta"><span>{artifactStatusLabel(preview?.status ?? "unavailable")}</span><span>{formatBytes(metadata?.byteSize ?? selected.byte_size)}</span></div></div><div className="segmented-control" role="tablist" aria-label="Artifact view"><button type="button" role="tab" aria-selected={view === "content"} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button><button type="button" role="tab" aria-selected={view === "changes"} className={view === "changes" ? "active" : ""} onClick={() => setView("changes")}><History size={14} /> Changes</button></div><div className="v2-artifact-facts"><span><small>Source Task</small><strong>{preview?.sourceTaskId ?? "Not reported"}</strong></span><span><small>Target path</small><strong>{preview?.targetPath ?? "Not applicable"}</strong></span><span><small>Digest</small><code>{shortDigest(selected.manifest_sha256)}</code></span></div>{metadataError && preview === undefined ? <Notice tone="warning" title="Readable content unavailable" detail={metadataError} /> : null}<div className="artifact-body">{view === "content" ? <div className="v2-artifact-documents">{preview?.documents.length ? preview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>{metadata?.mediaType ?? "text/markdown"}</small></div><pre>{document.content}</pre></section>) : <p className="v2-empty-copy">No readable document body is available for this artifact.</p>}</div> : <div className="v2-artifact-diff"><div className="v2-diff-summary"><span>Compared with <strong>{preview?.previousArtifactId ?? "no previous version"}</strong></span><span>{metadata?.diffStatus ?? (preview?.diffLines.length ? "available" : "unavailable")}</span></div>{preview?.diffLines.length ? <pre>{preview.diffLines.map((line, index) => <span key={`${line.kind}-${index}`} className={line.kind}>{line.kind === "added" ? "+ " : line.kind === "removed" ? "− " : "  "}{line.text}</span>)}</pre> : <p className="v2-empty-copy">No textual change preview is available.</p>}</div>}</div></section> : null}</div>}</section>;
-}
-
-function SystemWorkspaceV2({
-  snapshot,
-  activeProfile,
-  busy,
-  onOpenConnections,
-  onRestartService,
-  serviceLogs,
-  onLoadServiceLogs,
-  onCleanupCaches,
-  onCreateDiagnostic,
-}: {
-  readonly snapshot: DesktopProductSnapshotV2;
-  readonly activeProfile: RemoteProfileV2 | null;
-  readonly busy: boolean;
-  readonly onOpenConnections: () => void;
-  readonly onRestartService: (serviceId: string) => void;
-  readonly serviceLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
-  readonly onLoadServiceLogs: (serviceId: string) => void | Promise<void>;
-  readonly onCleanupCaches: () => void;
-  readonly onCreateDiagnostic: () => void;
-}) {
-  return (
-    <div className="v2-workspace-stack">
-      <section className="product-panel task-panel"><div className="panel-heading"><div><span className="panel-kicker">Connection owner</span><h2>System OpenSSH workspace</h2></div><button type="button" className="secondary-button" onClick={onOpenConnections}>Manage workspaces</button></div>{activeProfile && activeProfile.profile_kind === "system_openssh" ? <div className="v2-system-summary"><div><span>Display name</span><strong>{activeProfile.display_name}</strong></div><div><span>SSH alias</span><code>{activeProfile.ssh_host_alias}</code></div><div><span>Connection generation</span><strong>{activeProfile.connection_generation}</strong></div><div><span>Core API</span><strong>{activeProfile.core_api_major === 2 ? "v2 verified" : "Not connected"}</strong></div></div> : <p className="v2-empty-copy">No active remote workspace.</p>}</section>
-      <section className="product-panel task-panel">
-        <div className="panel-heading">
-          <div><span className="panel-kicker">Active project tunnel</span><h2>Remote services</h2></div>
-          <div className="v2-card-actions">
-            <button type="button" className="secondary-button" disabled={busy || activeProfile === null} onClick={onCreateDiagnostic}>Collect system diagnostics</button>
-            <button type="button" className="secondary-button" disabled={busy || activeProfile === null} onClick={onCleanupCaches}>Clean safe caches</button>
-          </div>
-        </div>
-        {snapshot.services.length === 0 ? (
-          <p className="v2-empty-copy">Services appear only after a compatible Daemon and active project tunnel are verified.</p>
-        ) : (
-          <div className="v2-service-list">
-            {snapshot.services.map((service) => (
-              <div key={service.service_id} className="v2-service-observation">
-                <div>
-                  <span><strong>{service.kind}</strong><small>{service.service_id}</small></span>
-                  <span className={`state-pill ${service.status}`}>{service.status}</span>
-                  <div className="v2-card-actions">
-                    <button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadServiceLogs(service.service_id)}>View logs</button>
-                    <button type="button" className="secondary-button" disabled={busy} onClick={() => onRestartService(service.service_id)}>Restart</button>
-                  </div>
-                </div>
-                {serviceLogs[service.service_id] === undefined ? null : (
-                  <LifecycleOperationPanelV2 model={servicePanelModelV2(service, serviceLogs[service.service_id]!)} />
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-    </div>
-  );
 }
 
 function IdentityCard({ title, id, detail, digest }: { readonly title: string; readonly id: string; readonly detail: string; readonly digest: string }) {

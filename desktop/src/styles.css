@@ -4336,8 +4336,7 @@ pre.json {
 .v2-section-heading code,
 .v2-profile-card code,
 .v2-identity-card code,
-.v2-task-card code,
-.v2-system-summary code {
+.v2-task-card code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -4378,8 +4377,7 @@ pre.json {
 
 .v2-profile-list,
 .v2-task-list,
-.v2-target-list,
-.v2-service-list {
+.v2-target-list {
   display: grid;
   gap: 10px;
 }
@@ -7702,74 +7700,8 @@ pre.json {
   }
 }
 
-.v2-system-summary {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.v2-system-summary > div {
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface-soft);
-}
-
-.v2-system-summary span,
-.v2-system-summary strong,
-.v2-system-summary code {
-  display: block;
-  overflow-wrap: anywhere;
-}
-
-.v2-system-summary span {
-  color: var(--subtle);
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-}
-
-.v2-system-summary strong,
-.v2-system-summary code {
-  margin-top: 6px;
-  font-size: 11px;
-}
-
-.v2-service-list > div {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.v2-service-list > .v2-service-observation {
-  grid-template-columns: minmax(0, 1fr);
-  align-items: stretch;
-}
-
-.v2-service-observation > div:first-child {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-}
-
-.v2-service-observation > .lifecycle-operation-panel,
 .v2-task-card > .lifecycle-operation-panel {
   margin-top: 12px;
-}
-
-.v2-service-list strong,
-.v2-service-list small {
-  display: block;
-}
-
-.v2-service-list small {
-  margin-top: 2px;
-  color: var(--muted);
 }
 
 .lifecycle-operation-panel {
@@ -8062,10 +7994,6 @@ pre.json {
   .v2-authority-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
-
-  .v2-system-summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 820px) {
@@ -8095,8 +8023,7 @@ pre.json {
   .v2-task-authority,
   .v2-supporting-results,
   .v2-target-list > article,
-  .v2-source-choice,
-  .v2-service-observation > div:first-child {
+  .v2-source-choice {
     grid-template-columns: minmax(0, 1fr);
   }
 
