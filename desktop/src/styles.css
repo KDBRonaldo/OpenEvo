@@ -6219,6 +6219,37 @@ pre.json {
   padding: 18px;
 }
 
+.v2-evolution-detail-heading h2 {
+  margin-top: 5px;
+}
+
+.v2-evolution-history-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: transparent;
+  cursor: pointer;
+}
+
+.v2-evolution-history-back:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.v2-evolution-history-back:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 3px;
+}
+
 .v2-evolution-head-flow {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
@@ -6418,10 +6449,9 @@ pre.json {
   grid-template-columns: minmax(0, 1fr);
   gap: 2px;
   max-height: 300px;
-  margin-bottom: 14px;
-  padding: 0 0 14px;
+  margin: 0;
+  padding: 0;
   overflow-y: auto;
-  border-bottom: 1px solid var(--line);
 }
 
 .v2-evolution-run-selector > button {

@@ -1491,7 +1491,7 @@ describe("Desktop v2 product renderer", () => {
     expect(provider.submitTask).toHaveBeenCalled();
   });
 
-  it("opens every standalone Evolution run in the shared artifact viewer", async () => {
+  it("separates Evolution history from run details and opens the latest run by default", async () => {
     const base = authoritySnapshot();
     const snapshot = {
       ...base,
@@ -1537,16 +1537,12 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Evolution");
 
-    expect(document.body.textContent).toContain("Evolution History");
+    expect(document.body.textContent).toContain("Evolution Details");
     expect(document.body.textContent).toContain(
       "Mark every unsupported conclusion as a hypothesis",
     );
-    const historyRuns = [
-      ...document.querySelectorAll<HTMLButtonElement>(".v2-evolution-run-selector > button"),
-    ];
-    expect(historyRuns).toHaveLength(2);
-    expect(historyRuns[0]?.getAttribute("aria-pressed")).toBe("true");
-    expect(document.querySelector(".v2-all-evolution-artifacts")?.hasAttribute("open")).toBe(false);
+    expect(document.querySelector(".v2-evolution-run-selector")).toBeNull();
+    expect(document.querySelector(".v2-all-evolution-artifacts")).toBeNull();
     expect(document.body.textContent).toContain("Apply to future Sessions");
 
     const skillArtifact = [
@@ -1559,6 +1555,16 @@ describe("Desktop v2 product renderer", () => {
     });
     expect(document.body.textContent).toContain("Enumerate claims");
 
+    await click("Evolution History");
+
+    const historyRuns = [
+      ...document.querySelectorAll<HTMLButtonElement>(".v2-evolution-run-selector > button"),
+    ];
+    expect(historyRuns).toHaveLength(2);
+    expect(historyRuns[0]?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".v2-current-evolution-run")).toBeNull();
+    expect(document.body.textContent).not.toContain("Enumerate claims");
+
     await act(async () => {
       historyRuns[1]!.click();
       await Promise.resolve();
@@ -1567,7 +1573,8 @@ describe("Desktop v2 product renderer", () => {
     });
 
     const historicalViewer = document.querySelector(".v2-current-evolution-viewer");
-    expect(historyRuns[1]?.getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".v2-evolution-run-selector")).toBeNull();
+    expect(document.body.textContent).toContain("Evolution Details");
     expect(historicalViewer?.textContent).toContain("Previous research memory");
     expect(historicalViewer?.textContent).toContain("Summarize the strongest conclusion");
   });
