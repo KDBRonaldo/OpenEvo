@@ -8548,6 +8548,26 @@ pre.json {
   box-shadow: 0 5px 13px rgb(24 75 63 / 9%), inset 0 1px 0 white;
 }
 
+.evolution-workspace-v2 .v2-current-evolution-viewer-head p {
+  color: #52615b;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.evolution-workspace-v2 .v2-artifact-documents pre,
+.evolution-workspace-v2 .v2-artifact-diff pre {
+  color: #26332e;
+  background: rgb(255 255 255 / 92%);
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  font-weight: 450;
+  font-variant-ligatures: none;
+  letter-spacing: 0;
+  line-height: 1.72;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: auto;
+}
+
 .evolution-workspace-v2 .v2-current-evolution-empty {
   margin: 16px 18px;
   border: 1px dashed rgb(45 135 115 / 22%);
