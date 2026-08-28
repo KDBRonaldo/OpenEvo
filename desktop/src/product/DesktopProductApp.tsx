@@ -1901,7 +1901,6 @@ function ResearchWorkspaceV2({
     .filter((task) => task.project_id === project.project_id)
     .sort(compareTasksNewestFirst);
   const selectedTask = projectTasks.find((task) => task.task_id === selectedTaskId) ?? null;
-  const observedTask = selectedTask ?? projectTasks[0] ?? null;
   const activeTask = projectTasks.find((task) => ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)) ?? null;
   const [optimisticStartingSession, setOptimisticStartingSession] = useState<StartingSessionV2 | null>(null);
   const visibleStartingSession = startingSession ?? optimisticStartingSession;
@@ -1974,6 +1973,11 @@ function ResearchWorkspaceV2({
     objective: taskObjective.trim(),
   };
   const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
+  const canStartDraft = !formBusy
+    && !sessionStartBlocked
+    && ready
+    && taskValid
+    && selectedProjectHead !== null;
   const startDraftSession = async (): Promise<void> => {
     if (selectedProjectHead === null) return;
     const optimistic = {
@@ -2028,59 +2032,97 @@ function ResearchWorkspaceV2({
     );
   }
   return (
-    <div className="workspace-stack" data-testid="research-workspace">
+    <div className="workspace-stack new-session-workspace" data-testid="research-workspace">
       <div className="workspace-heading">
         <div><h1>{project.display_name}</h1></div>
         <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button></div>
       </div>
-      {visibleStartingSession ? (
-        <div className="session-submit-progress" role="status">
-          <LoaderCircle className="spin" size={17} />
-          <div><strong>{visibleStartingSession.phase === "validating" ? "Validating Session" : "Starting Session"}</strong><span>Your draft is preserved while you continue browsing.</span></div>
-        </div>
-      ) : null}
-      {!ready ? (
-        <div className="disabled-reason">
-          <AlertCircle size={14} />
-          <span>
-            <strong>The next task cannot start yet.</strong>{" "}
-            {project.state === "not_ready" && project.active_project_head === null
-              ? "OpenEvo is preparing the remote service and initial Project Head. This page will retry automatically."
-              : "Wait for the current Evolution, settings, workspace, or runtime change to finish."}
-          </span>
-          {project.state === "not_ready" && project.active_project_head === null ? (
-            <button type="button" className="text-button" disabled={formBusy} onClick={onRetryInitialization}>
-              Retry now
-            </button>
+      <div className="new-session-canvas">
+        <div className="session-composer-wrap">
+          {visibleStartingSession ? (
+            <div className="session-submit-progress" role="status">
+              <LoaderCircle className="spin" size={17} />
+              <div><strong>{visibleStartingSession.phase === "validating" ? "Validating Session" : "Starting Session"}</strong><span>Your draft is preserved while you continue browsing.</span></div>
+            </div>
           ) : null}
+          {!ready ? (
+            <div className="disabled-reason">
+              <AlertCircle size={14} />
+              <span>
+                <strong>The next task cannot start yet.</strong>{" "}
+                {project.state === "not_ready" && project.active_project_head === null
+                  ? "OpenEvo is preparing the remote service and initial Project Head. This page will retry automatically."
+                  : "Wait for the current Evolution, settings, workspace, or runtime change to finish."}
+              </span>
+              {project.state === "not_ready" && project.active_project_head === null ? (
+                <button type="button" className="text-button" disabled={formBusy} onClick={onRetryInitialization}>
+                  Retry now
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          <form
+            className="session-composer next-task-fields"
+            data-testid="session-composer"
+            aria-label="Start a new Session"
+            aria-busy={visibleStartingSession !== null}
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (canStartDraft) void startDraftSession();
+            }}
+          >
+            <label className="session-composer-title">
+              <span>Task title</span>
+              <input
+                maxLength={256}
+                value={taskTitle}
+                placeholder="Name this Session"
+                disabled={formBusy || sessionStartBlocked}
+                onChange={(event) => setTaskTitle(event.target.value)}
+              />
+            </label>
+            <label className="session-composer-instructions">
+              <span className="visually-hidden">Task instructions</span>
+              <textarea
+                rows={4}
+                maxLength={65_536}
+                value={taskObjective}
+                placeholder="What should the Agent do next?"
+                disabled={formBusy || sessionStartBlocked}
+                onChange={(event) => setTaskObjective(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+                  event.preventDefault();
+                  if (canStartDraft) void startDraftSession();
+                }}
+              />
+            </label>
+            {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
+              <legend>Evolution after this Session <span>{selectedEvolutionCount} selected</span></legend>
+              <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
+            </fieldset> : null}
+            {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
+            <div className="session-composer-footer">
+              <label className="session-head-picker">
+                <Sparkles size={15} />
+                <span className="visually-hidden">Evolution context</span>
+                <select value={selectedProjectHeadId} disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
+                  {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}</option>)}
+                </select>
+              </label>
+              <button
+                type="submit"
+                className="session-send-button"
+                aria-label={sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting Session" : "Start session"}
+                title={sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting Session" : "Start session"}
+                disabled={!canStartDraft}
+              >
+                {formBusy ? <LoaderCircle className="spin" size={18} /> : <ArrowUp size={19} strokeWidth={2.4} />}
+                <span className="visually-hidden">{sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting Session" : "Start session"}</span>
+              </button>
+            </div>
+          </form>
         </div>
-      ) : null}
-      <div className="research-grid">
-      <section className="product-panel task-panel" aria-busy={visibleStartingSession !== null}>
-        <div className="panel-heading"><div><h2>What should the Agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state === "ready" ? "Ready" : "Preparing"}</span></div>
-        <div className="next-task-fields">
-          <label>Task title<input maxLength={256} value={taskTitle} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskTitle(event.target.value)} /></label>
-          <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={formBusy || sessionStartBlocked} onChange={(event) => setTaskObjective(event.target.value)} /></label>
-          <label>Evolution context
-            <select value={selectedProjectHeadId} disabled={formBusy || sessionStartBlocked || availableProjectHeads.length === 0} onChange={(event) => setSelectedProjectHeadId(event.target.value)}>
-              {availableProjectHeads.map((head) => <option key={head.project_head_id} value={head.project_head_id}>Project Head {head.generation}{head.project_head_id === project.active_project_head?.project_head_id ? " · recommended" : " · historical"}</option>)}
-            </select>
-          </label>
-        </div>
-        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
-          <legend>Evolution after this session <span>Optional · formal contract</span></legend>
-          <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
-          <p>{selectedEvolutionCount === 0 ? "No evolution will run after this session." : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
-        </fieldset> : null}
-        {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="session-draft-actions">
-          <button type="button" className="primary-button" disabled={formBusy || sessionStartBlocked || !ready || !taskValid || selectedProjectHead === null} onClick={() => void startDraftSession()}>{formBusy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} {sessionStartBlocked ? "Evolution running" : visibleStartingSession ? "Starting" : "Start session"}</button>
-        </div>
-      </section>
-      <section className="product-panel active-run-panel">
-        <div className="panel-heading"><div><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No Session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span> : <span className="muted-pill">Ready</span>}</div>
-        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Session admission</strong></div><span className={`state-pill ${observedTask.state}`}>{taskStateLabelV2(observedTask.state)}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "No task instructions are available for this historical Session."}</p><div className="active-run-actions"><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>{["admitted", "preparing", "running", "cancelling"].includes(observedTask.state) ? "Open live Session" : "Open Session result"} <ArrowRight size={14} /></button>{["admitted", "preparing", "running"].includes(observedTask.state) ? <button type="button" className="danger-text-button" disabled={busy} onClick={() => onCancelTask(observedTask)}>Cancel Session</button> : null}</div></> : <div className="quiet-empty"><Play size={22} /><p>Start a Session when the remote workspace is ready.</p></div>}
-      </section>
       </div>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable Project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>

@@ -1183,7 +1183,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Unsupported conclusions are marked as hypotheses",
     );
-    expect(document.body.textContent).not.toContain("What should the Agent do next?");
+    expect(document.querySelector('[data-testid="session-composer"]')).toBeFalsy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
 
     await click("Back to Protein study");
@@ -1191,7 +1191,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
-    expect(document.body.textContent).toContain("What should the Agent do next?");
+    expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy();
     expect(document.querySelector(".session-explorer-list")).toBeTruthy();
   });
 
@@ -1311,6 +1311,60 @@ describe("Desktop v2 product renderer", () => {
       expect.any(Object),
       expect.objectContaining({ project_head_id: "project-head-6", generation: 6 }),
     );
+  });
+
+  it("starts the Session from the composer with Enter and keeps Shift+Enter for a new line", async () => {
+    const provider = providerFixture(authoritySnapshot());
+    root = await render(provider);
+    const instructions = textarea("Task instructions");
+
+    await act(async () => {
+      instructions.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        shiftKey: true,
+        bubbles: true,
+      }));
+      await Promise.resolve();
+    });
+    expect(provider.submitTask).not.toHaveBeenCalled();
+
+    await act(async () => {
+      instructions.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalled());
+  });
+
+  it("starts the Session from the composer with Enter and keeps Shift+Enter for a new line", async () => {
+    const provider = providerFixture(authoritySnapshot());
+    root = await render(provider);
+    const instructions = textarea("Task instructions");
+
+    await act(async () => {
+      instructions.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        shiftKey: true,
+        bubbles: true,
+      }));
+      await Promise.resolve();
+    });
+    expect(provider.submitTask).not.toHaveBeenCalled();
+
+    await act(async () => {
+      instructions.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+      }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalled());
   });
 
   it("keeps the Session draft when admission fails", async () => {
@@ -1843,7 +1897,7 @@ describe("Desktop v2 product renderer", () => {
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeTruthy();
-    expect(document.body.textContent).not.toContain("What should the Agent do next?");
+    expect(document.querySelector('[data-testid="session-composer"]')).toBeFalsy();
     expect(
       [...document.querySelectorAll("button")].some((candidate) =>
         candidate.textContent?.includes("Start session"),
@@ -1931,7 +1985,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).not.toContain("Task state:");
   });
 
-  it("cancels an active Session from the chat and keeps the control on the project overview", async () => {
+  it("cancels an active Session from the chat and returns to the new Session composer", async () => {
     const snapshot = authoritySnapshot();
     const runningTask = {
       ...snapshot.tasks[0]!,
@@ -1963,8 +2017,9 @@ describe("Desktop v2 product renderer", () => {
     expect(cancelTask).toHaveBeenCalledWith("task-1", expect.objectContaining({ streamEpoch: 1 }));
 
     await click("Back to Protein study");
-    expect(document.body.textContent).toContain("Open live Session");
-    expect(document.body.textContent).toContain("Cancel Session");
+    expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Open live Session");
+    expect(document.body.textContent).not.toContain("Cancel Session");
   });
 
   it("hides the transient Agent activity after the Session is complete", async () => {
