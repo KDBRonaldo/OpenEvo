@@ -797,7 +797,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Previous research memory");
 
     await click("Evolution");
-    expect(document.body.textContent).toContain("Cross-session changes");
+    expect(document.body.textContent).toContain("Improve future Sessions");
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
   });
@@ -1215,7 +1215,7 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
     await click("Evolution");
 
-    expect(document.body.textContent).toContain("Cross-session changes");
+    expect(document.body.textContent).toContain("Improve future Sessions");
     expect(document.body.textContent).toContain("Evidence review memory");
     expect(document.body.textContent).toContain(
       "Trajectory-to-skill: evidence audit",

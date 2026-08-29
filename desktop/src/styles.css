@@ -7867,24 +7867,6 @@ pre.json {
   line-height: 1.65;
 }
 
-.evolution-telemetry {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 20px;
-  color: #788680;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 8px;
-  letter-spacing: .08em;
-  text-transform: uppercase;
-}
-
-.evolution-telemetry i {
-  width: 28px;
-  height: 1px;
-  background: linear-gradient(90deg, rgb(51 148 127 / 16%), rgb(51 148 127 / 62%), rgb(51 148 127 / 16%));
-}
-
 .evolution-head-context {
   position: relative;
   z-index: 1;
@@ -8015,17 +7997,6 @@ pre.json {
   background: linear-gradient(90deg, var(--evolution-cyan), transparent);
   box-shadow: 0 0 12px rgb(66 184 170 / 45%);
   content: "";
-}
-
-.evolution-workspace-v2 .evolution-step-section::after {
-  position: absolute;
-  top: 10px;
-  right: 22px;
-  z-index: 0;
-  color: rgb(43 112 96 / 4%);
-  font: 800 62px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
-  content: attr(data-step);
-  pointer-events: none;
 }
 
 .product-v2-shell .evolution-workspace-v2 .evolution-step-section > .panel-heading {
@@ -8662,10 +8633,6 @@ pre.json {
     border-top: 1px solid rgb(40 121 103 / 14%);
   }
 
-  .evolution-telemetry {
-    flex-wrap: wrap;
-  }
-
   .evolution-workspace-v2 .evolution-stepper button {
     justify-content: center;
   }
@@ -8701,8 +8668,7 @@ pre.json {
 
 @media (prefers-reduced-motion: reduce) {
   .evolution-atmosphere span,
-  .evolution-workspace-heading::after,
-  .evolution-workspace-heading .eyebrow svg {
+  .evolution-workspace-heading::after {
     animation: none;
   }
 
