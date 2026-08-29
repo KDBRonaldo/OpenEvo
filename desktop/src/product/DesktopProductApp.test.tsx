@@ -691,8 +691,12 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     expect(document.body.textContent).toContain("EvoLab is starting.");
-    expect(document.body.textContent).toContain("No action is needed");
+    expect(document.body.textContent).toContain("Preparing your workspace");
+    expect(document.querySelector(".initial-launch-title-shimmer")).toBeTruthy();
+    expect(document.querySelector(".initial-launch-preparing")).toBeTruthy();
     expect(document.body.textContent).not.toContain("Add remote workspace");
+    expect(document.body.textContent).not.toContain("STARTING EVOLAB");
+    expect(document.body.textContent).not.toContain("Agent evolution workspace");
     expect(document.querySelector(".product-sidebar")).toBeNull();
     expect(document.querySelector(".product-topbar")).toBeNull();
   });

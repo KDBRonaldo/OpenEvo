@@ -967,32 +967,25 @@ function InitialV2View({
 }) {
   return (
     <div className={`product-shell initial-launch-shell${error ? " has-error" : ""}`}>
-      <header className="initial-launch-header">
-        <strong>EvoLab</strong>
-        <span>{error ? "Startup paused" : "Starting"}</span>
-      </header>
       <main className="initial-launch-main">
         <section className="initial-launch-copy" aria-live="polite">
-          <div className="initial-launch-kicker">
-            <span aria-hidden="true" />
-            {error ? "STARTUP NEEDS ATTENTION" : "STARTING EVOLAB"}
-          </div>
-          <h1>
+          <h1 className={error ? undefined : "initial-launch-title-shimmer"}>
             {error ? "EvoLab needs " : "EvoLab is "}
             <span>{error ? "a moment." : "starting."}</span>
           </h1>
-          <p>
-            {error
-              ? "The workspace could not be prepared automatically. Retry the startup when you are ready."
-              : "Preparing your workspace and connecting to the remote service. No action is needed — EvoLab will open automatically when everything is ready."}
-          </p>
-          <div className={`initial-launch-status${error ? " is-error" : ""}`} role="status">
-            {error ? <AlertCircle size={17} /> : <LoaderCircle className="spin" size={17} />}
-            <div>
-              <strong>{error ? "Startup did not complete" : "Preparing your workspace"}</strong>
-              <span>{error ?? "Secure connection and project state are loading."}</span>
-            </div>
-          </div>
+          {error ? (
+            <>
+              <p>The workspace could not be prepared automatically. Retry the startup when you are ready.</p>
+              <div className="initial-launch-status is-error" role="status">
+                <AlertCircle size={17} />
+                <div><strong>Startup did not complete</strong><span>{error}</span></div>
+              </div>
+            </>
+          ) : (
+            <p className="initial-launch-preparing" role="status">
+              Preparing your workspace and connecting to the remote service — EvoLab will open automatically when everything is ready.
+            </p>
+          )}
           {error ? (
             <button className="initial-launch-retry" type="button" onClick={onRetry}>
               <RefreshCw size={16} /> Retry startup
@@ -1001,10 +994,6 @@ function InitialV2View({
         </section>
         <div className="initial-launch-progress" aria-hidden="true"><span /></div>
       </main>
-      <footer className="initial-launch-footer">
-        <span>EvoLab</span>
-        <span>Agent evolution workspace</span>
-      </footer>
     </div>
   );
 }
