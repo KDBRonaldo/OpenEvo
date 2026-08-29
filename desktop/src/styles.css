@@ -8317,15 +8317,15 @@ pre.json {
 }
 
 .evolution-workspace-v2 .v2-target-toggle strong {
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 720;
 }
 
 .evolution-workspace-v2 .v2-target-toggle small {
   margin-top: 6px;
   color: #74817c;
-  font-size: 9px;
-  line-height: 1.55;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .evolution-workspace-v2 .v2-target-toggle input:checked {
@@ -8351,6 +8351,11 @@ pre.json {
   background: rgb(255 255 255 / 78%);
   box-shadow: inset 0 1px 0 white, 0 5px 12px rgb(20 59 50 / 4%);
   backdrop-filter: blur(10px);
+  font-size: 13px;
+}
+
+.evolution-workspace-v2 .v2-target-list > article > .soft-select-field > span {
+  font-size: 10px;
 }
 
 .evolution-workspace-v2 .v2-target-list .soft-select-trigger:hover:not(:disabled) {

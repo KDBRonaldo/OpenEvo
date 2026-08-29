@@ -3113,7 +3113,7 @@ function EvolutionWorkspaceV2({
         {completedTasks.length > evidenceTasks.length ? <Notice tone="warning" title="Some Sessions are unavailable" detail="Their transcript datasets were not sealed. Restart the updated development daemon to repair recoverable legacy Sessions; unavailable entries cannot be selected." /> : null}</div>
       </section> : null}
       <section id="evolution-methods" className="product-panel task-panel evolution-step-section" data-step="02">
-        <div className="panel-heading"><div>{!standaloneAvailable ? <span className="panel-kicker">Verified remote registry</span> : null}<h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
+        <div className="panel-heading"><div>{!standaloneAvailable ? <span className="panel-kicker">Verified remote registry</span> : null}<h2>Evolution targets</h2></div></div>
         <div className="evolution-section-body evolution-methods-body">{capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
           const methodId = current.method ?? target.effective_default_method_id ?? "";
