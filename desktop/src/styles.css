@@ -221,22 +221,6 @@ pre.json {
   min-width: 0;
 }
 
-.product-topbar {
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  display: flex;
-  height: 58px;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 18px;
-  padding: 0 22px;
-  border-bottom: 1px solid var(--line);
-  background: rgb(255 255 255 / 96%);
-  backdrop-filter: blur(12px);
-}
-
-.topbar-actions,
 .heading-actions,
 .panel-heading,
 .section-heading,
@@ -253,16 +237,6 @@ pre.json {
 .danger-button {
   display: flex;
   align-items: center;
-}
-
-.topbar-actions {
-  flex-shrink: 0;
-  gap: 9px;
-}
-
-.topbar-primary-action {
-  min-height: 32px;
-  white-space: nowrap;
 }
 
 .icon-button {
@@ -302,7 +276,7 @@ pre.json {
 .product-main {
   width: 100%;
   max-width: 1380px;
-  min-height: calc(100vh - 58px);
+  min-height: 100vh;
   margin: 0 auto;
   padding: 24px 26px 40px;
 }
@@ -4429,10 +4403,6 @@ pre.json {
 }
 
 @media (max-width: 820px) {
-  .product-topbar {
-    position: relative;
-  }
-
   .workspace-heading,
   .system-confirmation,
   .maintenance-row {

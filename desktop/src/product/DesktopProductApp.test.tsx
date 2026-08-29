@@ -791,6 +791,8 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-activitybar")).toBeTruthy();
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
+    expect(document.querySelector(".product-topbar")).toBeNull();
+    expect(document.querySelector("button.activitybar-settings")).toBeTruthy();
     const projectResizer = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize Project pane"]');
     expect(projectResizer).toBeTruthy();
     await act(async () => projectResizer!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
@@ -951,7 +953,12 @@ describe("Desktop v2 product renderer", () => {
     });
     const provider = providerFixture(snapshot);
     root = await render(provider);
-    await click("Add remote workspace");
+    const settings = document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]');
+    expect(settings).toBeTruthy();
+    await act(async () => {
+      settings!.click();
+      await Promise.resolve();
+    });
 
     expect(dialog()?.querySelectorAll(".v2-profile-card")).toHaveLength(1);
     expect(dialog()?.textContent).toContain("connected");

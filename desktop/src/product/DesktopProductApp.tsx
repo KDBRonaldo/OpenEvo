@@ -16,7 +16,6 @@ import {
   FolderUp,
   History,
   LoaderCircle,
-  PanelLeft,
   Play,
   Plus,
   RefreshCw,
@@ -460,9 +459,6 @@ export function DesktopProductApp({
   const displayedProject = snapshot.projects.find(
     (project) => project.project_id === (switchingProjectId ?? snapshot.state.active_project_id),
   ) ?? activeProject;
-  const activeProfile = snapshot.profiles.find(
-    (profile) => profile.profile_id === snapshot.state.active_profile_id,
-  ) ?? null;
   const connectedProfiles = snapshot.profiles.filter(isConnectedProfile);
   const generation = displayedProject?.active_project_head?.generation ?? 0;
   const displayedProjectTasks = displayedProject === null ? [] : snapshot.tasks
@@ -711,21 +707,6 @@ export function DesktopProductApp({
       />
 
       <div className="product-stage">
-        <header className="product-topbar">
-          <div className="topbar-actions">
-            {displayedProject === null && connectedProfiles.length > 0 ? (
-              <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
-                <FolderOpen size={15} /> New project
-              </button>
-            ) : null}
-            {activeProfile && activeProfile.profile_kind === "system_openssh" ? (
-              <button type="button" className="icon-button" aria-label="Remote workspace settings" onClick={() => setConnectionOpen(true)}><PanelLeft size={17} /></button>
-            ) : (
-              <button type="button" className="primary-button topbar-primary-action" onClick={() => setConnectionOpen(true)}><Plus size={16} /> Add remote workspace</button>
-            )}
-          </div>
-        </header>
-
         <main className="product-main">
           {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
           {actionError ? <Notice tone="error" title="Action not completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
