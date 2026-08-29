@@ -1727,24 +1727,34 @@ describe("Desktop v2 product renderer", () => {
     expect(button("Apply to future Sessions").disabled).toBe(true);
   });
 
-  it("does not present background Evolution as a Session submission spinner", async () => {
+  it("uses an active Evolution job for the page heading and Session admission guard", async () => {
     const base = authoritySnapshot();
     const snapshot: DesktopProductSnapshotV2 = {
       ...base,
       runtimePresentation: {
         ...base.runtimePresentation!,
-        evolutionRuns: [{
-          runId: "evolution-run-active",
-          projectId: "project-1",
-          sourceTaskIds: ["task-1"],
-          selections: [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
-          state: "running",
-          artifactIds: [],
-          jobIds: [],
-          error: null,
-          createdAt: NOW,
-          updatedAt: NOW,
-        }],
+        evolutionRuns: [],
+        tasks: {
+          ...base.runtimePresentation!.tasks,
+          "task-1": {
+            ...base.runtimePresentation!.tasks["task-1"]!,
+            evolutionJobs: [{
+              jobId: "evolution-job-active",
+              targetId: "text_memory",
+              methodId: "text_memory_reflector",
+              requestedMethodId: "text_memory_reflector",
+              resolverInputArtifactIds: [],
+              previousArtifactId: null,
+              config: {},
+              state: "running",
+              artifactIds: [],
+              error: null,
+              attempts: [],
+              createdAt: NOW,
+              updatedAt: NOW,
+            }],
+          },
+        },
       },
     };
     const provider = {
@@ -1756,10 +1766,11 @@ describe("Desktop v2 product renderer", () => {
     const blocked = button("Evolution running");
     expect(blocked.disabled).toBe(true);
     expect(blocked.querySelector(".spin")).toBeNull();
+    expect(document.body.textContent).not.toContain("View immutable Project authority");
 
     await click("Evolution");
     expect(document.querySelector(".evolution-workspace-heading h1")?.textContent).toBe(
-      "Evolution is running",
+      "Evolution Running",
     );
     expect(document.querySelector(".evolution-heading-running-icon .spin")).toBeTruthy();
     expect(document.body.textContent).toContain("Creating improvements from 1 selected Session.");

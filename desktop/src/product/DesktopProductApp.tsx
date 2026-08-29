@@ -118,6 +118,20 @@ function activeTaskIdV2(projectId: string, tasks: readonly TaskV2[]): string | n
   ))?.task_id ?? null;
 }
 
+function evolutionIsActiveV2(snapshot: DesktopProductSnapshotV2, projectId?: string): boolean {
+  if (snapshot.runtimePresentation?.evolutionRuns?.some((run) => (
+    run.state === "running" && (projectId === undefined || run.projectId === projectId)
+  ))) return true;
+
+  const projectTaskIds = projectId === undefined
+    ? null
+    : new Set(snapshot.tasks.filter((task) => task.project_id === projectId).map((task) => task.task_id));
+  return Object.entries(snapshot.runtimePresentation?.tasks ?? {}).some(([taskId, presentation]) => (
+    (projectTaskIds === null || projectTaskIds.has(taskId))
+      && presentation.evolutionJobs?.some((job) => job.state === "queued" || job.state === "running") === true
+  ));
+}
+
 function taskStateLabelV2(state: TaskV2["state"]): string {
   const labels: Record<TaskV2["state"], string> = {
     admitted: "Admitted",
@@ -476,9 +490,7 @@ export function DesktopProductApp({
   const mutationIntents = provider.listMutationIntents();
   const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
   const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
-  const developmentEvolutionActive = developmentAgentBridge && (
-    snapshot.runtimePresentation?.evolutionRuns?.some((run) => run.state === "running") === true
-  );
+  const developmentEvolutionActive = developmentAgentBridge && evolutionIsActiveV2(snapshot);
   const sessionEvolutionAvailable = !developmentAgentBridge && (
     displayedProject !== null && snapshot.capability?.project_id === displayedProject.project_id
   );
@@ -2193,7 +2205,6 @@ function ResearchWorkspaceV2({
           </form>
         </div>
       </div>
-      {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable Project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );
 }
@@ -2346,19 +2357,6 @@ function saveBrowserDownload(data: Blob, fileName: string): void {
   link.click();
   link.remove();
   globalThis.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-function AuthorityCardsV2({ project }: { readonly project: ProjectV2 }) {
-  const head = project.active_project_head!;
-  return (
-    <section className="v2-authority-grid" aria-label="Active immutable authority">
-      <IdentityCard title="Project Head" id={head.project_head_id} detail={`Generation ${head.generation}`} digest={head.manifest_sha256} />
-      <IdentityCard title="Evolution Revision" id={head.evolution_revision.evolution_revision_id} detail={`${head.evolution_revision.artifact_count} artifacts`} digest={head.evolution_revision.manifest_sha256} />
-      <IdentityCard title="Runtime Context Snapshot" id={head.runtime_context_snapshot.runtime_context_snapshot_id} detail="Materialized next-session context" digest={head.runtime_context_snapshot.manifest_sha256} />
-      <IdentityCard title="Effective Execution Snapshot" id={head.effective_execution_snapshot.effective_execution_snapshot_id} detail={`Producer ${head.effective_execution_snapshot.producer_id}`} digest={head.effective_execution_snapshot.snapshot_sha256} />
-      <IdentityCard title="Workspace Snapshot" id={head.workspace_snapshot.workspace_snapshot_id} detail={`${head.workspace_snapshot.entry_count} entries`} digest={head.workspace_snapshot.manifest_sha256} />
-    </section>
-  );
 }
 
 function TaskHistoryTableV2({ tasks, presentation, selectedTaskId, transitions, onOpenTask }: {
@@ -2980,7 +2978,20 @@ function EvolutionWorkspaceV2({
     .reverse();
   const newestRun = runs[0];
   const runningRun = runs.find((run) => run.state === "running");
-  const evolutionRunning = runningRun !== undefined;
+  const projectedEvolutionRunning = evolutionIsActiveV2(snapshot, project.project_id);
+  const runningJobTaskCount = snapshot.tasks.filter((task) => (
+    task.project_id === project.project_id
+      && snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionJobs?.some(
+        (job) => job.state === "queued" || job.state === "running",
+      ) === true
+  )).length;
+  const runningSourceCount = runningRun?.sourceTaskIds.length
+    ?? (runningJobTaskCount || selectedTaskIds.length);
+  const [runStarting, setRunStarting] = useState(false);
+  const evolutionRunning = runStarting || projectedEvolutionRunning;
+  useEffect(() => {
+    if (!busy && !projectedEvolutionRunning) setRunStarting(false);
+  }, [busy, projectedEvolutionRunning]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [resultView, setResultView] = useState<"history" | "detail">("detail");
   useEffect(() => {
@@ -3062,9 +3073,9 @@ function EvolutionWorkspaceV2({
         <div>
           <div className="evolution-heading-title">
             {evolutionRunning ? <span className="evolution-heading-running-icon" aria-hidden="true"><LoaderCircle className="spin" size={22} /></span> : null}
-            <h1>{evolutionRunning ? "Evolution is running" : "Improve future Sessions"}</h1>
+            <h1>{evolutionRunning ? "Evolution Running" : "Improve future Sessions"}</h1>
           </div>
-          <p>{evolutionRunning ? `Creating improvements from ${runningRun.sourceTaskIds.length} selected Session${runningRun.sourceTaskIds.length === 1 ? "" : "s"}.` : "Select completed Sessions to create improvements. Review the result, then apply it to new Sessions."}</p>
+          <p>{evolutionRunning ? `Creating improvements from ${runningSourceCount} selected Session${runningSourceCount === 1 ? "" : "s"}.` : "Select completed Sessions to create improvements. Review the result, then apply it to new Sessions."}</p>
         </div>
         {project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Currently applied</small><strong>Version {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by new Sessions</em></span></div> : null}
       </div>
@@ -3108,7 +3119,7 @@ function EvolutionWorkspaceV2({
             setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: true, method: nextMethodId, config: defaultConfig } }));
           }} /></div>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This target has no method accepted by the active registry.</p> : null}</article>;
         })}</div>}
-        <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => onStartRun(selectedTaskIds, enabledSelections)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div></div>
+        <div className="v2-primary-row">{standaloneAvailable ? <button type="button" className="primary-button" disabled={busy || snapshot.capability === null || selectedTaskIds.length === 0 || enabledSelections.length === 0} onClick={() => { setRunStarting(true); onStartRun(selectedTaskIds, enabledSelections); }}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />} Run Evolution</button> : <button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button>}</div></div>
       </section>
       {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section">
         {resultView === "history" ? <>
@@ -3171,10 +3182,6 @@ function EvolutionArtifactBrowserV2({ artifacts, presentation, provider }: {
   const selected = artifacts.find((artifact) => artifact.artifact_id === selectedId) ?? null;
   const preview = selectedId === null ? undefined : presentation?.[selectedId];
   return <section className="v2-evolution-results">{artifacts.length === 0 ? <div className="empty-row">No textual evolution artifacts have been published for this project yet.</div> : <div className="artifact-layout"><aside className="artifact-list" aria-label="Evolution artifacts"><div className="artifact-list-heading"><span>Evolution results</span><strong>{artifacts.length} selected</strong></div>{artifacts.map((artifact) => { const item = presentation?.[artifact.artifact_id]; return <button type="button" key={artifact.artifact_id} className={`artifact-list-item ${artifact.artifact_id === selectedId ? "active" : ""}`} aria-pressed={artifact.artifact_id === selectedId} onClick={() => { setSelectedId(artifact.artifact_id); setView("content"); }}><span className={`artifact-icon ${artifact.artifact_type}`}><Sparkles size={15} /></span><span><strong>{item?.title ?? artifactTypeLabel(artifact.artifact_type)}</strong><small>{item?.statusDetail ?? `${artifactTypeLabel(artifact.artifact_type)} · ${formatTimeV2(artifact.created_at)}`}</small></span><ArrowRight size={14} /></button>; })}</aside>{selected ? <section className="artifact-viewer"><div className="artifact-viewer-head"><div><span className="panel-kicker">{artifactTypeLabel(selected.artifact_type)}</span><h2>{preview?.title ?? selected.artifact_id}</h2><p>{preview?.statusDetail ?? "The authoritative artifact metadata is available; readable content is not exposed by the current contract."}</p></div><div className="artifact-meta"><span>{artifactStatusLabel(preview?.status ?? "unavailable")}</span><span>{formatBytes(metadata?.byteSize ?? selected.byte_size)}</span></div></div><div className="segmented-control" role="tablist" aria-label="Artifact view"><button type="button" role="tab" aria-selected={view === "content"} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button><button type="button" role="tab" aria-selected={view === "changes"} className={view === "changes" ? "active" : ""} onClick={() => setView("changes")}><History size={14} /> Changes</button></div><div className="v2-artifact-facts"><span><small>Source Task</small><strong>{preview?.sourceTaskId ?? "Not reported"}</strong></span><span><small>Target path</small><strong>{preview?.targetPath ?? "Not applicable"}</strong></span><span><small>Digest</small><code>{shortDigest(selected.manifest_sha256)}</code></span></div>{metadataError && preview === undefined ? <Notice tone="warning" title="Readable content unavailable" detail={metadataError} /> : null}<div className="artifact-body">{view === "content" ? <div className="v2-artifact-documents">{preview?.documents.length ? preview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>{metadata?.mediaType ?? "text/markdown"}</small></div><pre>{document.content}</pre></section>) : <p className="v2-empty-copy">No readable document body is available for this artifact.</p>}</div> : <div className="v2-artifact-diff"><div className="v2-diff-summary"><span>Compared with <strong>{preview?.previousArtifactId ?? "no previous version"}</strong></span><span>{metadata?.diffStatus ?? (preview?.diffLines.length ? "available" : "unavailable")}</span></div>{preview?.diffLines.length ? <pre>{preview.diffLines.map((line, index) => <span key={`${line.kind}-${index}`} className={line.kind}>{line.kind === "added" ? "+ " : line.kind === "removed" ? "− " : "  "}{line.text}</span>)}</pre> : <p className="v2-empty-copy">No textual change preview is available.</p>}</div>}</div></section> : null}</div>}</section>;
-}
-
-function IdentityCard({ title, id, detail, digest }: { readonly title: string; readonly id: string; readonly detail: string; readonly digest: string }) {
-  return <article className="v2-identity-card"><span>{title}</span><strong>{id}</strong><small>{detail}</small><code>{shortDigest(digest)}</code></article>;
 }
 
 function WorkspaceButton({ active, onClick, icon: Icon, children }: { readonly active: boolean; readonly onClick: () => void; readonly icon: typeof BookOpen; readonly children: string }) {
