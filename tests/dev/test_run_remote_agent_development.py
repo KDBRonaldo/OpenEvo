@@ -580,6 +580,30 @@ def test_remote_capture_reports_its_deadline(
         )
 
 
+def test_remote_script_transport_uses_lf_bytes_on_every_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        observed["args"] = args
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout=b"ready\n", stderr=b"")
+
+    monkeypatch.setattr(remote_launcher.subprocess, "run", run)
+    connection = remote_launcher.SshConnection((), "server", "server")
+
+    output = remote_launcher._run_remote_capture(
+        "ssh",
+        connection,
+        "set -eu\r\nprintf 'ready\\n'\r\n",
+    )
+
+    assert output == "ready\n"
+    assert observed["input"] == b"set -eu\nprintf 'ready\\n'\n"
+    assert "text" not in observed
+
+
 def test_remote_script_can_only_install_source_without_starting_services() -> None:
     script = remote_launcher.build_remote_script(
         branch="stable",

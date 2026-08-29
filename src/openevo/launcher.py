@@ -1438,6 +1438,11 @@ def _run_remote_capture(
     *,
     timeout: int = REMOTE_COMMAND_TIMEOUT_SECONDS,
 ) -> str:
+    # ``text=True`` writes through ``TextIOWrapper`` and translates ``\n`` to
+    # ``\r\n`` on Windows.  Those carriage returns reach the remote POSIX
+    # shell verbatim (for example as ``set -eu\r``), which dash then rejects.
+    # Send normalized bytes so the SSH transport is identical on every host.
+    script_bytes = script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     try:
         completed = subprocess.run(
             [
@@ -1448,8 +1453,7 @@ def _run_remote_capture(
                 "sh",
                 "-s",
             ],
-            input=script,
-            text=True,
+            input=script_bytes,
             check=False,
             capture_output=True,
             timeout=timeout,
@@ -1458,13 +1462,16 @@ def _run_remote_capture(
         raise LauncherError(f"remote SSH command exceeded {timeout} seconds") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
         raise LauncherError(
             f"remote command failed with exit code {completed.returncode}: {detail}"
         )
-    return completed.stdout
+    return completed.stdout.decode("utf-8", errors="strict")
 
 
 def _run_remote(ssh_binary: str, connection: SshConnection, script: str) -> None:
+    script_bytes = script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     try:
         completed = subprocess.run(
             [
@@ -1475,8 +1482,7 @@ def _run_remote(ssh_binary: str, connection: SshConnection, script: str) -> None
                 "sh",
                 "-s",
             ],
-            input=script,
-            text=True,
+            input=script_bytes,
             check=False,
             timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
         )
