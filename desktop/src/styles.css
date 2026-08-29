@@ -8087,10 +8087,8 @@ pre.json {
   overflow: hidden;
   border: 0;
   border-radius: 16px;
-  background:
-    radial-gradient(280px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 8%), transparent 58%),
-    linear-gradient(145deg, rgb(255 255 255 / 76%), rgb(241 248 245 / 64%));
-  box-shadow: 0 8px 24px rgb(20 60 50 / 4%), inset 0 1px 0 rgb(255 255 255 / 75%);
+  background: linear-gradient(145deg, rgb(255 255 255 / 88%), rgb(246 249 247 / 78%));
+  box-shadow: 0 6px 18px rgb(20 60 50 / 3%), inset 0 1px 0 rgb(255 255 255 / 78%);
   transition: transform 180ms ease, box-shadow 180ms ease, filter 180ms ease;
 }
 
@@ -8110,17 +8108,17 @@ pre.json {
 .evolution-workspace-v2 .session-evolution-options article:hover {
   z-index: 1;
   background:
-    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 58%),
-    linear-gradient(145deg, rgb(255 255 255 / 90%), rgb(238 248 244 / 76%));
-  box-shadow: 0 16px 36px rgb(22 74 62 / 9%), inset 0 1px 0 white;
-  transform: translateY(-2px);
+    radial-gradient(280px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 142 124 / 6%), transparent 62%),
+    linear-gradient(145deg, rgb(255 255 255 / 94%), rgb(243 248 245 / 84%));
+  box-shadow: 0 10px 24px rgb(22 74 62 / 6%), inset 0 1px 0 white;
+  transform: translateY(-1px);
 }
 
 .evolution-workspace-v2 .session-evolution-options article.selected {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 62%),
-    linear-gradient(135deg, rgb(237 249 245 / 82%), rgb(242 244 253 / 70%));
-  box-shadow: 0 12px 30px rgb(31 117 98 / 8%), inset 2px 0 0 rgb(52 166 141 / 42%), inset 0 1px 0 white;
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(62 139 121 / 6%), transparent 64%),
+    linear-gradient(135deg, rgb(239 247 244 / 88%), rgb(247 249 248 / 86%));
+  box-shadow: 0 8px 22px rgb(31 99 84 / 5%), inset 2px 0 0 rgb(51 126 108 / 48%), inset 0 1px 0 white;
 }
 
 .evolution-workspace-v2 .session-evolution-options article.selected::before {
@@ -8172,10 +8170,10 @@ pre.json {
 }
 
 .evolution-workspace-v2 .session-evolution-options input:checked {
-  border-color: #30967f;
-  background: linear-gradient(145deg, #42b8a2, #287e6b);
-  box-shadow: 0 0 0 4px rgb(66 184 162 / 11%), 0 0 18px rgb(48 150 127 / 24%);
-  transform: scale(1.03);
+  border-color: #397f70;
+  background: #397f70;
+  box-shadow: 0 0 0 3px rgb(57 127 112 / 9%);
+  transform: none;
 }
 
 .evolution-workspace-v2 .session-evolution-options strong {
@@ -8197,8 +8195,8 @@ pre.json {
   padding: 5px 7px;
   border: 1px solid rgb(48 148 126 / 12%);
   border-radius: 999px;
-  color: #4e796e;
-  background: rgb(238 249 246 / 70%);
+  color: #60736c;
+  background: rgb(246 249 247 / 78%);
   font-size: 8px;
   font-style: normal;
   font-weight: 700;
@@ -8207,8 +8205,8 @@ pre.json {
 }
 
 .evolution-workspace-v2 .session-evolution-options em svg {
-  color: #39a68f;
-  filter: drop-shadow(0 0 4px rgb(57 166 143 / 46%));
+  color: #568678;
+  filter: none;
 }
 
 .evolution-workspace-v2 .v2-target-list {
@@ -8245,10 +8243,8 @@ pre.json {
   overflow: visible;
   border: 0;
   border-radius: 17px;
-  background:
-    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(104 117 232 / 5%), transparent 58%),
-    linear-gradient(145deg, rgb(255 255 255 / 78%), rgb(241 247 245 / 66%));
-  box-shadow: 0 10px 28px rgb(19 57 48 / 4%), inset 0 1px 0 rgb(255 255 255 / 78%);
+  background: linear-gradient(145deg, rgb(255 255 255 / 88%), rgb(246 249 247 / 80%));
+  box-shadow: 0 7px 20px rgb(19 57 48 / 3.5%), inset 0 1px 0 rgb(255 255 255 / 80%);
   transition: transform 190ms ease, box-shadow 190ms ease, background 190ms ease;
 }
 
@@ -8267,17 +8263,17 @@ pre.json {
 
 .evolution-workspace-v2 .v2-target-list > article:hover {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 13%), transparent 58%),
-    linear-gradient(145deg, rgb(255 255 255 / 91%), rgb(238 248 244 / 76%));
-  box-shadow: 0 18px 40px rgb(19 72 59 / 9%), inset 0 1px 0 white;
-  transform: translateY(-3px);
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 142 124 / 6%), transparent 62%),
+    linear-gradient(145deg, rgb(255 255 255 / 94%), rgb(243 248 245 / 86%));
+  box-shadow: 0 11px 26px rgb(19 72 59 / 6%), inset 0 1px 0 white;
+  transform: translateY(-1px);
 }
 
 .evolution-workspace-v2 .v2-target-list > article.enabled {
   background:
-    radial-gradient(320px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(66 184 170 / 14%), transparent 60%),
-    linear-gradient(135deg, rgb(237 249 245 / 84%), rgb(242 244 253 / 72%));
-  box-shadow: 0 15px 36px rgb(30 111 93 / 8%), inset 2px 0 0 rgb(52 166 141 / 38%), inset 0 1px 0 white;
+    radial-gradient(300px circle at var(--evolution-pointer-x) var(--evolution-pointer-y), rgb(62 139 121 / 6%), transparent 64%),
+    linear-gradient(135deg, rgb(239 247 244 / 90%), rgb(247 249 248 / 88%));
+  box-shadow: 0 9px 24px rgb(30 100 85 / 5%), inset 2px 0 0 rgb(51 126 108 / 44%), inset 0 1px 0 white;
 }
 
 .evolution-workspace-v2 .v2-target-toggle {
@@ -8297,15 +8293,16 @@ pre.json {
   border: 1px solid rgb(48 145 124 / 15%);
   border-radius: 13px;
   color: #398d7b;
-  background: linear-gradient(145deg, #f6fcfa, #e8f4f1);
-  box-shadow: inset 0 1px 0 white, 0 8px 18px rgb(31 107 91 / 7%);
+  background: #f1f6f4;
+  box-shadow: inset 0 1px 0 white, 0 5px 12px rgb(31 107 91 / 4%);
   transition: color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
 }
 
 .evolution-workspace-v2 .v2-target-list > article.enabled .evolution-target-glyph {
   color: #237d69;
-  box-shadow: inset 0 1px 0 white, 0 0 22px rgb(49 159 135 / 17%);
-  transform: translateY(-1px);
+  background: #eaf3ef;
+  box-shadow: inset 0 1px 0 white;
+  transform: none;
 }
 
 .evolution-workspace-v2 .v2-target-toggle > input {
@@ -8332,9 +8329,9 @@ pre.json {
 }
 
 .evolution-workspace-v2 .v2-target-toggle input:checked {
-  border-color: #2f9a82;
-  background: linear-gradient(90deg, #31927c, #46b9a3);
-  box-shadow: 0 0 0 4px rgb(66 184 163 / 10%), 0 0 18px rgb(49 154 130 / 18%);
+  border-color: #397f70;
+  background: #397f70;
+  box-shadow: 0 0 0 3px rgb(57 127 112 / 8%);
 }
 
 .evolution-workspace-v2 .v2-target-list > article > .soft-select-field {
@@ -8377,15 +8374,16 @@ pre.json {
   overflow: hidden;
   border: 1px solid rgb(26 100 84 / 28%);
   border-radius: 11px;
-  background: linear-gradient(105deg, #236d5d, #319680 52%, #5664b7);
-  box-shadow: 0 10px 22px rgb(30 111 93 / 20%), inset 0 1px 0 rgb(255 255 255 / 22%);
+  background: #397566;
+  box-shadow: 0 7px 16px rgb(30 91 77 / 14%), inset 0 1px 0 rgb(255 255 255 / 16%);
   transition: transform 180ms ease, box-shadow 180ms ease, filter 180ms ease;
 }
 
 .evolution-workspace-v2 .v2-primary-row .primary-button:hover:not(:disabled),
 .evolution-workspace-v2 .v2-evolution-apply-bar .primary-button:hover:not(:disabled) {
-  box-shadow: 0 14px 30px rgb(30 111 93 / 27%), 0 0 24px rgb(66 184 163 / 14%);
-  filter: saturate(1.08);
+  background: #306859;
+  box-shadow: 0 9px 20px rgb(30 91 77 / 18%);
+  filter: none;
   transform: translateY(-1px);
 }
 
