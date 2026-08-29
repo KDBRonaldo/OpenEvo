@@ -1875,7 +1875,7 @@ function StartingSessionChatV2({
       <div className="session-detail-navigation">
         <span className="session-starting-label">Starting a new Session in {project.display_name} · Project Head {session.projectHeadGeneration}</span>
       </div>
-      <article className="product-panel v2-starting-session-card">
+      <article className="v2-starting-session-card">
         <section className="v2-conversation-section session-chat-canvas" aria-label="Starting Session conversation">
           <div className="v2-transcript">
             <article className="user" aria-label="You"><span aria-hidden="true">You</span><p>{session.task.objective}</p></article>

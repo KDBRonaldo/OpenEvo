@@ -1452,6 +1452,8 @@ describe("Desktop v2 product renderer", () => {
 
     expect(document.querySelector('[data-testid="starting-session-workspace"]')).toBeTruthy();
     expect(document.querySelector('[data-testid="research-workspace"]')).toBeNull();
+    expect(document.querySelector('[data-testid="starting-session-workspace"] .product-panel')).toBeNull();
+    expect(document.querySelector('[data-testid="starting-session-workspace"] .v2-starting-session-card')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
     expect(document.body.textContent).toContain("Starting Session");
 

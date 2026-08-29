@@ -4753,10 +4753,16 @@ pre.json {
   margin: 0 auto;
 }
 
+.product-v2-shell .product-main:has(> .session-detail-workspace) {
+  max-width: none;
+  padding: 18px 0 0;
+}
+
 .session-detail-navigation {
   display: flex;
   align-items: center;
   min-height: 36px;
+  padding: 0 28px;
 }
 
 .session-back-button {
@@ -4788,10 +4794,14 @@ pre.json {
 
 .v2-starting-session-card {
   display: flex;
-  min-height: min(720px, calc(100dvh - 132px));
+  min-height: calc(100dvh - 54px);
   flex-direction: column;
   overflow: hidden;
   padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 .v2-starting-session-card .session-chat-canvas {
