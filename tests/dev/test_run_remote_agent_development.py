@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import shutil
 import socket
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -376,6 +378,35 @@ def test_tunnel_enables_keepalive_so_dead_forwarding_does_not_hang(
     assert "ServerAliveInterval=10" in command
     assert "ServerAliveCountMax=3" in command
     assert "TCPKeepAlive=yes" in command
+
+
+def test_local_webui_health_check_never_uses_environment_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WebUiHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body = b"<!doctype html><title>OpenEvo</title>"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), WebUiHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    try:
+        remote_launcher._wait_for_local_webui(server.server_address[1])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.parametrize(

@@ -61,9 +61,11 @@ SOURCE_ACTIONS = frozenset({"auto", "install", "update", "start"})
 SSH_CONNECT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 600
 SOURCE_TRANSFER_TIMEOUT_SECONDS = 180
+LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS = 3
 SSH_CONFIG_MAX_INCLUDE_DEPTH = 8
 SSH_CONFIG_MAX_FILES = 64
 LAUNCHER_PREFERENCES_SCHEMA_VERSION = 1
+_LOOPBACK_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class LauncherError(RuntimeError):
@@ -1522,7 +1524,9 @@ def _wait_for_local_health(local_port: int, token: str) -> None:
     last_error = "no response"
     for _ in range(30):
         try:
-            with urllib.request.urlopen(request, timeout=1) as response:
+            with _LOOPBACK_URL_OPENER.open(
+                request, timeout=LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS
+            ) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             if payload == {"schema_version": "1", "status": "ready"}:
                 return
@@ -1538,7 +1542,9 @@ def _wait_for_local_webui(local_port: int) -> None:
     last_error = "no response"
     for _ in range(50):
         try:
-            with urllib.request.urlopen(url, timeout=1) as response:
+            with _LOOPBACK_URL_OPENER.open(
+                url, timeout=LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS
+            ) as response:
                 body = response.read(4096).decode("utf-8", errors="replace")
             if response.status == 200 and "<title>OpenEvo</title>" in body:
                 return
