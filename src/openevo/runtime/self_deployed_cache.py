@@ -16,6 +16,8 @@ from typing import Protocol
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from openevo import __version__
+
 from .self_deployed import SelfDeployedModelFile, SelfDeployedModelProfile
 
 
@@ -218,7 +220,7 @@ def _download_exact_file(
         headers={
             "Accept": "application/octet-stream",
             "Accept-Encoding": "identity",
-            "User-Agent": "OpenEvo/0.1.10",
+            "User-Agent": f"EvoLab/{__version__}",
         },
     )
     response: _HttpResponse | None = None

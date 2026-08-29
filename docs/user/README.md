@@ -1,4 +1,4 @@
-# OpenEvo self-hosted WebUI
+# EvoLab self-hosted WebUI
 
 This branch provides a repository-free launcher candidate. It does not restore
 the old DMG or packaged Tauri Desktop application.
@@ -8,32 +8,37 @@ the old DMG or packaged Tauri Desktop application.
 Requirements on the user's computer:
 
 - Python 3.11 or newer;
-- POSIX `sh` and `tar`;
+- POSIX `sh` and `tar`, or Windows PowerShell;
 - system OpenSSH (`ssh`);
 - a literal host alias in `~/.ssh/config`.
 
 Install the latest published version:
 
 ```bash
-curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh | sh
-~/.local/bin/openevo webui
+curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.sh \
+  | sh -s -- --version v0.2.0
+~/.local/bin/evolab webui
 ```
 
 The online installer verifies the archive against the separately published
-SHA-256 file before installation. An exact version can be selected with
-`sh -s -- --version v0.1.10`.
+SHA-256 file before installation. On Windows, run:
 
-For an offline installation, download `openevo-launcher.tar.gz` and its
+```powershell
+irm https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.ps1 | iex
+evolab webui
+```
+
+For an offline installation, download `evolab-launcher.tar.gz` and its
 `.sha256` file from the same GitHub Release, verify it, then run:
 
 ```bash
-sha256sum --check openevo-launcher.tar.gz.sha256
-tar -xzf openevo-launcher.tar.gz
-sh openevo-launcher/install.sh
-~/.local/bin/openevo webui
+sha256sum --check evolab-launcher.tar.gz.sha256
+tar -xzf evolab-launcher.tar.gz
+sh evolab-launcher/install.sh
+~/.local/bin/evolab webui
 ```
 
-Add `~/.local/bin` to `PATH` to use `openevo webui` directly. The archive
+Add `~/.local/bin` to `PATH` to use `evolab webui` directly. The archive
 already contains the matching server Release Bundle. Git, uv, Node/npm, and an
 OpenEvo checkout are not required on the user's computer.
 
@@ -51,7 +56,7 @@ Host openevo-lab
 Then run:
 
 ```bash
-openevo webui
+evolab webui
 ```
 
 The launcher discovers concrete aliases from the SSH config (including common

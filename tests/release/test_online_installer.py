@@ -26,9 +26,9 @@ def published_release(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, s
     root = tmp_path_factory.mktemp("online-installer-release")
     download_root = root / "releases" / "latest" / "download"
     download_root.mkdir(parents=True)
-    archive = download_root / "openevo-launcher.tar.gz"
+    archive = download_root / "evolab-launcher.tar.gz"
     receipt = build_launcher_distribution(REPOSITORY_ROOT, archive)
-    (download_root / "openevo-launcher.tar.gz.sha256").write_text(
+    (download_root / "evolab-launcher.tar.gz.sha256").write_text(
         f"{receipt.sha256}  {archive.name}\n",
         encoding="utf-8",
     )
@@ -76,6 +76,7 @@ def test_online_installer_downloads_verifies_and_installs_without_repository(
 
     assert result.returncode == 0, result.stderr
     assert (prefix / "bin" / "openevo").is_file()
+    assert (prefix / "bin" / "evolab").is_file()
     assert (
         prefix / "share" / "openevo" / "active-launcher-v1"
     ).read_text(encoding="utf-8").strip() == distribution_id
@@ -107,7 +108,7 @@ def test_online_installer_rejects_archive_that_does_not_match_checksum(
         / "releases"
         / "latest"
         / "download"
-        / "openevo-launcher.tar.gz"
+        / "evolab-launcher.tar.gz"
     )
     with archive.open("ab") as output:
         output.write(b"tampered")

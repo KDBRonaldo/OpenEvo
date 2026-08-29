@@ -71,7 +71,7 @@ def development_registry_snapshot() -> Any:
 
     identity = ImplementationDistributionIdentity(
         distribution="openevo",
-        distribution_version="0.1.10.dev0",
+        distribution_version="0.2.0.dev0",
         distribution_digest=hashlib.sha256(b"openevo-development-catalog-v1").hexdigest(),
     )
     return build_builtin_registry(identity)

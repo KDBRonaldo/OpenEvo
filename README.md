@@ -1,6 +1,6 @@
-# OpenEvo
+# EvoLab
 
-OpenEvo is being rebuilt as a self-hosted WebUI for running a real agent on a
+EvoLab is a self-hosted WebUI for running a real agent on a
 remote Linux workspace and evolving reusable context between sessions.
 
 The current product path is intentionally small:
@@ -16,36 +16,40 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Install without the repository
 
-The ordinary-user release is installed and integrity-checked with one command:
+The current installable pre-release is `v0.2.0`. On Linux, macOS, or WSL:
 
 ```bash
-curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh | sh
-~/.local/bin/openevo webui
+curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.sh \
+  | sh -s -- --version v0.2.0
+~/.local/bin/evolab webui
 ```
 
-The bootstrap downloads `openevo-launcher.tar.gz` and its published SHA-256
-file before running the archive's own verified installer. To install an exact
-release, pass `--version`, for example:
+On Windows PowerShell:
 
-```bash
-curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/latest/download/install.sh \
-  | sh -s -- --version v0.1.10
+```powershell
+irm https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.ps1 | iex
+evolab webui
 ```
 
-A maintainer can still build the same archive locally from an exact commit:
+Both bootstraps verify the downloaded archive against its published SHA-256
+file before installation. The release preserves `openevo webui` as a
+compatibility command. A maintainer can build both deterministic archives from
+an exact commit:
 
 ```bash
 uv run python scripts/release/build_launcher_distribution.py \
-  --output dist/openevo-launcher.tar.gz
+  --output dist/evolab-launcher.tar.gz
+uv run python scripts/release/build_launcher_distribution.py \
+  --output dist/evolab-launcher.zip
 ```
 
 The user only needs Python 3.11+, POSIX `sh`/`tar`, system OpenSSH, and a
 configured SSH host:
 
 ```bash
-tar -xzf openevo-launcher.tar.gz
-sh openevo-launcher/install.sh
-~/.local/bin/openevo webui
+tar -xzf evolab-launcher.tar.gz
+sh evolab-launcher/install.sh
+~/.local/bin/evolab webui
 ```
 
 The archive contains a standard-library Python launcher and the matching
@@ -53,12 +57,14 @@ server Release Bundle. The user's computer does not need the OpenEvo source
 tree, Git, uv, Node, or npm. Reinstalling the same archive is idempotent; a
 newer archive installs beside the previous version and atomically changes the
 active launcher receipt. The installer refuses to overwrite an unrelated
-`openevo` command.
+`evolab` or legacy `openevo` command.
 
 Pushing a tag that exactly matches `v<pyproject version>` runs the launcher
 release workflow. It verifies the committed WebUI and release tests, then
-publishes `install.sh`, `openevo-launcher.tar.gz`, and
-`openevo-launcher.tar.gz.sha256` as immutable GitHub Release assets.
+publishes the PowerShell and POSIX bootstraps plus `evolab-launcher.zip` and
+`evolab-launcher.tar.gz` with SHA-256 files as immutable GitHub Pre-release
+assets. The Windows archive is installed and smoke-tested on a clean Windows
+runner before publication.
 
 ## Run the working remote WebUI
 

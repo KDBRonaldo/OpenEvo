@@ -267,7 +267,7 @@ def test_status_runs_without_checkout_validation_or_token_rotation(
 
     assert result == 0
     assert captured["ssh_binary"] == "ssh"
-    assert "OpenEvo remote development stack" in str(captured["script"])
+    assert "EvoLab remote development stack" in str(captured["script"])
 
 
 def test_port_preflight_rejects_an_existing_launcher_before_deployment() -> None:
@@ -454,7 +454,7 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
     assert 'git -C "$source_root" remote remove origin' in script
     assert "refusing to run non-committed source" in script
     assert script.index("status --porcelain") < script.index(
-        "Installed OpenEvo source already matches"
+        "Installed EvoLab source already matches"
     )
     assert "fetch origin" not in script
     assert "github.com" not in script

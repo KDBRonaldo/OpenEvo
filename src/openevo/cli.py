@@ -1,4 +1,4 @@
-"""Ordinary-user OpenEvo command entry point."""
+"""Ordinary-user EvoLab command entry point."""
 
 from __future__ import annotations
 
@@ -10,14 +10,14 @@ from openevo.launcher import command_main as launcher_main
 
 def _root_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="openevo",
-        description="Connect to and operate a self-hosted OpenEvo deployment.",
+        prog="evolab",
+        description="Connect to and operate a self-hosted EvoLab deployment.",
     )
     parser.add_argument(
         "command",
         nargs="?",
         choices=("webui",),
-        help="webui: install/connect through SSH and open the OpenEvo WebUI",
+        help="webui: install/connect through SSH and open the EvoLab WebUI",
     )
     return parser
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, connect to, and operate a self-hosted OpenEvo WebUI over SSH."""
+"""Install, connect to, and operate a self-hosted EvoLab WebUI over SSH."""
 
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ _LOOPBACK_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({
 
 
 class LauncherError(RuntimeError):
-    """A user-actionable OpenEvo launcher failure."""
+    """A user-actionable EvoLab launcher failure."""
 
 
 @dataclass(frozen=True)
@@ -130,7 +130,7 @@ def ensure_local_ports_available(ports: list[int]) -> None:
         rendered = ", ".join(str(port) for port in unavailable)
         raise LauncherError(
             f"local development port(s) already in use: {rendered}. "
-            "Another OpenEvo launcher may still be running. Keep using that launcher, "
+            "Another EvoLab launcher may still be running. Keep using that launcher, "
             "or stop it before starting a replacement. The remote daemon was not changed."
         )
 
@@ -300,7 +300,7 @@ def save_last_ssh_alias(alias: str, preferences_path: Path | None = None) -> Non
         finally:
             temporary.unlink(missing_ok=True)
     except OSError as exc:
-        raise LauncherError(f"could not save OpenEvo launcher preferences: {exc}") from exc
+        raise LauncherError(f"could not save EvoLab launcher preferences: {exc}") from exc
 
 
 def select_ssh_alias(
@@ -406,7 +406,7 @@ def validate_branch(value: str) -> str:
         or branch.endswith(("/", "."))
         or branch.startswith("-")
     ):
-        raise LauncherError("Git branch name is not accepted by the OpenEvo launcher")
+        raise LauncherError("Git branch name is not accepted by the EvoLab launcher")
     return branch
 
 
@@ -517,7 +517,7 @@ def probe_remote_source_commit(
             return commit
     if result == "unrecognized":
         raise LauncherError(
-            "remote source path exists but is not owned by the OpenEvo launcher"
+            "remote source path exists but is not owned by the EvoLab launcher"
         )
     raise LauncherError(f"remote source probe returned an invalid result: {result!r}")
 
@@ -733,7 +733,7 @@ if [ ! -e "$release_root" ]; then
   fi
 fi
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3 is required to install the OpenEvo release." >&2
+  echo "Python 3 is required to install the EvoLab release." >&2
   exit 54
 fi
 
@@ -885,7 +885,7 @@ marker_tmp="$active_marker.tmp.$$"
 printf '%s\n' "$release_id" > "$marker_tmp"
 mv "$marker_tmp" "$active_marker"
 rm -f "$archive"
-echo "OpenEvo release $expected_version ($release_id) is installed and verified."
+echo "EvoLab release $expected_version ($release_id) is installed and verified."
 """
 
 
@@ -954,7 +954,7 @@ process_status() {{
 
     if action == "status":
         return common + """
-printf 'OpenEvo remote development stack\\n'
+printf 'EvoLab remote development stack\\n'
 printf 'state: %s\\n' "$state_root"
 process_status "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "$daemon_log_file" "scripts/dev/live_agent_daemon.py"
 process_status "web-layer" "$web_pid_file" "openevo.web_gateway.product_app" "$web_log_file" "scripts/dev/development_agent_web_layer.py"
@@ -966,7 +966,7 @@ fi
 
     if action == "logs":
         return common + f"""
-printf 'OpenEvo remote development logs (last {tail_lines} lines each)\\n'
+printf 'EvoLab remote development logs (last {tail_lines} lines each)\\n'
 printf '\\n[daemon] %s\\n' "$daemon_log_file"
 if [ -f "$daemon_log_file" ]; then tail -n {tail_lines} "$daemon_log_file"; else printf 'no daemon log yet\\n'; fi
 printf '\\n[web-layer] %s\\n' "$web_log_file"
@@ -1124,7 +1124,7 @@ if [ "$web_ready" -ne 1 ]; then
   tail -n 40 "$web_log_file" >&2 || true
   exit 30
 fi
-echo "Remote OpenEvo Web Layer is ready on loopback port $remote_web_port."
+echo "Remote EvoLab Web Layer is ready on loopback port $remote_web_port."
 """
     return f"""\
 set -eu
@@ -1157,7 +1157,7 @@ if [ "$delivery_mode" = release ]; then
   active_release="$(cat "$state_root/active-release-v1" 2>/dev/null || true)"
   if [ "$active_release" != "$release_id" ] || [ ! -d "$source_root" ] || \
      [ ! -f "$state_root/releases/$release_id/manifest.json" ]; then
-    echo "Requested OpenEvo release is not installed and active." >&2
+    echo "Requested EvoLab release is not installed and active." >&2
     exit 50
   fi
   deployed_commit="$expected_commit"
@@ -1176,7 +1176,7 @@ if [ -e "$source_root" ]; then
 fi
 
 if [ "$installed_commit" = "$expected_commit" ]; then
-  echo "[remote 1/4] Installed OpenEvo source already matches $expected_commit; skipping update."
+  echo "[remote 1/4] Installed EvoLab source already matches $expected_commit; skipping update."
 elif [ -z "$source_bundle_sha256" ]; then
   echo "Installed source does not match $expected_commit and no local source bundle was uploaded." >&2
   exit 26
@@ -1203,7 +1203,7 @@ else
     git -C "$verify_root" bundle verify "$source_bundle" >/dev/null
   fi
   if [ ! -e "$source_root" ]; then
-    echo "[remote 1/4] Installing the locally delivered OpenEvo source..."
+    echo "[remote 1/4] Installing the locally delivered EvoLab source..."
     install_parent="$(mktemp -d "$state_root/incoming/install.XXXXXX")"
     git clone --branch "$branch" --single-branch "$source_bundle" "$install_parent/source"
     if [ -e "$source_root" ]; then
@@ -1217,7 +1217,7 @@ else
     echo "Refusing to modify an unrecognized path: $source_root" >&2
     exit 20
   else
-    echo "[remote 1/4] Updating from the locally delivered OpenEvo source bundle..."
+    echo "[remote 1/4] Updating from the locally delivered EvoLab source bundle..."
     git -C "$source_root" fetch "$source_bundle" \
       "refs/heads/$branch:refs/remotes/openevo-local/$branch"
     current_branch="$(git -C "$source_root" branch --show-current)"
@@ -1328,7 +1328,7 @@ if [ "$runtime_commit" != "$runtime_identity" ]; then
 fi
 
 if [ "$start_services" -ne 1 ]; then
-  echo "Remote OpenEvo source and runtime are installed at $runtime_identity."
+  echo "Remote EvoLab source and runtime are installed at $runtime_identity."
   exit 0
 fi
 
@@ -1552,7 +1552,7 @@ def _wait_for_local_webui(local_port: int) -> None:
         except (OSError, urllib.error.URLError) as exc:
             last_error = str(exc)
         time.sleep(0.2)
-    raise LauncherError(f"local OpenEvo WebUI health check failed: {last_error}")
+    raise LauncherError(f"local EvoLab WebUI health check failed: {last_error}")
 
 
 def open_browser(url: str) -> bool:
@@ -1588,7 +1588,7 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Install or update self-hosted OpenEvo through system OpenSSH, "
+            "Install or update self-hosted EvoLab through system OpenSSH, "
             "open a private local tunnel, and launch the WebUI"
         )
     )
@@ -1658,7 +1658,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--self-hosted-webui",
         action="store_true",
         help=(
-            "serve the OpenEvo WebUI and v2 Web Layer beside the remote "
+            "serve the EvoLab WebUI and v2 Web Layer beside the remote "
             "daemon, using one local SSH tunnel"
         ),
     )
@@ -1695,7 +1695,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     lifecycle.add_argument(
         "--stop",
         action="store_true",
-        help="stop only the remote processes owned by this OpenEvo launcher",
+        help="stop only the remote processes owned by this EvoLab launcher",
     )
     parser.add_argument(
         "--tail",
@@ -1733,7 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
         if not ssh_binary:
             raise LauncherError("system OpenSSH client was not found")
         print(
-            "Managing the OpenEvo remote stack through SSH "
+            "Managing the EvoLab remote stack through SSH "
             f"{connection.display_name}...",
             flush=True,
         )
@@ -1785,7 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
 
     delivery_label = "release" if release_bundle is not None else "source"
     print(
-        f"Checking installed OpenEvo {delivery_label} through SSH {connection.display_name}...",
+        f"Checking installed EvoLab {delivery_label} through SSH {connection.display_name}...",
         flush=True,
     )
     expected_identity = (
@@ -1798,11 +1798,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.source_action == "install" and remote_identity is not None:
         raise LauncherError(
-            f"OpenEvo is already installed at {remote_identity}; use --source-action update"
+            f"EvoLab is already installed at {remote_identity}; use --source-action update"
         )
     if args.source_action == "update" and remote_identity is None:
         raise LauncherError(
-            "OpenEvo is not installed; use --source-action install"
+            "EvoLab is not installed; use --source-action install"
         )
     if args.source_action == "start" and remote_identity != expected_identity:
         installed = remote_identity or "nothing"
@@ -1817,7 +1817,7 @@ def main(argv: list[str] | None = None) -> int:
     if release_bundle is not None:
         if needs_source_delivery:
             print(
-                f"Uploading OpenEvo {release_bundle.product_version} release "
+                f"Uploading EvoLab {release_bundle.product_version} release "
                 f"{release_bundle.release_id[:12]} ({release_bundle.byte_size} bytes) over SSH...",
                 flush=True,
             )
@@ -1939,7 +1939,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"#browser-bootstrap={web_bootstrap_token}"
             )
             print("Remote daemon, Web Layer, WebUI, and SSH tunnel are ready.")
-            print(f"OpenEvo WebUI URL: {browser_url}")
+            print(f"EvoLab WebUI URL: {browser_url}")
             if args.browser_e2e:
                 npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
                 if not npm_binary:
@@ -2012,7 +2012,7 @@ def main(argv: list[str] | None = None) -> int:
             npm_script = "dev:agent:web"
             npm_arguments = []
             print(
-                "OpenEvo WebUI URL: "
+                "EvoLab WebUI URL: "
                 f"http://127.0.0.1:5173/product-preview.html#browser-bootstrap={bootstrap_token}"
             )
             print("Local WebUI API bridge is ready; the browser will use only the web-layer session token.")
@@ -2047,7 +2047,7 @@ def command_main(argv: list[str] | None = None) -> int:
     try:
         return main(argv)
     except LauncherError as exc:
-        print(f"OpenEvo WebUI setup failed: {exc}", file=sys.stderr)
+        print(f"EvoLab WebUI setup failed: {exc}", file=sys.stderr)
         return 1
 
 

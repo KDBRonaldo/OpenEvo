@@ -1,4 +1,4 @@
-name: OpenEvo launcher release
+name: EvoLab installable pre-release
 
 on:
   push:
@@ -9,12 +9,12 @@ permissions:
   contents: write
 
 concurrency:
-  group: openevo-launcher-release-${{ github.ref }}
+  group: evolab-launcher-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish repository-free launcher
+  build:
+    name: Build repository-free installers
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -53,7 +53,6 @@ jobs:
             echo "The checked out commit is not the commit named by $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          echo "OPENEVO_PRODUCT_VERSION=$product_version" >> "$GITHUB_ENV"
 
       - name: Verify committed WebUI matches its source
         working-directory: desktop
@@ -73,17 +72,74 @@ jobs:
             tests/release/test_online_installer.py \
             -q
 
-      - name: Build launcher archive and checksum
+      - name: Build Linux, macOS, WSL, and Windows archives
         run: |
           mkdir -p dist
           python scripts/release/build_launcher_distribution.py \
             --commit HEAD \
-            --output dist/openevo-launcher.tar.gz
+            --output dist/evolab-launcher.tar.gz
+          python scripts/release/build_launcher_distribution.py \
+            --commit HEAD \
+            --output dist/evolab-launcher.zip
           cd dist
-          sha256sum openevo-launcher.tar.gz > openevo-launcher.tar.gz.sha256
-          sha256sum --check openevo-launcher.tar.gz.sha256
+          sha256sum evolab-launcher.tar.gz > evolab-launcher.tar.gz.sha256
+          sha256sum evolab-launcher.zip > evolab-launcher.zip.sha256
+          sha256sum --check evolab-launcher.tar.gz.sha256
+          sha256sum --check evolab-launcher.zip.sha256
 
-      - name: Publish immutable GitHub Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evolab-${{ github.ref_name }}-installers
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/evolab-launcher.tar.gz
+            dist/evolab-launcher.tar.gz.sha256
+            dist/evolab-launcher.zip
+            dist/evolab-launcher.zip.sha256
+            install.sh
+            install.ps1
+
+  windows-install-smoke:
+    name: Install and launch help on Windows
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evolab-${{ github.ref_name }}-installers
+
+      - name: Verify and install the Windows archive
+        shell: powershell
+        run: |
+          $expected = ((Get-Content dist/evolab-launcher.zip.sha256 -Raw).Trim() -split '\s+')[0]
+          $actual = (Get-FileHash dist/evolab-launcher.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Windows archive checksum mismatch" }
+          Expand-Archive dist/evolab-launcher.zip -DestinationPath "$env:RUNNER_TEMP\evolab-package"
+          $prefix = "$env:RUNNER_TEMP\evolab-installed"
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File "$env:RUNNER_TEMP\evolab-package\evolab-launcher\install.ps1" `
+            -Prefix $prefix -NoPathUpdate
+          if ($LASTEXITCODE -ne 0) { throw "EvoLab installer failed" }
+          & "$prefix\bin\evolab.cmd" webui --help
+          if ($LASTEXITCODE -ne 0) { throw "Installed EvoLab command failed" }
+
+  publish:
+    name: Publish immutable GitHub pre-release
+    needs: [build, windows-install-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: evolab-${{ github.ref_name }}-installers
+
+      - name: Publish EvoLab pre-release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,10 +149,14 @@ jobs:
             exit 1
           fi
           gh release create "$GITHUB_REF_NAME" \
-            dist/openevo-launcher.tar.gz \
-            dist/openevo-launcher.tar.gz.sha256 \
+            dist/evolab-launcher.tar.gz \
+            dist/evolab-launcher.tar.gz.sha256 \
+            dist/evolab-launcher.zip \
+            dist/evolab-launcher.zip.sha256 \
             install.sh \
+            install.ps1 \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "OpenEvo ${OPENEVO_PRODUCT_VERSION}" \
+            --prerelease \
+            --title "EvoLab ${GITHUB_REF_NAME#v} (pre-release)" \
             --generate-notes

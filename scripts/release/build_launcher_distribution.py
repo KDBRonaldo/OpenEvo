@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the repository-free OpenEvo ordinary-user launcher archive."""
+"""Build a repository-free EvoLab ordinary-user launcher archive."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 from launcher_distribution import (
-    LAUNCHER_DISTRIBUTION_SUFFIX,
+    LAUNCHER_DISTRIBUTION_SUFFIXES,
     LauncherDistributionError,
     build_launcher_distribution,
 )
@@ -22,10 +22,10 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        help=f"output ending in {LAUNCHER_DISTRIBUTION_SUFFIX}; defaults under dist/",
+        help=f"output ending in {' or '.join(LAUNCHER_DISTRIBUTION_SUFFIXES)}; defaults under dist/",
     )
     args = parser.parse_args()
-    output = args.output or REPOSITORY_ROOT / "dist" / "openevo-launcher.tar.gz"
+    output = args.output or REPOSITORY_ROOT / "dist" / "evolab-launcher.tar.gz"
     try:
         receipt = build_launcher_distribution(REPOSITORY_ROOT, output, commit=args.commit)
     except LauncherDistributionError as exc:

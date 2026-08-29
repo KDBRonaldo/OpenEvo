@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openevo"
-version = "0.1.10"
-description = "OpenEvo self-hosted WebUI and agent evolution runtime."
+version = "0.2.0"
+description = "EvoLab self-hosted WebUI and agent evolution runtime."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -26,6 +26,7 @@ dependencies = [
 ]
 
 [project.scripts]
+evolab = "openevo.cli:main"
 openevo = "openevo.cli:main"
 openevo-daemon = "openevo.daemon.cli:main"
 

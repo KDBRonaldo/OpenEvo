@@ -75,7 +75,7 @@ from openevo.daemon.contracts import (
 
 OPENAPI_SHA256 = "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af"
 EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
-RELEASE_VERSION = "0.1.10-dev-agent-web-v1"
+RELEASE_VERSION = "0.2.0-web-v1"
 FEATURES = [
     "development_agent_bridge_v2",
     "event_replay_v2",
