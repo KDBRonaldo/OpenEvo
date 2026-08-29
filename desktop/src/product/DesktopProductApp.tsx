@@ -83,7 +83,6 @@ type BrowserWorkspaceUploadV2 = {
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
-const PROJECT_SESSION_SELECTIONS_KEY = "openevo.desktop.navigation.project-session-selections";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
 
 function readPersistedRecord(storageKey: string): Record<string, string> {
@@ -110,15 +109,11 @@ function compareTasksNewestFirst(left: TaskV2, right: TaskV2): number {
   return right.updated_at.localeCompare(left.updated_at) || right.task_id.localeCompare(left.task_id);
 }
 
-function preferredTaskIdV2(
-  projectId: string,
-  tasks: readonly TaskV2[],
-  remembered: Readonly<Record<string, string>>,
-): string | null {
-  const projectTasks = tasks.filter((task) => task.project_id === projectId);
-  const rememberedId = remembered[projectId];
-  if (rememberedId && projectTasks.some((task) => task.task_id === rememberedId)) return rememberedId;
-  return null;
+function activeTaskIdV2(projectId: string, tasks: readonly TaskV2[]): string | null {
+  return tasks.find((task) => (
+    task.project_id === projectId
+      && ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)
+  ))?.task_id ?? null;
 }
 
 function taskStateLabelV2(state: TaskV2["state"]): string {
@@ -282,6 +277,7 @@ export function DesktopProductApp({
   const [switchingProjectId, setSwitchingProjectId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [newSessionDraftKey, setNewSessionDraftKey] = useState(0);
   const [startingSession, setStartingSession] = useState<StartingSessionV2 | null>(null);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
   const [projectPaneWidth, setProjectPaneWidth] = usePersistedPaneWidth(
@@ -306,18 +302,7 @@ export function DesktopProductApp({
   const refreshInFlight = useRef<Promise<DesktopProductSnapshotV2 | null> | null>(null);
   const snapshotRef = useRef<DesktopProductSnapshotV2 | null>(null);
   const projectRecoveryRefreshInFlight = useRef(false);
-  const selectedSessionByProject = useRef<Record<string, string>>(
-    readPersistedRecord(PROJECT_SESSION_SELECTIONS_KEY),
-  );
   const resolvedSelectionProjectId = useRef<string | null>(null);
-
-  const rememberSelectedSession = useCallback((projectId: string, taskId: string): void => {
-    selectedSessionByProject.current = {
-      ...selectedSessionByProject.current,
-      [projectId]: taskId,
-    };
-    persistRecord(PROJECT_SESSION_SELECTIONS_KEY, selectedSessionByProject.current);
-  }, []);
 
   const refresh = useCallback((): Promise<DesktopProductSnapshotV2 | null> => {
     refreshRequestSequence.current += 1;
@@ -379,11 +364,8 @@ export function DesktopProductApp({
     if (activeProjectId === null || switchingProjectId !== null) return;
     if (resolvedSelectionProjectId.current === activeProjectId) return;
     resolvedSelectionProjectId.current = activeProjectId;
-    setSelectedTaskId(preferredTaskIdV2(
-      activeProjectId,
-      snapshot?.tasks ?? [],
-      selectedSessionByProject.current,
-    ));
+    setSelectedTaskId(activeTaskIdV2(activeProjectId, snapshot?.tasks ?? []));
+    setNewSessionDraftKey((current) => current + 1);
   }, [snapshot?.state.active_project_id, snapshot?.tasks, switchingProjectId]);
 
   useEffect(() => {
@@ -596,7 +578,6 @@ export function DesktopProductApp({
         throw new Error("The admitted Session was not visible in the refreshed remote state.");
       }
       setSelectedTaskId(submittedTask.task_id);
-      rememberSelectedSession(project.project_id, submittedTask.task_id);
       setActionStatus("Session started. Its completed transcript can be used in future Evolution runs.");
       return true;
     } catch (error) {
@@ -613,12 +594,8 @@ export function DesktopProductApp({
     if (!project || switchingProjectId !== null) return;
     setSelectedWorkspacePath(null);
     setWorkspace("research");
-    const preferredTaskId = preferredTaskIdV2(
-      projectId,
-      snapshot.tasks,
-      selectedSessionByProject.current,
-    );
-    setSelectedTaskId(preferredTaskId);
+    setSelectedTaskId(activeTaskIdV2(projectId, snapshot.tasks));
+    setNewSessionDraftKey((current) => current + 1);
     if (project.project_id === activeProject?.project_id) {
       return;
     }
@@ -633,11 +610,7 @@ export function DesktopProductApp({
           throw new Error("The selected Project has not synchronized yet. Please try again.");
         }
         resolvedSelectionProjectId.current = projectId;
-        setSelectedTaskId(preferredTaskIdV2(
-          projectId,
-          refreshed.tasks,
-          selectedSessionByProject.current,
-        ));
+        setSelectedTaskId(activeTaskIdV2(projectId, refreshed.tasks));
       } catch (error) {
         setActionError(userMessageV2(error));
         resolvedSelectionProjectId.current = null;
@@ -729,9 +702,13 @@ export function DesktopProductApp({
           setWorkspace("research");
           setSelectedWorkspacePath(null);
           setSelectedTaskId(taskId);
-          if (displayedProject) rememberSelectedSession(displayedProject.project_id, taskId);
         }}
-        onNewSession={() => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(null); }}
+        onNewSession={() => {
+          setWorkspace("research");
+          setSelectedWorkspacePath(null);
+          setSelectedTaskId(null);
+          setNewSessionDraftKey((current) => current + 1);
+        }}
         paneWidth={sessionPaneWidth}
         onResizePane={setSessionPaneWidth}
       />
@@ -784,13 +761,14 @@ export function DesktopProductApp({
               capability={snapshot.capability}
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
+              newSessionDraftKey={newSessionDraftKey}
               startingSession={startingSession?.projectId === displayedProject.project_id ? startingSession : null}
               busy={busy || switchingProjectId !== null}
               sessionStartBlocked={developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
               onSelectTask={(taskId) => {
                 setSelectedTaskId(taskId);
-                if (taskId !== null) rememberSelectedSession(displayedProject.project_id, taskId);
+                if (taskId === null) setNewSessionDraftKey((current) => current + 1);
               }}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
@@ -1851,7 +1829,7 @@ function SessionExplorerV2({
   };
   return (
     <aside className="session-explorer" aria-label="Project sessions">
-      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="New Session" title="New Session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
+      <div className="explorer-heading"><span>Sessions</span><button type="button" className="new-session-button" aria-label="New Session" title="New Session" disabled={project === null} onClick={onNewSession}><Plus size={14} /><span>New</span></button></div>
       <div className="session-explorer-project" title={project?.display_name}>{project?.display_name ?? "No Project selected"}</div>
       <div className="session-explorer-tools">
         <label className="session-search"><Search size={13} /><input type="search" aria-label="Search Sessions" placeholder="Search Sessions" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
@@ -1946,6 +1924,7 @@ function ResearchWorkspaceV2({
   capability,
   runtimePresentation,
   selectedTaskId,
+  newSessionDraftKey,
   startingSession,
   busy,
   sessionStartBlocked,
@@ -1968,6 +1947,7 @@ function ResearchWorkspaceV2({
   readonly capability: DesktopProductSnapshotV2["capability"];
   readonly runtimePresentation: DesktopProductSnapshotV2["runtimePresentation"];
   readonly selectedTaskId: string | null;
+  readonly newSessionDraftKey: number;
   readonly startingSession: StartingSessionV2 | null;
   readonly busy: boolean;
   readonly sessionStartBlocked: boolean;
@@ -2011,8 +1991,8 @@ function ResearchWorkspaceV2({
   const [selectedProjectHeadId, setSelectedProjectHeadId] = useState(
     project.active_project_head?.project_head_id ?? "",
   );
-  const [taskTitle, setTaskTitle] = useState(project.config.task.title);
-  const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
+  const [taskTitle, setTaskTitle] = useState("");
+  const [taskObjective, setTaskObjective] = useState("");
   const sessionEvolutionCapabilities = useMemo(() => (
     capability?.project_id === project.project_id
       ? capability.capabilities.targets
@@ -2043,22 +2023,16 @@ function ResearchWorkspaceV2({
     initialSessionEvolutionTargets,
   );
   useEffect(() => {
-    if (visibleStartingSession !== null) {
-      setTaskTitle(visibleStartingSession.task.title);
-      setTaskObjective(visibleStartingSession.task.objective);
-      return;
-    }
-    setTaskTitle(project.config.task.title);
-    setTaskObjective(project.config.task.objective);
     setSelectedEvolutionTargets(initialSessionEvolutionTargets());
   }, [
     initialSessionEvolutionTargets,
     project.project_id,
     project.project_config_sha256,
-    visibleStartingSession?.projectId,
-    visibleStartingSession?.task.title,
-    visibleStartingSession?.task.objective,
   ]);
+  useEffect(() => {
+    setTaskTitle("");
+    setTaskObjective("");
+  }, [newSessionDraftKey, project.project_id]);
   useEffect(() => {
     if (availableProjectHeads.some((head) => head.project_head_id === selectedProjectHeadId)) return;
     setSelectedProjectHeadId(project.active_project_head?.project_head_id ?? "");
@@ -2110,8 +2084,8 @@ function ResearchWorkspaceV2({
       <div className="workspace-stack session-detail-workspace" data-testid="session-detail-workspace">
         <div className="session-detail-navigation">
           <button type="button" className="session-back-button" onClick={() => onSelectTask(null)}>
-            <ArrowLeft size={16} />
-            Back to {project.display_name}
+            <Plus size={16} />
+            New Session
           </button>
         </div>
         <TaskAuthorityCardV2
@@ -2139,7 +2113,7 @@ function ResearchWorkspaceV2({
   return (
     <div className="workspace-stack new-session-workspace" data-testid="research-workspace">
       <div className="workspace-heading">
-        <div><h1>{project.display_name}</h1></div>
+        <div><h1>New Session</h1><p>{project.display_name}</p></div>
         <div className="heading-actions"><button className="secondary-button" type="button" disabled={formBusy || sessionStartBlocked} onClick={onOpenSettings}><Settings size={16} /> Edit project</button></div>
       </div>
       <div className="new-session-canvas">
@@ -2206,7 +2180,7 @@ function ResearchWorkspaceV2({
               <legend>Evolution after this Session <span>{selectedEvolutionCount} selected</span></legend>
               <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
             </fieldset> : null}
-            {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
+            {!taskValid && (taskTitle.trim().length > 0 || taskObjective.trim().length > 0) ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
             <div className="session-composer-footer">
               <div className="session-head-picker">
                 <Sparkles size={15} />

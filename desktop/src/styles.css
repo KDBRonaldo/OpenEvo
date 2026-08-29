@@ -1680,6 +1680,16 @@ pre.json {
   background: #e7ece8;
 }
 
+.explorer-heading .new-session-button {
+  width: auto;
+  gap: 4px;
+  padding: 0 8px;
+  color: var(--accent-strong);
+  font: inherit;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .project-switcher-shell {
   position: relative;
   z-index: 12;
@@ -4536,10 +4546,11 @@ pre.json {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 7px 0;
-  border: 0;
-  color: var(--muted);
-  background: transparent;
+  padding: 8px 12px;
+  border: 1px solid #d8dfda;
+  border-radius: 8px;
+  color: var(--accent-strong);
+  background: #fff;
   font: inherit;
   font-size: 12px;
   font-weight: 650;
@@ -4548,6 +4559,8 @@ pre.json {
 
 .session-back-button:hover {
   color: var(--accent-strong);
+  border-color: #b9cbc3;
+  background: #f4f8f6;
 }
 
 .session-starting-label {

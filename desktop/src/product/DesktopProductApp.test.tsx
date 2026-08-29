@@ -1201,13 +1201,15 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector('[data-testid="session-composer"]')).toBeFalsy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
 
-    await click("Back to Protein study");
+    await click("New Session");
 
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
     expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy();
     expect(document.querySelector(".session-explorer-list")).toBeTruthy();
+    expect(input("Task title").value).toBe("");
+    expect(textarea("Task instructions").value).toBe("");
   });
 
   it("browses memory, skill, and agent-system previews and their changes", async () => {
@@ -1249,11 +1251,9 @@ describe("Desktop v2 product renderer", () => {
     const provider = providerFixture(snapshot);
     root = await render(provider);
 
-    expect(input("Task title").value).toBe("Review evidence");
-    expect(textarea("Task instructions").value).toBe(
-      "Review the evidence and update the workspace.",
-    );
-    expect(button("Start session").disabled).toBe(false);
+    expect(input("Task title").value).toBe("");
+    expect(textarea("Task instructions").value).toBe("");
+    expect(button("Start session").disabled).toBe(true);
     expect(document.body.textContent).not.toContain("Save task");
 
     setInput("Task title", "Verify the selected evidence");
@@ -1315,6 +1315,8 @@ describe("Desktop v2 product renderer", () => {
     const picker = document.querySelector<HTMLButtonElement>('.next-task-fields .soft-select-trigger[aria-label="Evolution context"]');
     expect(picker).toBeTruthy();
 
+    setInput("Task title", "Review historical context");
+    setTextarea("Task instructions", "Review the evidence with the selected historical context.");
     await selectSoftOption("Evolution context", "Project Head 6");
     await click("Start session");
 
@@ -1328,6 +1330,8 @@ describe("Desktop v2 product renderer", () => {
   it("starts the Session from the composer with Enter and keeps Shift+Enter for a new line", async () => {
     const provider = providerFixture(authoritySnapshot());
     root = await render(provider);
+    setInput("Task title", "Review evidence");
+    setTextarea("Task instructions", "Review the evidence and update the workspace.");
     const instructions = textarea("Task instructions");
 
     await act(async () => {
@@ -1355,6 +1359,8 @@ describe("Desktop v2 product renderer", () => {
   it("starts the Session from the composer with Enter and keeps Shift+Enter for a new line", async () => {
     const provider = providerFixture(authoritySnapshot());
     root = await render(provider);
+    setInput("Task title", "Review evidence");
+    setTextarea("Task instructions", "Review the evidence and update the workspace.");
     const instructions = textarea("Task instructions");
 
     await act(async () => {
@@ -1410,6 +1416,8 @@ describe("Desktop v2 product renderer", () => {
       submitTask: vi.fn(async () => submission),
     } satisfies DesktopProductProviderV2;
     root = await render(provider);
+    setInput("Task title", "Review evidence");
+    setTextarea("Task instructions", "Review the evidence and update the workspace.");
 
     await act(async () => {
       button("Start session").click();
@@ -1459,6 +1467,8 @@ describe("Desktop v2 product renderer", () => {
       submitTask: vi.fn(async () => submission),
     } satisfies DesktopProductProviderV2;
     root = await render(provider);
+    setInput("Task title", "Live research session");
+    setTextarea("Task instructions", "Stream the Agent response in the conversation view.");
 
     await act(async () => {
       button("Start session").click();
@@ -1741,6 +1751,8 @@ describe("Desktop v2 product renderer", () => {
       await preflightBlocked;
       return { status: "fresh" as const, snapshot };
     });
+    setInput("Task title", "Review evidence");
+    setTextarea("Task instructions", "Review the evidence and update the workspace.");
 
     await act(async () => {
       button("Start session").click();
@@ -1853,7 +1865,7 @@ describe("Desktop v2 product renderer", () => {
     ).toBeFalsy();
   });
 
-  it("restores each Project's last Session and Session-list scroll position", async () => {
+  it("opens a blank composer for each Project while restoring Session-list scroll position", async () => {
     const initial = authoritySnapshot();
     const secondProject = {
       ...initial.projects[0]!,
@@ -1914,9 +1926,10 @@ describe("Desktop v2 product renderer", () => {
 
     await selectProject("Protein study");
     await vi.waitFor(() => expect(switcher.disabled).toBe(false));
-    await vi.waitFor(() => expect(
-      document.querySelector<HTMLButtonElement>('button[title="Review evidence"]')?.classList.contains("active"),
-    ).toBe(true));
+    await vi.waitFor(() => expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy());
+    expect(document.querySelector<HTMLButtonElement>('button[title="Review evidence"]')?.classList.contains("active")).toBe(false);
+    expect(input("Task title").value).toBe("");
+    expect(textarea("Task instructions").value).toBe("");
     await vi.waitFor(() => expect(document.querySelector<HTMLElement>(".session-explorer-list")?.scrollTop).toBe(120));
   });
 
@@ -2149,7 +2162,7 @@ describe("Desktop v2 product renderer", () => {
     await click("Cancel session");
     expect(cancelTask).toHaveBeenCalledWith("task-1", expect.objectContaining({ streamEpoch: 1 }));
 
-    await click("Back to Protein study");
+    await click("New Session");
     expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy();
     expect(document.body.textContent).not.toContain("Open live Session");
     expect(document.body.textContent).not.toContain("Cancel Session");
@@ -2230,6 +2243,8 @@ describe("Desktop v2 product renderer", () => {
     ] as never;
     const provider = providerFixture(snapshot);
     root = await render(provider);
+    setInput("Task title", "Review evidence");
+    setTextarea("Task instructions", "Review the evidence and update the workspace.");
 
     const checkbox = document.querySelector<HTMLInputElement>(
       '.session-evolution-picker input[type="checkbox"]',
