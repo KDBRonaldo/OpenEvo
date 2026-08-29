@@ -3103,7 +3103,7 @@ function EvolutionWorkspaceV2({
       <div className="evolution-atmosphere" aria-hidden="true"><span /><span /><span /></div>
       <div className="workspace-heading evolution-workspace-heading"><div><p className="eyebrow"><CircleDot size={11} /> Evolution system online</p><h1>Cross-session changes</h1><p>Choose completed Session evidence, produce a candidate, review it, then apply it to future Sessions.</p><div className="evolution-telemetry" aria-hidden="true"><span>Evidence mesh</span><i /><span>Context synthesis</span><i /><span>Project Head</span></div></div>{project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Active Project Head</small><strong>Project Head {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by the next Session</em></span></div> : null}</div>
       {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section" data-step="01">
-        <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
+        <div className="panel-heading"><div><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
         <div className="evolution-section-body">{completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task, index) => {
           const selected = selectedTaskIds.includes(task.task_id);
           const evidenceReady = snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionEvidenceReady === true;
@@ -3113,7 +3113,7 @@ function EvolutionWorkspaceV2({
         {completedTasks.length > evidenceTasks.length ? <Notice tone="warning" title="Some Sessions are unavailable" detail="Their transcript datasets were not sealed. Restart the updated development daemon to repair recoverable legacy Sessions; unavailable entries cannot be selected." /> : null}</div>
       </section> : null}
       <section id="evolution-methods" className="product-panel task-panel evolution-step-section" data-step="02">
-        <div className="panel-heading"><div><span className="panel-kicker">{standaloneAvailable ? "Step 2 · Methods" : "Verified remote registry"}</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
+        <div className="panel-heading"><div>{!standaloneAvailable ? <span className="panel-kicker">Verified remote registry</span> : null}<h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>
         <div className="evolution-section-body evolution-methods-body">{capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
           const methodId = current.method ?? target.effective_default_method_id ?? "";
@@ -3146,7 +3146,7 @@ function EvolutionWorkspaceV2({
       </section>
       {standaloneAvailable ? <section ref={resultSectionRef} id="evolution-result" className="product-panel task-panel evolution-step-section" data-step="03">
         {resultView === "history" ? <>
-          <div className="panel-heading"><div><span className="panel-kicker">Step 3 · Review and apply</span><h2>Evolution History</h2></div><span className="muted-pill">{runs.length} run{runs.length === 1 ? "" : "s"}</span></div>
+          <div className="panel-heading"><div><h2>Evolution History</h2></div><span className="muted-pill">{runs.length} run{runs.length === 1 ? "" : "s"}</span></div>
           <div className="evolution-section-body evolution-history-body">{runs.length > 0 ? <nav className="v2-evolution-run-selector" aria-label="Evolution history">{runs.map((run, index) => {
           const selected = run.runId === latestRun?.runId;
           return <button type="button" key={run.runId} className={selected ? "active" : ""} data-run-state={run.state} aria-pressed={selected} onPointerMove={trackEvolutionSpotlight} onClick={() => { setSelectedRunId(run.runId); setResultView("detail"); }}><span className={`v2-evolution-job-state ${run.state}`} aria-hidden="true">{run.state === "running" ? <LoaderCircle className="spin" size={15} /> : run.state === "applied" || run.state === "candidate_ready" ? <CheckCircle2 size={15} /> : <AlertCircle size={15} />}</span><span><strong>{run.selections.map((selection) => evolutionTargetLabel(selection.targetId)).join(", ")}</strong><small>{index === 0 ? "Latest · " : ""}{formatTimeV2(run.createdAt)} · {run.sourceTaskIds.length} Session{run.sourceTaskIds.length === 1 ? "" : "s"}</small></span><span className={`state-pill ${run.state}`}>{evolutionRunStateLabel(run.state)}</span></button>;
