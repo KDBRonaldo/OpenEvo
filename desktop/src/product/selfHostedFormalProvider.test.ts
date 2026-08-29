@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   combineSelfHostedProviders,
+  developmentTaskIdForActionV2,
 } from "./selfHostedFormalProvider";
 import {
   unavailableDesktopProductProviderV2,
@@ -15,6 +16,14 @@ function providerWith(
 }
 
 describe("self-hosted formal provider", () => {
+  it("derives one stable daemon Task identity from a submission action", () => {
+    const taskId = developmentTaskIdForActionV2("submit-task-ambiguous-0001");
+
+    expect(taskId).toBe("dev-session-26a7fd2119d1910c");
+    expect(developmentTaskIdForActionV2("submit-task-ambiguous-0001")).toBe(taskId);
+    expect(developmentTaskIdForActionV2("submit-task-ambiguous-0002")).not.toBe(taskId);
+  });
+
   it("keeps formal authority while merging readable development presentation", async () => {
     const formalSnapshot = { state: { active_project_id: "formal-project" } } as unknown as DesktopProductSnapshotV2;
     const candidateArtifact = {

@@ -119,6 +119,8 @@ export interface LocalApiDesktopProductProviderOptionsV2 {
   readonly native: LocalApiNativeBridgeV2;
   readonly featureFlags: readonly string[];
   readonly providerStreamInstance: string;
+  /** Resolve the durable Task identity used to recover an ambiguous submission. */
+  readonly taskIdForSubmissionAction?: (actionId: string) => string;
   readonly fetch?: FetchLikeV2;
   readonly reconnectDelaysMs?: readonly number[];
 }
@@ -133,6 +135,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly fetch: FetchLikeV2;
   private readonly reconnectDelaysMs: readonly number[];
   private readonly providerStreamInstance: string;
+  private readonly taskIdForSubmissionAction: ((actionId: string) => string) | null;
   private readonly mutationIntents: MutationIntentCoordinatorV2;
   private readonly lifecycleOperations: LifecycleOperationControllerV2;
   private readonly coreOperations: CoreOperationControllerV2;
@@ -157,6 +160,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     this.native = options.native;
     this.featureFlags = Object.freeze([...options.featureFlags]);
     this.providerStreamInstance = opaqueIdV2Schema.parse(options.providerStreamInstance);
+    this.taskIdForSubmissionAction = options.taskIdForSubmissionAction ?? null;
     this.mutationIntents = new MutationIntentCoordinatorV2(options.native);
     this.lifecycleOperations = new LifecycleOperationControllerV2(options.client);
     this.coreOperations = new CoreOperationControllerV2(options.client, () => this.activeCoreAuthorityV2());
@@ -1330,6 +1334,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     for (const originalEntry of entries) {
       let entry = originalEntry;
       if (entry.accepted_operation_id === null) {
+        if (await this.reconcileReservedTaskSubmissionV2(entry, snapshot)) {
+          continue;
+        }
         const recovered = await this.recoverReservedLifecycleOperationV2(entry);
         if (recovered === null) {
           await this.reconcileReservedCancellationV2(entry);
@@ -1392,6 +1399,30 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }
       await this.acknowledgeLifecycleTerminalV2(state.operation);
     }
+  }
+
+  private async reconcileReservedTaskSubmissionV2(
+    entry: PendingMutationIntentV2,
+    snapshot: DesktopProductSnapshotV2,
+  ): Promise<boolean> {
+    if (entry.state !== "reserved"
+      || entry.mutation_kind !== "task_submit"
+      || this.taskIdForSubmissionAction === null) {
+      return false;
+    }
+    const taskId = opaqueIdV2Schema.parse(this.taskIdForSubmissionAction(entry.action_id));
+    const task = snapshot.tasks.find((candidate) => candidate.task_id === taskId);
+    if (task === undefined) return false;
+    if (entry.resource_scope !== `project:${task.project_id}:task:new`) {
+      throw new DesktopContractErrorV2(
+        "Recovered Task submission belongs to another Project authority",
+      );
+    }
+    await this.mutationIntents.markDirectResponseObserved(
+      entry.action_id,
+      sha256Utf8V2(canonicalJsonV2(task)),
+    );
+    return true;
   }
 
   private async recoverReservedLifecycleOperationV2(

@@ -230,8 +230,9 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
 
 function nativeFixture(
   selected: unknown = nativeLifecycleOperation(),
+  initialJournalValue: string | null = null,
 ): LocalApiNativeBridgeV2 & { readonly journalValue: () => string | null; readonly callOrder: string[] } {
-  let journalValue: string | null = null;
+  let journalValue: string | null = initialJournalValue;
   const callOrder: string[] = [];
   return {
     callOrder,
@@ -1171,6 +1172,99 @@ describe("Desktop v2 product provider", () => {
       streamEpoch: result.snapshot.stream.epoch,
     })).rejects.toThrow(/different request or authority/i);
     expect(client.createProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears an ambiguously acknowledged task submission once its durable Task appears", async () => {
+    const actionId = "submit-task-ambiguous-0001";
+    const taskId = "dev-session-recovered";
+    const native = nativeFixture(nativeLifecycleOperation(), JSON.stringify({
+      schema_version: "2",
+      revision: 1,
+      entries: [{
+        action_id: actionId,
+        mutation_kind: "task_submit",
+        resource_scope: "project:project-1:task:new",
+        request_sha256: DIGEST,
+        authority_sha256: DIGEST,
+        provider_stream_instance: "provider-instance-test",
+        provider_stream_epoch: 1,
+        chain_step: "single",
+        accepted_operation_id: null,
+        completed_operation_ids: [],
+        state: "reserved",
+        created_at: NOW,
+        updated_at: NOW,
+      }],
+    }));
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-1",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-1",
+    });
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        project_id: "project-1",
+        config: { execution: { mode: "codex_subscription_transcript" } },
+      }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listTasks).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        task_id: taskId,
+        project_id: "project-1",
+        state: "completed",
+        successor_transition: null,
+      }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listServices).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.projectCapabilities).mockResolvedValue({
+      project_id: "project-1",
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+    } as never);
+    vi.mocked(client.taskTimeline).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.taskArtifacts).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+      taskIdForSubmissionAction: (candidate) => candidate === actionId ? taskId : "unexpected-task",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    expect(native.journalValue()).toBeNull();
   });
 
   it("releases an exact deterministic rejection because it proves no side effect can publish", async () => {

@@ -1,6 +1,7 @@
 import {
   canonicalJsonV2,
   desktopBootstrapContextV2Schema,
+  sha256Utf8V2,
   type DesktopBootstrapContextV2,
 } from "../api/v2/schemas";
 import {
@@ -21,6 +22,10 @@ import type {
 } from "./providerV2";
 
 const MUTATION_JOURNAL_KEY = "openevo.desktop.self-hosted.mutation-journal.v2";
+
+export function developmentTaskIdForActionV2(actionId: string): string {
+  return `dev-session-${sha256Utf8V2(actionId).slice(0, 16)}`;
+}
 
 function developmentContractOf(
   bootstrap: DesktopBootstrapContextV2,
@@ -81,6 +86,7 @@ export async function createSelfHostedFormalProvider(
     native: browserNativeBridge,
     featureFlags: version.feature_flags,
     providerStreamInstance: version.build_id,
+    taskIdForSubmissionAction: developmentTaskIdForActionV2,
     fetch: globalThis.fetch.bind(globalThis),
   });
   const presentation = createDevelopmentAgentProvider({
