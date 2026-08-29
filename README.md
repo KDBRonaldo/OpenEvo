@@ -16,40 +16,28 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Install without the repository
 
-The current installable pre-release is `v0.2.0`. On Linux, macOS, or WSL:
+The current installable pre-release supports macOS only. Download
+`EvoLab-macOS-0.2.1.tar.gz` from the matching GitHub Release. Do not download
+GitHub's automatically generated source-code archives; they are repository
+snapshots, not EvoLab installers.
+
+The release page contains the complete first-install guide. In short, the Mac
+needs Python 3.11+ and system OpenSSH, while the remote Linux server needs
+Python 3, standard POSIX tools, and an authenticated Codex CLI for the exact
+SSH user EvoLab will use. Then install the downloaded archive:
 
 ```bash
-curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.sh \
-  | sh -s -- --version v0.2.0
-~/.local/bin/evolab webui
-```
-
-On Windows PowerShell:
-
-```powershell
-irm https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.ps1 | iex
-evolab webui
-```
-
-Both bootstraps verify the downloaded archive against its published SHA-256
-file before installation. The release preserves `openevo webui` as a
-compatibility command. A maintainer can build both deterministic archives from
-an exact commit:
-
-```bash
-uv run python scripts/release/build_launcher_distribution.py \
-  --output dist/evolab-launcher.tar.gz
-uv run python scripts/release/build_launcher_distribution.py \
-  --output dist/evolab-launcher.zip
-```
-
-The user only needs Python 3.11+, POSIX `sh`/`tar`, system OpenSSH, and a
-configured SSH host:
-
-```bash
-tar -xzf evolab-launcher.tar.gz
+tar -xzf EvoLab-macOS-0.2.1.tar.gz
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
+```
+
+The release preserves `openevo webui` as a compatibility command. A maintainer
+can build the deterministic macOS archive from an exact commit:
+
+```bash
+uv run python scripts/release/build_launcher_distribution.py \
+  --output dist/EvoLab-macOS-0.2.1.tar.gz
 ```
 
 The archive contains a standard-library Python launcher and the matching
@@ -61,10 +49,11 @@ active launcher receipt. The installer refuses to overwrite an unrelated
 
 Pushing a tag that exactly matches `v<pyproject version>` runs the launcher
 release workflow. It verifies the committed WebUI and release tests, then
-publishes the PowerShell and POSIX bootstraps plus `evolab-launcher.zip` and
-`evolab-launcher.tar.gz` with SHA-256 files as immutable GitHub Pre-release
-assets. The Windows archive is installed and smoke-tested on a clean Windows
-runner before publication.
+installs the archive on a clean macOS runner. It publishes exactly one custom
+asset, `EvoLab-macOS-<version>.tar.gz`, after that smoke test passes. The
+Release body combines a fixed first-install guide with GitHub's generated
+changelog. GitHub still displays its two automatic source-code links, which
+cannot be removed from a tag release.
 
 ## Run the working remote WebUI
 

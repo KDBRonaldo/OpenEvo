@@ -7,33 +7,18 @@ the old DMG or packaged Tauri Desktop application.
 
 Requirements on the user's computer:
 
+- macOS (the current pre-release does not publish Windows, Linux, or WSL launchers);
 - Python 3.11 or newer;
-- POSIX `sh` and `tar`, or Windows PowerShell;
+- POSIX `sh` and `tar`;
 - system OpenSSH (`ssh`);
 - a literal host alias in `~/.ssh/config`.
 
-Install the latest published version:
+Download `EvoLab-macOS-0.2.1.tar.gz` from the `v0.2.1` GitHub Release. Do not
+download GitHub's `Source code (zip)` or `Source code (tar.gz)` links; those are
+repository snapshots rather than the installer. Install the archive with:
 
 ```bash
-curl -fsSL https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.sh \
-  | sh -s -- --version v0.2.0
-~/.local/bin/evolab webui
-```
-
-The online installer verifies the archive against the separately published
-SHA-256 file before installation. On Windows, run:
-
-```powershell
-irm https://github.com/KDBRonaldo/OpenEvo/releases/download/v0.2.0/install.ps1 | iex
-evolab webui
-```
-
-For an offline installation, download `evolab-launcher.tar.gz` and its
-`.sha256` file from the same GitHub Release, verify it, then run:
-
-```bash
-sha256sum --check evolab-launcher.tar.gz.sha256
-tar -xzf evolab-launcher.tar.gz
+tar -xzf EvoLab-macOS-0.2.1.tar.gz
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
@@ -51,11 +36,14 @@ Host openevo-lab
   HostName server.example.com
   User researcher
   Port 22
+  IdentityFile ~/.ssh/id_ed25519
 ```
 
-Then run:
+Verify the alias first, then run EvoLab:
 
 ```bash
+ssh openevo-lab
+exit
 evolab webui
 ```
 
@@ -82,7 +70,18 @@ current committed tree and does not require `git push`.
 
 - a reachable Linux SSH account;
 - Python 3 and standard POSIX utilities on the server;
-- Codex CLI installed and authenticated for that remote account.
+- Codex CLI installed and authenticated for that exact remote account.
+
+For a headless server, connect as the same SSH user configured above and run:
+
+```bash
+command -v codex
+codex login --device-auth
+codex login status
+```
+
+Logging in as another server user does not authenticate the account EvoLab
+will invoke.
 
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,

@@ -72,8 +72,10 @@ The online bootstrap is tested against a local HTTP release fixture, including
 checksum rejection. To publish a real release, update `project.version`, commit
 the exact tree, and push the matching `v<version>` tag. The
 `openevo-launcher-release.yml` workflow refuses mismatched tags and existing
-GitHub Releases, and publishes the launcher archive, SHA-256 file, and online
-installer together.
+GitHub Releases. It installs the macOS archive on a clean macOS runner, then
+publishes exactly one custom asset named `EvoLab-macOS-<version>.tar.gz`. The
+Release body is rendered from the fixed first-install guide plus GitHub's
+generated changelog.
 
 The new daemon lifecycle can also be smoke-tested independently without
 switching the product path:

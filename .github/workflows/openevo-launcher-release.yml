@@ -70,41 +70,30 @@ jobs:
             tests/release/test_release_bundle.py \
             tests/release/test_launcher_distribution.py \
             tests/release/test_online_installer.py \
+            tests/release/test_release_notes.py \
             -q
 
-      - name: Build Linux, macOS, WSL, and Windows archives
+      - name: Build the macOS installer archive
         run: |
+          set -euo pipefail
           mkdir -p dist
+          product_version="${GITHUB_REF_NAME#v}"
           python scripts/release/build_launcher_distribution.py \
             --commit HEAD \
-            --output dist/evolab-launcher.tar.gz
-          python scripts/release/build_launcher_distribution.py \
-            --commit HEAD \
-            --output dist/evolab-launcher.zip
-          cd dist
-          sha256sum evolab-launcher.tar.gz > evolab-launcher.tar.gz.sha256
-          sha256sum evolab-launcher.zip > evolab-launcher.zip.sha256
-          sha256sum --check evolab-launcher.tar.gz.sha256
-          sha256sum --check evolab-launcher.zip.sha256
+            --output "dist/EvoLab-macOS-${product_version}.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-installers
+          name: evolab-${{ github.ref_name }}-macos-installer
           if-no-files-found: error
           retention-days: 7
-          path: |
-            dist/evolab-launcher.tar.gz
-            dist/evolab-launcher.tar.gz.sha256
-            dist/evolab-launcher.zip
-            dist/evolab-launcher.zip.sha256
-            install.sh
-            install.ps1
+          path: dist/EvoLab-macOS-*.tar.gz
 
-  windows-install-smoke:
-    name: Install and launch help on Windows
+  macos-install-smoke:
+    name: Install and launch help on macOS
     needs: build
-    runs-on: windows-latest
-    timeout-minutes: 10
+    runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -112,32 +101,32 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-installers
+          name: evolab-${{ github.ref_name }}-macos-installer
 
-      - name: Verify and install the Windows archive
-        shell: powershell
+      - name: Install the packaged launcher
+        shell: bash
         run: |
-          $expected = ((Get-Content dist/evolab-launcher.zip.sha256 -Raw).Trim() -split '\s+')[0]
-          $actual = (Get-FileHash dist/evolab-launcher.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "Windows archive checksum mismatch" }
-          Expand-Archive dist/evolab-launcher.zip -DestinationPath "$env:RUNNER_TEMP\evolab-package"
-          $prefix = "$env:RUNNER_TEMP\evolab-installed"
-          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
-            -File "$env:RUNNER_TEMP\evolab-package\evolab-launcher\install.ps1" `
-            -Prefix $prefix -NoPathUpdate
-          if ($LASTEXITCODE -ne 0) { throw "EvoLab installer failed" }
-          & "$prefix\bin\evolab.cmd" webui --help
-          if ($LASTEXITCODE -ne 0) { throw "Installed EvoLab command failed" }
+          set -euo pipefail
+          package_root="$RUNNER_TEMP/evolab-package"
+          prefix="$RUNNER_TEMP/evolab-installed"
+          mkdir -p "$package_root"
+          tar -xzf EvoLab-macOS-*.tar.gz -C "$package_root"
+          sh "$package_root/evolab-launcher/install.sh" \
+            --prefix "$prefix" \
+            --no-path-update
+          "$prefix/bin/evolab" webui --help
 
   publish:
     name: Publish immutable GitHub pre-release
-    needs: [build, windows-install-smoke]
+    needs: [build, macos-install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-installers
+          name: evolab-${{ github.ref_name }}-macos-installer
 
       - name: Publish EvoLab pre-release
         env:
@@ -148,15 +137,20 @@ jobs:
             echo "Release $GITHUB_REF_NAME already exists; refusing to replace immutable assets." >&2
             exit 1
           fi
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" \
+            -f target_commitish="$GITHUB_SHA" \
+            --jq .body > "$RUNNER_TEMP/generated-notes.md"
+          python scripts/release/render_release_notes.py \
+            --template docs/user/macos-release-template.md \
+            --version "${GITHUB_REF_NAME#v}" \
+            --changelog "$RUNNER_TEMP/generated-notes.md" \
+            --output "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" \
-            dist/evolab-launcher.tar.gz \
-            dist/evolab-launcher.tar.gz.sha256 \
-            dist/evolab-launcher.zip \
-            dist/evolab-launcher.zip.sha256 \
-            install.sh \
-            install.ps1 \
+            EvoLab-macOS-*.tar.gz \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --prerelease \
             --title "EvoLab ${GITHUB_REF_NAME#v} (pre-release)" \
-            --generate-notes
+            --notes-file "$RUNNER_TEMP/release-notes.md"
