@@ -1786,6 +1786,28 @@ describe("Desktop v2 product renderer", () => {
 
     expect(dialog()?.textContent).toContain("Create science project");
     expect(input("Project name").value).toBe("New research project");
+    expect(dialog()?.textContent).not.toContain("Task title");
+    expect(dialog()?.textContent).not.toContain("Task objective");
+  });
+
+  it("keeps Session task fields out of Project settings", async () => {
+    const snapshot = authoritySnapshot();
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+
+    await click("Edit project");
+    expect(dialog()?.textContent).toContain("Edit science project");
+    expect(dialog()?.textContent).not.toContain("Task title");
+    expect(dialog()?.textContent).not.toContain("Task objective");
+
+    setInput("Project name", "Renamed protein study");
+    await click("Save project");
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Renamed protein study",
+      expect.objectContaining({ task: snapshot.projects[0]!.config.task }),
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
   });
 
   it("lists every real project and activates the selected one without mixing Sessions", async () => {
@@ -2079,7 +2101,7 @@ describe("Desktop v2 product renderer", () => {
 
     expect(button("Start session").disabled).toBe(true);
     expect(document.body.textContent).toContain(
-      "OpenEvo is preparing the remote service and initial Project Head",
+      "EvoLab is preparing the remote service and initial Project Head",
     );
 
     const refreshCalls = provider.refresh.mock.calls.length;
@@ -2468,15 +2490,15 @@ describe("Desktop v2 product renderer", () => {
     await click("New project");
     await click("Self-Deployed");
     expect(document.body.textContent).toContain("Qwen3 0.6B");
-    setTextarea(
-      "Task objective",
-      "Run this task through the managed local model.",
-    );
     await click("Create project");
 
     expect(createProject).toHaveBeenCalledWith(
       expect.objectContaining({
         config: expect.objectContaining({
+          task: {
+            title: "Untitled Session",
+            objective: "Task details are provided when the Session starts.",
+          },
           execution: {
             mode: "self-deployed",
             capture_mode: "transcript",
@@ -2602,10 +2624,6 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     await click("New project");
-    setTextarea(
-      "Task objective",
-      "Create a reproducible result from this workspace.",
-    );
     await click("Create project");
     await act(async () => vi.advanceTimersByTime(16_000));
 
@@ -2662,7 +2680,6 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     await click("New project");
-    setTextarea("Task objective", "Prepare a native workspace safely.");
     await click("Choose folder snapshot");
     expect(selectNativeWorkspace).toHaveBeenCalledTimes(1);
     await click("Cancel");

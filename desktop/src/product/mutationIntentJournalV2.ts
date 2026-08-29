@@ -204,7 +204,7 @@ export class MutationIntentCoordinatorV2 {
         this.initialized = true;
       })().catch((error) => {
         this.initialization = null;
-        throw new MutationIntentJournalErrorV2("OpenEvo Desktop could not restore mutation retry identity", { cause: error });
+        throw new MutationIntentJournalErrorV2("EvoLab could not restore mutation retry identity", { cause: error });
       });
     }
     await this.initialization;
@@ -437,7 +437,7 @@ export class MutationIntentCoordinatorV2 {
           return decision.result;
         } catch (error) {
           if (!isNativeCasConflict(error) || attempt + 1 === MAX_CAS_RETRIES) {
-            throw new MutationIntentJournalErrorV2("OpenEvo Desktop could not persist mutation retry identity", { cause: error });
+            throw new MutationIntentJournalErrorV2("EvoLab could not persist mutation retry identity", { cause: error });
           }
           const refreshed = await this.bridge.readMutationIntentJournalV2();
           this.installRawValue(refreshed);

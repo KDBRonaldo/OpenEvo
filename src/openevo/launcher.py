@@ -1546,7 +1546,7 @@ def _wait_for_local_webui(local_port: int) -> None:
                 url, timeout=LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS
             ) as response:
                 body = response.read(4096).decode("utf-8", errors="replace")
-            if response.status == 200 and "<title>OpenEvo</title>" in body:
+            if response.status == 200 and "<title>EvoLab</title>" in body:
                 return
             last_error = f"unexpected response status/body from {url}"
         except (OSError, urllib.error.URLError) as exc:

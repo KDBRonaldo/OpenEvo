@@ -52,7 +52,6 @@ import type {
   SuccessorTransitionV2,
   TaskV2,
 } from "../api/v2/schemas";
-import { OpenEvoMark } from "../components/OpenEvoMark";
 import {
   LifecycleOperationPanelV2,
   coreOperationPanelModelV2,
@@ -84,6 +83,10 @@ const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
+const PROJECT_TASK_PLACEHOLDER = {
+  title: "Untitled Session",
+  objective: "Task details are provided when the Session starts.",
+} satisfies ScienceProjectConfigV2["task"];
 
 function readPersistedRecord(storageKey: string): Record<string, string> {
   try {
@@ -320,7 +323,7 @@ export function DesktopProductApp({
             // because a subscription refresh superseded its preflight read.
             if (requestSequence !== refreshRequestSequence.current) continue;
             if (result.status !== "fresh") {
-              const error = new Error("OpenEvo Desktop state is not currently authoritative.");
+              const error = new Error("EvoLab state is not currently authoritative.");
               setLoadError(userMessageV2(result.status === "error" ? result.stream.error : error));
               if (snapshotRef.current === null && !initialFailureReported.current) {
                 initialFailureReported.current = true;
@@ -666,9 +669,7 @@ export function DesktopProductApp({
       } as CSSProperties}
     >
       <aside className="product-activitybar" aria-label="Primary navigation">
-        <div className="product-brand" aria-label="OpenEvo Desktop" title="OpenEvo Desktop">
-          <span className="product-mark"><OpenEvoMark /></span>
-        </div>
+        <div className="product-brand" aria-label="EvoLab" title="EvoLab"><span>EvoLab</span></div>
         <nav className="product-nav" aria-label="Workspace views">
           <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>Research</WorkspaceButton>
           <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
@@ -973,21 +974,21 @@ function InitialV2View({
   return (
     <div className="product-shell initial-sync-shell">
       <aside className="product-sidebar">
-        <div className="product-brand"><span className="product-mark"><OpenEvoMark /></span><span>OpenEvo</span></div>
+        <div className="product-brand"><span>EvoLab</span></div>
       </aside>
       <div className="product-stage">
-        <header className="product-topbar"><strong>OpenEvo Desktop</strong><button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button></header>
+        <header className="product-topbar"><strong>EvoLab</strong><button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button></header>
         <main className="product-main">
           <Notice
             tone={error ? "error" : "info"}
-            title={error ? "OpenEvo Desktop could not load its local state" : "Loading your workspace"}
+            title={error ? "EvoLab could not load its local state" : "Loading your workspace"}
             detail={error ?? "Verifying the packaged Desktop Local API v2 authority."}
             action={error ? <button className="secondary-button" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry</button> : <LoaderCircle className="spin" size={18} />}
           />
           <section className="quiet-empty empty-project-state">
             <Server size={28} />
             <h1>No authoritative workspace loaded</h1>
-            <p>Connect a remote OpenEvo daemon to load projects, sessions, artifacts, and workspace files.</p>
+            <p>Connect a remote EvoLab service to load projects, Sessions, results, and workspace files.</p>
             <button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button>
           </section>
         </main>
@@ -1137,7 +1138,7 @@ function RemoteWorkspaceSetupV2({
         <div className="drawer-content">
           {error ? <Notice tone="error" title="Connection action failed" detail={error} onDismiss={onClearError} /> : null}
           <section className="form-section">
-            <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>OpenEvo reads aliases from your system <code>~/.ssh/config</code> and invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for host, port, user, identities, ProxyJump, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
+            <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>EvoLab reads aliases from your system <code>~/.ssh/config</code> and invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for host, port, user, identities, ProxyJump, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
             {snapshot.catalog.warnings.length > 0 ? (
               <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>Some SSH configuration entries could not be listed.</strong> Fix your system OpenSSH configuration, then rescan.</span></div>
             ) : null}
@@ -1268,8 +1269,6 @@ function NewProjectDialogV2({
   readonly onError: (error: unknown) => void;
 }) {
   const [displayName, setDisplayName] = useState(project?.display_name ?? "New research project");
-  const [title, setTitle] = useState(project?.config.task.title ?? "Research task");
-  const [objective, setObjective] = useState(project?.config.task.objective ?? "");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">(project?.config.workspace.kind ?? "scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState(project?.config.workspace.display_name ?? "Research workspace");
   const [executionMode, setExecutionMode] = useState<ScienceProjectConfigV2["execution"]["mode"]>(project?.config.execution.mode ?? "codex_subscription_transcript");
@@ -1277,7 +1276,8 @@ function NewProjectDialogV2({
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
   const closedRef = useRef(false);
   const dialogRef = useDialogBoundary(onClose);
-  const baseDraftValid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== "";
+  const projectTask = project?.config.task ?? PROJECT_TASK_PLACEHOLDER;
+  const baseDraftValid = displayName.trim() !== "";
   const valid = baseDraftValid
     && (workspaceKind === "scratch" || sourceActionId !== null || project !== null);
 
@@ -1287,8 +1287,8 @@ function NewProjectDialogV2({
     onBusy(true);
     try {
       const config = scienceProjectConfig(
-        title,
-        objective,
+        projectTask.title,
+        projectTask.objective,
         "native_folder_snapshot",
         workspaceDisplayName,
         executionMode,
@@ -1329,8 +1329,8 @@ function NewProjectDialogV2({
     if (!valid) return;
     const actionId = workspaceKind === "native_folder_snapshot" && project === null ? sourceActionId! : actionIdV2(project ? "update-project" : "create-project");
     const config = scienceProjectConfig(
-      title,
-      objective,
+      projectTask.title,
+      projectTask.objective,
       workspaceKind,
       workspaceDisplayName,
       executionMode,
@@ -1370,8 +1370,6 @@ function NewProjectDialogV2({
         <div className="drawer-content">
           <section className="form-section">
             <label>Project name<input maxLength={256} value={displayName} disabled={sourceActionId !== null} onChange={(event) => setDisplayName(event.target.value)} /></label>
-            <label>Task title<input maxLength={256} value={title} disabled={sourceActionId !== null} onChange={(event) => setTitle(event.target.value)} /></label>
-            <label>Task objective<textarea rows={7} maxLength={65_536} value={objective} disabled={sourceActionId !== null} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the scientific result the agent should produce." /></label>
           </section>
           <section className="form-section">
             <h3>Workspace snapshot</h3>
@@ -1385,7 +1383,7 @@ function NewProjectDialogV2({
               <button type="button" className={executionMode === "self-deployed" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => setExecutionMode("self-deployed")}>Self-Deployed</button>
             </div>
             <div className="agent-note"><ShieldCheck size={17} /><span>{executionMode === "self-deployed" ? "Codex → Core Gateway → managed vLLM · Qwen3 0.6B · exact release profile" : "Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort"}</span></div>
-            {executionMode === "self-deployed" ? <p className="form-help">Requires a supported NVIDIA GPU, NVIDIA Container Toolkit, Docker Engine, and at least 30 GiB free storage. OpenEvo prepares the pinned image and exact model snapshot on first run.</p> : null}
+            {executionMode === "self-deployed" ? <p className="form-help">Requires a supported NVIDIA GPU, NVIDIA Container Toolkit, Docker Engine, and at least 30 GiB free storage. EvoLab prepares the pinned image and exact model snapshot on first run.</p> : null}
           </section>
         </div>
         <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : project ? <Settings size={15} /> : <Plus size={15} />} {project ? "Save project" : "Create project"}</button></div>
@@ -2130,7 +2128,7 @@ function ResearchWorkspaceV2({
               <span>
                 <strong>The next task cannot start yet.</strong>{" "}
                 {project.state === "not_ready" && project.active_project_head === null
-                  ? "OpenEvo is preparing the remote service and initial Project Head. This page will retry automatically."
+                  ? "EvoLab is preparing the remote service and initial Project Head. This page will retry automatically."
                   : "Wait for the current Evolution, settings, workspace, or runtime change to finish."}
               </span>
               {project.state === "not_ready" && project.active_project_head === null ? (
@@ -2410,7 +2408,7 @@ function sessionActivityStageV2(
     return "Codex is reasoning and working in the project workspace.";
   }
   if (latest.includes("Running the selected evolution methods")) {
-    return "The Agent replied. OpenEvo is applying the selected evolution methods.";
+    return "The Agent replied. EvoLab is applying the selected evolution methods.";
   }
   if (latest.includes("published") && latest.includes("for the next session")) {
     return "Saving evolved context for the next Session.";
@@ -2656,7 +2654,7 @@ function TaskAuthorityCardV2({
       </section>
       {taskNeedsRecovery || transitionNeedsRecovery ? <section className="session-recovery-card" data-session-priority="recovery" role="alert">
         <AlertCircle size={18} />
-        <div><strong>{taskNeedsRecovery ? "Session failed" : "Project Head update failed"}</strong><p>{taskNeedsRecovery ? "OpenEvo could not complete this Session. You can retry it with the same pinned context." : transition?.error?.message ?? "OpenEvo could not prepare the next Project Head."}</p><div className="session-recovery-actions">{taskNeedsRecovery ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Retry Session</button> : null}{transitionNeedsRecovery ? <><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Discard evolution result</button></> : null}</div></div>
+        <div><strong>{taskNeedsRecovery ? "Session failed" : "Project Head update failed"}</strong><p>{taskNeedsRecovery ? "EvoLab could not complete this Session. You can retry it with the same pinned context." : transition?.error?.message ?? "EvoLab could not prepare the next Project Head."}</p><div className="session-recovery-actions">{taskNeedsRecovery ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Retry Session</button> : null}{transitionNeedsRecovery ? <><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Discard evolution result</button></> : null}</div></div>
       </section> : null}
       </>}
       </aside>
@@ -3142,7 +3140,7 @@ function EvolutionWorkspaceV2({
               <div className="segmented-control" role="tablist" aria-label="Current result view"><button type="button" role="tab" aria-selected={latestArtifactView === "content"} className={latestArtifactView === "content" ? "active" : ""} onClick={() => setLatestArtifactView("content")}><FileText size={14} /> Content</button><button type="button" role="tab" aria-selected={latestArtifactView === "changes"} className={latestArtifactView === "changes" ? "active" : ""} onClick={() => setLatestArtifactView("changes")}><History size={14} /> Changes</button></div>
               {latestArtifactView === "content" ? <div className="v2-artifact-documents">{selectedLatestPreview?.documents.length ? selectedLatestPreview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>{document.path.endsWith(".md") ? "text/markdown" : "text/plain"}</small></div><pre>{document.content}</pre></section>) : <p className="v2-empty-copy">No readable document body is available for this result.</p>}</div> : <div className="v2-artifact-diff"><div className="v2-diff-summary"><span>Compared with <strong>{selectedLatestPreview?.previousArtifactId ?? "no previous version"}</strong></span></div>{selectedLatestPreview?.diffLines.length ? <pre>{selectedLatestPreview.diffLines.map((line, index) => <span key={`${line.kind}-${index}`} className={line.kind}>{line.kind === "added" ? "+ " : line.kind === "removed" ? "− " : "  "}{line.text}</span>)}</pre> : <p className="v2-empty-copy">No textual change preview is available.</p>}</div>}
             </div> : null}
-          </div> : latestArtifactsPending ? <div className="v2-current-evolution-empty loading"><LoaderCircle className="spin" size={18} /><div><strong>Loading result artifacts</strong><span>The candidate is ready. OpenEvo is refreshing its readable artifact inventory.</span></div><button type="button" className="secondary-button" disabled={busy} onClick={onRefresh}>Refresh result</button></div> : latestRun.state !== "running" && latestRun.state !== "failed" ? <div className="v2-current-evolution-empty"><div><strong>No displayable result was published</strong><span>The run completed, but it did not declare an artifact that this WebUI can preview.</span></div></div> : null}
+          </div> : latestArtifactsPending ? <div className="v2-current-evolution-empty loading"><LoaderCircle className="spin" size={18} /><div><strong>Loading result artifacts</strong><span>The candidate is ready. EvoLab is refreshing its readable artifact inventory.</span></div><button type="button" className="secondary-button" disabled={busy} onClick={onRefresh}>Refresh result</button></div> : latestRun.state !== "running" && latestRun.state !== "failed" ? <div className="v2-current-evolution-empty"><div><strong>No displayable result was published</strong><span>The run completed, but it did not declare an artifact that this WebUI can preview.</span></div></div> : null}
           <div className="v2-evolution-apply-bar"><div><strong>{latestRun.state === "applied" ? latestRun.appliedProjectHeadId ? `Applied as ${projectHeadDisplayName(latestRun.appliedProjectHeadId)}` : "Applied Evolution" : latestRun.state === "candidate_ready" ? "Candidate ready to apply" : "Evolution Run controls"}</strong><span>{latestRun.state === "candidate_ready" ? "Applying this candidate creates the context used by the next Project Head." : latestRun.state === "applied" ? "This historical candidate was applied to the Project Head shown above." : "Retry only the failed methods while preserving the original evidence."}</span></div><div className="v2-card-actions">{latestRun.state === "candidate_ready" ? <button type="button" className="primary-button" disabled={busy || latestArtifactsPending} onClick={() => onApplyRun(latestRun.runId)}>Apply to future Sessions</button> : null}{latestRun.state === "applied" ? <span className="muted-pill">Applied</span> : null}{allJobs.filter((job) => latestRun.jobIds.includes(job.jobId) && job.state === "failed").map((job) => <button type="button" className="secondary-button" disabled={busy} key={job.jobId} onClick={() => onRetryJob(job.jobId)}>Retry {evolutionTargetLabel(job.targetId)}</button>)}</div></div>
           </article></div>
         </>}
@@ -3274,7 +3272,7 @@ function userMessageV2(error: unknown): string {
   if (error instanceof DesktopApiErrorV2) return error.apiError.summary;
   if (isDesktopErrorV2(error)) return error.summary;
   if (error instanceof Error && error.message.length > 0 && error.message.length <= 768) return error.message;
-  return "OpenEvo could not complete this action. Refresh the remote state and try again.";
+  return "EvoLab could not complete this action. Refresh the remote state and try again.";
 }
 
 function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
@@ -3295,7 +3293,7 @@ function connectionLabel(state: RemoteWorkspaceProfileV2["connection_state"]): s
     connecting: "Connecting with OpenSSH",
     prompt_pending: "Waiting for local authentication",
     host_key_review: "Host identity review required",
-    bootstrapping: "Checking the OpenEvo daemon",
+    bootstrapping: "Checking the EvoLab service",
     negotiating: "Negotiating Core authority",
     connected: "Connected",
     disconnecting: "Disconnecting",

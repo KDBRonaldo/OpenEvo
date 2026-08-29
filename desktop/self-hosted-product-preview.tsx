@@ -45,7 +45,7 @@ async function establishBrowserSession(): Promise<DesktopBootstrapContextV2> {
   if (bootstrapToken === null) {
     const stored = loadStoredBrowserSession();
     if (stored !== null) return stored;
-    throw new Error("OpenEvo must be opened from the remote development launcher.");
+    throw new Error("EvoLab must be opened from the remote development launcher.");
   }
   if (!BOOTSTRAP_TOKEN_PATTERN.test(bootstrapToken)) {
     throw new Error("The browser bootstrap token is invalid.");

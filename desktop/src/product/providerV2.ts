@@ -292,7 +292,7 @@ export function isDesktopProductProviderV2(value: unknown): value is DesktopProd
 
 export class DesktopProductProviderUnavailableErrorV2 extends Error {
   constructor() {
-    super("OpenEvo Desktop could not reach its local v2 service.");
+    super("EvoLab could not reach its local service.");
     this.name = "DesktopProductProviderUnavailableErrorV2";
   }
 }

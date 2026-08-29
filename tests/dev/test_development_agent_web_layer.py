@@ -1302,7 +1302,7 @@ def test_self_hosted_layer_serves_the_preserved_webui_renderer() -> None:
         asset_statuses = [client.get(path).status_code for path in asset_paths]
 
     assert page.status_code == 200
-    assert "<title>OpenEvo</title>" in page.text
+    assert "<title>EvoLab</title>" in page.text
     assert asset_paths
     assert asset_statuses == [200] * len(asset_paths)
     assert bootstrap.status_code == 200

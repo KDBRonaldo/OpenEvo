@@ -385,7 +385,7 @@ def test_local_webui_health_check_never_uses_environment_proxy(
 ) -> None:
     class WebUiHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            body = b"<!doctype html><title>OpenEvo</title>"
+            body = b"<!doctype html><title>EvoLab</title>"
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
