@@ -8085,6 +8085,39 @@ pre.json {
   max-width: 760px;
 }
 
+.evolution-heading-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.evolution-heading-running-icon {
+  display: inline-flex;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(47 151 129 / 18%);
+  border-radius: 50%;
+  color: #348b76;
+  background: rgb(234 248 244 / 78%);
+  box-shadow: 0 0 0 7px rgb(53 165 142 / 6%), 0 8px 20px rgb(28 91 76 / 8%);
+}
+
+.evolution-workspace-heading.is-running h1 {
+  background: linear-gradient(100deg, #18231f 6%, #2d7765 44%, #6675bd 58%, #285f53 76%);
+  background-size: 190% 100%;
+  background-clip: text;
+  animation: evolution-heading-running-shine 3.4s ease-in-out infinite;
+  -webkit-text-fill-color: transparent;
+}
+
+@keyframes evolution-heading-running-shine {
+  0%, 15% { background-position: 100% 50%; }
+  65%, 100% { background-position: 0 50%; }
+}
+
 .evolution-workspace-heading .eyebrow {
   display: flex;
   align-items: center;
@@ -9205,6 +9238,7 @@ pre.json {
   .product-main > .quiet-empty,
   .initial-launch-progress > span,
   .initial-launch-title-shimmer,
+  .evolution-workspace-heading.is-running h1,
   .v2-agent-running-dot,
   .v2-agent-running-text {
     animation: none;

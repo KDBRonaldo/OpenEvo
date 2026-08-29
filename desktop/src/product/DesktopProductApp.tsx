@@ -2998,6 +2998,8 @@ function EvolutionWorkspaceV2({
     .filter((run) => run.projectId === project.project_id)]
     .reverse();
   const newestRun = runs[0];
+  const runningRun = runs.find((run) => run.state === "running");
+  const evolutionRunning = runningRun !== undefined;
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [resultView, setResultView] = useState<"history" | "detail">("detail");
   useEffect(() => {
@@ -3075,7 +3077,16 @@ function EvolutionWorkspaceV2({
   return (
     <div className="workspace-stack evolution-workspace-v2" data-testid="evolution-workspace">
       <div className="evolution-atmosphere" aria-hidden="true"><span /><span /><span /></div>
-      <div className="workspace-heading evolution-workspace-heading"><div><h1>Improve future Sessions</h1><p>Select completed Sessions to create improvements. Review the result, then apply it to new Sessions.</p></div>{project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Currently applied</small><strong>Version {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by new Sessions</em></span></div> : null}</div>
+      <div className={`workspace-heading evolution-workspace-heading${evolutionRunning ? " is-running" : ""}`}>
+        <div>
+          <div className="evolution-heading-title">
+            {evolutionRunning ? <span className="evolution-heading-running-icon" aria-hidden="true"><LoaderCircle className="spin" size={22} /></span> : null}
+            <h1>{evolutionRunning ? "Evolution is running" : "Improve future Sessions"}</h1>
+          </div>
+          <p>{evolutionRunning ? `Creating improvements from ${runningRun.sourceTaskIds.length} selected Session${runningRun.sourceTaskIds.length === 1 ? "" : "s"}.` : "Select completed Sessions to create improvements. Review the result, then apply it to new Sessions."}</p>
+        </div>
+        {project.active_project_head ? <div className="evolution-head-context"><span className="evolution-head-context-icon"><ShieldCheck size={16} /></span><span><small>Currently applied</small><strong>Version {project.active_project_head.generation}</strong><em><CircleDot size={8} /> Used by new Sessions</em></span></div> : null}
+      </div>
       {standaloneAvailable ? <section id="evolution-evidence" className="product-panel task-panel evolution-step-section">
         <div className="panel-heading"><div><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
         <div className="evolution-section-body">{completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task, index) => {

@@ -1747,6 +1747,13 @@ describe("Desktop v2 product renderer", () => {
     const blocked = button("Evolution running");
     expect(blocked.disabled).toBe(true);
     expect(blocked.querySelector(".spin")).toBeNull();
+
+    await click("Evolution");
+    expect(document.querySelector(".evolution-workspace-heading h1")?.textContent).toBe(
+      "Evolution is running",
+    );
+    expect(document.querySelector(".evolution-heading-running-icon .spin")).toBeTruthy();
+    expect(document.body.textContent).toContain("Creating improvements from 1 selected Session.");
   });
 
   it("coalesces an SSE refresh with the Start session authority preflight", async () => {
