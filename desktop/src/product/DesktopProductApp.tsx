@@ -982,9 +982,10 @@ function InitialV2View({
               </div>
             </>
           ) : (
-            <p className="initial-launch-preparing" role="status">
-              Preparing your workspace and connecting to the remote service — EvoLab will open automatically when everything is ready.
-            </p>
+            <div className="initial-launch-preparing" role="status">
+              <LoaderCircle className="spin" size={21} aria-hidden="true" />
+              <span>Preparing your workspace and connecting to the remote service — EvoLab will open automatically when everything is ready.</span>
+            </div>
           )}
           {error ? (
             <button className="initial-launch-retry" type="button" onClick={onRetry}>

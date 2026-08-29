@@ -1572,17 +1572,20 @@ pre.json {
 }
 
 .initial-launch-copy {
-  width: min(850px, 82%);
+  width: 100%;
 }
 
 .initial-launch-copy h1 {
-  max-width: 920px;
+  width: fit-content;
+  max-width: 100%;
   margin: 0;
+  padding: .08em .04em .12em 0;
   color: #151b29;
-  font-size: clamp(58px, 7.4vw, 112px);
+  font-size: clamp(56px, 6.7vw, 104px);
   font-weight: 750;
-  letter-spacing: -.075em;
-  line-height: .94;
+  letter-spacing: -.07em;
+  line-height: 1.04;
+  white-space: nowrap;
 }
 
 .initial-launch-copy h1 > span {
@@ -1627,14 +1630,22 @@ pre.json {
   line-height: 1.7;
 }
 
-.initial-launch-copy > .initial-launch-preparing {
-  max-width: 980px;
-  margin-top: 40px;
+.initial-launch-preparing {
+  display: flex;
+  max-width: 900px;
+  margin-top: 32px;
+  align-items: center;
+  gap: 11px;
   color: #586762;
-  font-size: clamp(34px, 2.5vw, 40px);
-  font-weight: 450;
-  letter-spacing: -.025em;
-  line-height: 1.4;
+  font-size: clamp(15px, 1.15vw, 18px);
+  font-weight: 500;
+  letter-spacing: -.01em;
+  line-height: 1.55;
+}
+
+.initial-launch-preparing > svg {
+  flex: 0 0 auto;
+  color: #438271;
 }
 
 .initial-launch-status {
@@ -1740,14 +1751,20 @@ pre.json {
 
   .initial-launch-copy h1 {
     font-size: clamp(46px, 15vw, 72px);
+    white-space: normal;
   }
 
   .initial-launch-copy > p {
     font-size: 15px;
   }
 
-  .initial-launch-copy > .initial-launch-preparing {
-    font-size: 28px;
+  .initial-launch-preparing {
+    align-items: flex-start;
+    font-size: 15px;
+  }
+
+  .initial-launch-preparing > svg {
+    margin-top: 1px;
   }
 }
 
