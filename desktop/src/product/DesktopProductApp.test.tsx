@@ -682,6 +682,21 @@ describe("Desktop v2 product renderer", () => {
     window.history.replaceState(null, "", window.location.pathname);
   });
 
+  it("shows a passive startup screen while the workspace loads", async () => {
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      refresh: vi.fn(() => new Promise<never>(() => undefined)),
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+
+    expect(document.body.textContent).toContain("EvoLab is starting.");
+    expect(document.body.textContent).toContain("No action is needed");
+    expect(document.body.textContent).not.toContain("Add remote workspace");
+    expect(document.querySelector(".product-sidebar")).toBeNull();
+    expect(document.querySelector(".product-topbar")).toBeNull();
+  });
+
   it("uses configured OpenSSH aliases in the localhost browser host", async () => {
     window.history.replaceState(
       null,

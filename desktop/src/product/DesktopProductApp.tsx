@@ -450,10 +450,6 @@ export function DesktopProductApp({
       <InitialV2View
         error={loadError}
         onRetry={() => void refresh()}
-        onAddRemote={() => {
-          setConnectionOpen(true);
-          void refresh();
-        }}
       />
     );
   }
@@ -965,34 +961,50 @@ export function DesktopProductApp({
 function InitialV2View({
   error,
   onRetry,
-  onAddRemote,
 }: {
   readonly error: string | null;
   readonly onRetry: () => void;
-  readonly onAddRemote: () => void;
 }) {
   return (
-    <div className="product-shell initial-sync-shell">
-      <aside className="product-sidebar">
-        <div className="product-brand"><span>EvoLab</span></div>
-      </aside>
-      <div className="product-stage">
-        <header className="product-topbar"><strong>EvoLab</strong><button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button></header>
-        <main className="product-main">
-          <Notice
-            tone={error ? "error" : "info"}
-            title={error ? "EvoLab could not load its local state" : "Loading your workspace"}
-            detail={error ?? "Verifying the packaged Desktop Local API v2 authority."}
-            action={error ? <button className="secondary-button" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry</button> : <LoaderCircle className="spin" size={18} />}
-          />
-          <section className="quiet-empty empty-project-state">
-            <Server size={28} />
-            <h1>No authoritative workspace loaded</h1>
-            <p>Connect a remote EvoLab service to load projects, Sessions, results, and workspace files.</p>
-            <button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button>
-          </section>
-        </main>
-      </div>
+    <div className={`product-shell initial-launch-shell${error ? " has-error" : ""}`}>
+      <header className="initial-launch-header">
+        <strong>EvoLab</strong>
+        <span>{error ? "Startup paused" : "Starting"}</span>
+      </header>
+      <main className="initial-launch-main">
+        <section className="initial-launch-copy" aria-live="polite">
+          <div className="initial-launch-kicker">
+            <span aria-hidden="true" />
+            {error ? "STARTUP NEEDS ATTENTION" : "STARTING EVOLAB"}
+          </div>
+          <h1>
+            {error ? "EvoLab needs " : "EvoLab is "}
+            <span>{error ? "a moment." : "starting."}</span>
+          </h1>
+          <p>
+            {error
+              ? "The workspace could not be prepared automatically. Retry the startup when you are ready."
+              : "Preparing your workspace and connecting to the remote service. No action is needed — EvoLab will open automatically when everything is ready."}
+          </p>
+          <div className={`initial-launch-status${error ? " is-error" : ""}`} role="status">
+            {error ? <AlertCircle size={17} /> : <LoaderCircle className="spin" size={17} />}
+            <div>
+              <strong>{error ? "Startup did not complete" : "Preparing your workspace"}</strong>
+              <span>{error ?? "Secure connection and project state are loading."}</span>
+            </div>
+          </div>
+          {error ? (
+            <button className="initial-launch-retry" type="button" onClick={onRetry}>
+              <RefreshCw size={16} /> Retry startup
+            </button>
+          ) : null}
+        </section>
+        <div className="initial-launch-progress" aria-hidden="true"><span /></div>
+      </main>
+      <footer className="initial-launch-footer">
+        <span>EvoLab</span>
+        <span>Agent evolution workspace</span>
+      </footer>
     </div>
   );
 }
