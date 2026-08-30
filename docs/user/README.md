@@ -7,18 +7,19 @@ the old DMG or packaged Tauri Desktop application.
 
 Requirements on the user's computer:
 
-- macOS (the current pre-release does not publish Windows, Linux, or WSL launchers);
+- macOS or WSL (native Windows PowerShell is not supported by this pre-release);
 - Python 3.11 or newer;
 - POSIX `sh` and `tar`;
 - system OpenSSH (`ssh`);
 - a literal host alias in `~/.ssh/config`.
 
-Download `EvoLab-macOS-0.2.1.tar.gz` from the `v0.2.1` GitHub Release. Do not
+Download `evolab-launcher.zip` from the matching GitHub Release. The same
+package is tested on macOS and the WSL-compatible Linux path. Do not
 download GitHub's `Source code (zip)` or `Source code (tar.gz)` links; those are
 repository snapshots rather than the installer. Install the archive with:
 
 ```bash
-tar -xzf EvoLab-macOS-0.2.1.tar.gz
+unzip evolab-launcher.zip
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```

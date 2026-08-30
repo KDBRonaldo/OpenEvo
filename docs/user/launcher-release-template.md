@@ -1,21 +1,22 @@
-# EvoLab {{VERSION}} for macOS
+# EvoLab {{VERSION}} for macOS and WSL
 
-> **Supported local platform:** macOS only. Windows, Linux, and WSL launcher packages are not included in this pre-release.
+> **Supported local platforms:** macOS and WSL. Native Windows PowerShell is not supported in this pre-release. Both supported environments use the same ZIP package.
 
 ## Download this file
 
 Under **Assets**, download exactly:
 
-**`EvoLab-macOS-{{VERSION}}.tar.gz`**
+**`evolab-launcher.zip`**
 
-Do not download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** files. Those are repository snapshots, not the EvoLab installer.
+Do not download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** files. Those are repository snapshots, not the EvoLab launcher package.
 
-## 1. Prepare your Mac
+## 1. Prepare your Mac or WSL environment
 
-Your Mac needs:
+Your local environment needs:
 
 - Python 3.11 or newer: `python3 --version`
 - the system OpenSSH client: `ssh -V`
+- `unzip`
 
 You do **not** need Git, uv, Node.js, npm, or an OpenEvo/EvoLab source checkout.
 
@@ -37,9 +38,9 @@ codex login status
 exit
 ```
 
-Device-code login may need to be enabled in your ChatGPT security or workspace settings. EvoLab checks Codex authentication for this same remote user; logging in as `root` does not authenticate `ubuntu`, and vice versa.
+EvoLab checks Codex authentication for this same remote user; logging in as `root` does not authenticate `ubuntu`, and vice versa.
 
-## 3. Configure SSH on your Mac
+## 3. Configure SSH locally
 
 Add a concrete alias to `~/.ssh/config`:
 
@@ -60,10 +61,10 @@ exit
 
 ## 4. Install and run EvoLab
 
-From the directory where the archive was downloaded:
+From the directory where the ZIP was downloaded:
 
 ```bash
-tar -xzf EvoLab-macOS-{{VERSION}}.tar.gz
+unzip evolab-launcher.zip
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
@@ -82,7 +83,7 @@ evolab webui
 - **SSH connection fails:** run `ssh evolab-server` and fix the host, port, user, key, or server firewall first.
 - **Remote Codex is missing:** SSH to the server and check `command -v codex`.
 - **Codex is not logged in:** run `codex login --device-auth` and `codex login status` as the same SSH user configured above.
-- **Python is too old:** confirm Python 3.11+ on the Mac with `python3 --version`.
+- **Python is too old:** confirm Python 3.11+ locally with `python3 --version`.
 
 ## Changes in this release
 

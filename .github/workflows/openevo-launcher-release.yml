@@ -73,21 +73,20 @@ jobs:
             tests/release/test_release_notes.py \
             -q
 
-      - name: Build the macOS installer archive
+      - name: Build the launcher ZIP
         run: |
           set -euo pipefail
           mkdir -p dist
-          product_version="${GITHUB_REF_NAME#v}"
           python scripts/release/build_launcher_distribution.py \
             --commit HEAD \
-            --output "dist/EvoLab-macOS-${product_version}.tar.gz"
+            --output dist/evolab-launcher.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-macos-installer
+          name: evolab-${{ github.ref_name }}-launcher
           if-no-files-found: error
           retention-days: 7
-          path: dist/EvoLab-macOS-*.tar.gz
+          path: dist/evolab-launcher.zip
 
   macos-install-smoke:
     name: Install and launch help on macOS
@@ -101,7 +100,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-macos-installer
+          name: evolab-${{ github.ref_name }}-launcher
 
       - name: Install the packaged launcher
         shell: bash
@@ -110,15 +109,40 @@ jobs:
           package_root="$RUNNER_TEMP/evolab-package"
           prefix="$RUNNER_TEMP/evolab-installed"
           mkdir -p "$package_root"
-          tar -xzf EvoLab-macOS-*.tar.gz -C "$package_root"
+          unzip -q evolab-launcher.zip -d "$package_root"
           sh "$package_root/evolab-launcher/install.sh" \
-            --prefix "$prefix" \
-            --no-path-update
+            --prefix "$prefix"
+          "$prefix/bin/evolab" webui --help
+
+  wsl-install-smoke:
+    name: Install and launch help on WSL-compatible Linux
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evolab-${{ github.ref_name }}-launcher
+
+      - name: Install the same package on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="$RUNNER_TEMP/evolab-package"
+          prefix="$RUNNER_TEMP/evolab-installed"
+          mkdir -p "$package_root"
+          unzip -q evolab-launcher.zip -d "$package_root"
+          sh "$package_root/evolab-launcher/install.sh" \
+            --prefix "$prefix"
           "$prefix/bin/evolab" webui --help
 
   publish:
     name: Publish immutable GitHub pre-release
-    needs: [build, macos-install-smoke]
+    needs: [build, macos-install-smoke, wsl-install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -126,7 +150,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: evolab-${{ github.ref_name }}-macos-installer
+          name: evolab-${{ github.ref_name }}-launcher
 
       - name: Publish EvoLab pre-release
         env:
@@ -143,12 +167,12 @@ jobs:
             -f target_commitish="$GITHUB_SHA" \
             --jq .body > "$RUNNER_TEMP/generated-notes.md"
           python scripts/release/render_release_notes.py \
-            --template docs/user/macos-release-template.md \
+            --template docs/user/launcher-release-template.md \
             --version "${GITHUB_REF_NAME#v}" \
             --changelog "$RUNNER_TEMP/generated-notes.md" \
             --output "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" \
-            EvoLab-macOS-*.tar.gz \
+            evolab-launcher.zip \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --prerelease \
