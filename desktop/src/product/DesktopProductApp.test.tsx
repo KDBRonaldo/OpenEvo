@@ -917,7 +917,14 @@ describe("Desktop v2 product renderer", () => {
       finishUpload?.();
       await Promise.resolve();
     });
-    await vi.waitFor(() => expect(document.querySelector('[aria-label="Uploading large-dataset.csv"]')).toBeNull());
+    const completedProgress = document.querySelector<HTMLElement>('[aria-label="Uploading large-dataset.csv"]');
+    expect(completedProgress?.getAttribute("aria-valuenow")).toBe("100");
+    expect(document.querySelector('[role="treeitem"][title="large-dataset.csv"]')?.textContent)
+      .toContain("Finishing upload");
+    await vi.waitFor(
+      () => expect(document.querySelector('[aria-label="Uploading large-dataset.csv"]')).toBeNull(),
+      { timeout: 2_000 },
+    );
   });
 
   it("keeps one authoritative event subscription across the initial refresh", async () => {

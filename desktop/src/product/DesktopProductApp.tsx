@@ -91,6 +91,7 @@ const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
+const WORKSPACE_UPLOAD_MINIMUM_VISIBLE_MS = 1_400;
 const PROJECT_TASK_PLACEHOLDER = {
   title: "Untitled Session",
   objective: "Task details are provided when the Session starts.",
@@ -643,6 +644,7 @@ export function DesktopProductApp({
 
   const uploadWorkspaceFiles = (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean): void => {
     if (displayedProject === null) return;
+    const visibleSince = Date.now();
     const projectId = displayedProject.project_id;
     const pending = uploads.map((upload): WorkspaceUploadStateV2 => ({
       id: actionIdV2("workspace-upload-row"),
@@ -695,6 +697,10 @@ export function DesktopProductApp({
         }
         const refreshed = await refresh();
         if (refreshed !== null) {
+          const remainingVisibleMs = WORKSPACE_UPLOAD_MINIMUM_VISIBLE_MS - (Date.now() - visibleSince);
+          if (remainingVisibleMs > 0) {
+            await new Promise<void>((resolve) => globalThis.setTimeout(resolve, remainingVisibleMs));
+          }
           setWorkspaceUploads((current) => current.filter((upload) => (
             upload.projectId !== projectId || upload.status !== "uploaded"
           )));
