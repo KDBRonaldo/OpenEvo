@@ -114,6 +114,64 @@ def test_task_presentation_v2_is_paginated_and_restart_safe(tmp_path: Path) -> N
     assert presentation.model_dump(mode="json")["schema_version"] == "2"
 
 
+def test_project_and_session_deletions_are_durable_filtered_tombstones(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    for project_id, display_name in (
+        ("project-keep", "Keep"),
+        ("project-delete", "Delete"),
+    ):
+        store.create_project(
+            {"project_id": project_id, "display_name": display_name, "config": {}}
+        )
+    store.start_session(
+        "session-delete",
+        {
+            "project_id": "project-keep",
+            "project_name": "Keep",
+            "task_title": "Disposable Session",
+            "instruction": "Complete before deletion.",
+        },
+    )
+    store.complete_session(
+        "session-delete",
+        {
+            "response": "Done.",
+            "model": "codex-test",
+            "duration_ms": 1,
+            "logs": [],
+            "workspace_changes": [],
+            "runtime_activation": None,
+        },
+    )
+
+    assert store.delete_session("session-delete", "delete-session-action") == "project-delete"
+    assert store.delete_session("session-delete", "delete-session-action") == "project-delete"
+    with pytest.raises(KeyError):
+        store.delete_session("session-delete", "different-session-action")
+    with pytest.raises(KeyError):
+        store.get_session("session-delete")
+    assert store.task_presentations_v2(project_id="project-keep").items == []
+
+    active_project_id = store.delete_project("project-delete", "delete-project-action")
+    assert active_project_id == "project-keep"
+    restarted = MODULE.DevelopmentStateStore(database)
+    snapshot = restarted.snapshot()
+    assert snapshot["active_project_id"] == "project-keep"
+    assert [project["project_id"] for project in snapshot["projects"]] == ["project-keep"]
+    assert snapshot["sessions"] == []
+    assert (tmp_path / "workspaces" / "project-delete").is_dir()
+    with pytest.raises(KeyError):
+        restarted.update_project(
+            "project-delete", {"display_name": "Still deleted", "config": {}}
+        )
+    assert restarted.delete_project("project-delete", "delete-project-action") == "project-keep"
+    with pytest.raises(KeyError):
+        restarted.delete_project("project-delete", "different-project-action")
+
+
 def test_extract_event_logs_ignores_agent_message_content() -> None:
     stdout = "\n".join(
         [
@@ -1254,6 +1312,78 @@ def test_http_workspace_file_upload_and_download_round_trip(tmp_path: Path) -> N
     assert created["entry"]["path"] == "data/实验.csv"
     assert downloaded == payload
     assert content_type == "text/csv"
+
+
+def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(
+    tmp_path: Path,
+) -> None:
+    token = "d" * 32
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    for project_id in ("project-keep", "project-delete"):
+        store.create_project(
+            {"project_id": project_id, "display_name": project_id, "config": {}}
+        )
+    store.start_session(
+        "task-delete",
+        {
+            "project_id": "project-keep",
+            "project_name": "project-keep",
+            "task_title": "Delete me",
+            "instruction": "Finish first.",
+        },
+    )
+    store.complete_session(
+        "task-delete",
+        {
+            "response": "Done.",
+            "model": "codex-test",
+            "duration_ms": 1,
+            "logs": [],
+            "workspace_changes": [],
+            "runtime_activation": None,
+        },
+    )
+    server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def delete(path: str, action_id: str) -> dict[str, object]:
+        request = urllib.request.Request(
+            f"{base_url}{path}",
+            data=json.dumps({"schema_version": "2", "action_id": action_id}).encode(),
+            method="DELETE",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read())
+
+    try:
+        task_receipt = delete("/v2/development/tasks/task-delete", "delete-task")
+        assert task_receipt == {
+            "schema_version": "2",
+            "action_id": "delete-task",
+            "resource_kind": "task",
+            "resource_id": "task-delete",
+            "active_project_id": "project-delete",
+        }
+        assert delete("/v2/development/tasks/task-delete", "delete-task") == task_receipt
+        project_receipt = delete(
+            "/v2/development/projects/project-delete", "delete-project"
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert project_receipt["resource_kind"] == "project"
+    assert project_receipt["active_project_id"] == "project-keep"
+    assert [project["project_id"] for project in store.snapshot()["projects"]] == [
+        "project-keep"
+    ]
 
 
 def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(

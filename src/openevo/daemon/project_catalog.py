@@ -90,6 +90,11 @@ class SqliteProjectCatalog:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS development_deleted_projects (
+                project_id TEXT PRIMARY KEY REFERENCES development_projects(project_id),
+                action_id TEXT NOT NULL UNIQUE,
+                deleted_at TEXT NOT NULL
+            );
             """
         )
 
@@ -102,7 +107,11 @@ class SqliteProjectCatalog:
         projects = tuple(
             cls._project_from_row(row)
             for row in connection.execute(
-                "SELECT * FROM development_projects ORDER BY created_at, project_id"
+                "SELECT project.* FROM development_projects AS project "
+                "LEFT JOIN development_deleted_projects AS deleted "
+                "ON deleted.project_id = project.project_id "
+                "WHERE deleted.project_id IS NULL "
+                "ORDER BY project.created_at, project.project_id"
             )
         )
         active_row = connection.execute(
@@ -140,6 +149,14 @@ class SqliteProjectCatalog:
                 if existing_row is None:
                     raise
                 existing = self._project_from_row(existing_row)
+                deleted = connection.execute(
+                    "SELECT 1 FROM development_deleted_projects WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                if deleted is not None:
+                    raise ProjectCatalogConflictError(
+                        "deleted project_id cannot be reused"
+                    ) from exc
                 if existing.display_name != display_name or existing.config != config:
                     raise ProjectCatalogConflictError("project_id already exists") from exc
                 self._set_active(connection, project_id)
@@ -161,6 +178,10 @@ class SqliteProjectCatalog:
                 UPDATE development_projects
                 SET display_name = ?, config_json = ?, updated_at = ?
                 WHERE project_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM development_deleted_projects
+                      WHERE development_deleted_projects.project_id = development_projects.project_id
+                  )
                 """,
                 (
                     request["display_name"],
@@ -185,6 +206,53 @@ class SqliteProjectCatalog:
                 raise ProjectCatalogNotFoundError(project_id)
             self._set_active(connection, project_id)
 
+    def delete(self, project_id: str, action_id: str) -> str | None:
+        """Persistently hide one Project while retaining its historical identity."""
+
+        now = self._clock()
+        with self._lock, self._connection_factory() as connection:
+            project = connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if project is None:
+                raise ProjectCatalogNotFoundError(project_id)
+            deleted = connection.execute(
+                "SELECT action_id FROM development_deleted_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if deleted is not None:
+                if deleted["action_id"] != action_id:
+                    raise ProjectCatalogNotFoundError(project_id)
+            else:
+                try:
+                    connection.execute(
+                        "INSERT INTO development_deleted_projects(project_id, action_id, deleted_at) "
+                        "VALUES (?, ?, ?)",
+                        (project_id, action_id, now),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ProjectCatalogConflictError(
+                        "action_id is already bound to another Project deletion"
+                    ) from exc
+
+            state = self.read_state(connection)
+            active_row = connection.execute(
+                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
+            ).fetchone()
+            persisted_active = active_row["value"] if active_row is not None else None
+            visible_ids = {candidate.project_id for candidate in state.projects}
+            if persisted_active == project_id or persisted_active not in visible_ids:
+                replacement = state.projects[-1].project_id if state.projects else None
+                if replacement is None:
+                    connection.execute(
+                        "DELETE FROM development_metadata WHERE key = 'active_project_id'"
+                    )
+                else:
+                    self._set_active(connection, replacement)
+                return replacement
+            return state.active_project_id
+
     def require(self, project_id: str) -> None:
         with self._lock, self._connection_factory() as connection:
             if not self.exists(connection, project_id):
@@ -193,7 +261,10 @@ class SqliteProjectCatalog:
     @staticmethod
     def exists(connection: sqlite3.Connection, project_id: str) -> bool:
         return connection.execute(
-            "SELECT 1 FROM development_projects WHERE project_id = ?",
+            "SELECT 1 FROM development_projects AS project "
+            "LEFT JOIN development_deleted_projects AS deleted "
+            "ON deleted.project_id = project.project_id "
+            "WHERE project.project_id = ? AND deleted.project_id IS NULL",
             (project_id,),
         ).fetchone() is not None
 

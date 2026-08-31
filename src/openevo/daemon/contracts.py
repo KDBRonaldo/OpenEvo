@@ -51,6 +51,19 @@ class DevelopmentTaskCancelV2(StrictDevelopmentModelV2):
     action_id: core.OpaqueId
 
 
+class DevelopmentResourceDeleteRequestV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+
+
+class DevelopmentResourceDeleteReceiptV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    resource_kind: Literal["project", "task"]
+    resource_id: core.OpaqueId
+    active_project_id: core.OpaqueId | None = None
+
+
 class DevelopmentEvolutionSelectionPresentationV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     target_id: core.OpaqueId
@@ -518,6 +531,8 @@ __all__ = [
     "DevelopmentProjectAuthorityV2",
     "DevelopmentProjectCreateV2",
     "DevelopmentProjectUpdateV2",
+    "DevelopmentResourceDeleteReceiptV2",
+    "DevelopmentResourceDeleteRequestV2",
     "DevelopmentStateV2",
     "DevelopmentTaskCancelV2",
     "DevelopmentTaskCreateV2",

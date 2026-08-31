@@ -2074,6 +2074,69 @@ pre.json {
   opacity: .55;
 }
 
+.soft-select-option {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+}
+
+.soft-select-option > [role="option"] {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  padding-right: 38px;
+}
+
+.soft-select-option > [role="option"] > svg {
+  margin-right: 22px;
+}
+
+.soft-select-menu .soft-select-option-more {
+  z-index: 1;
+  display: flex;
+  width: 28px;
+  min-height: 28px;
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+  justify-self: end;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  opacity: 0;
+  transform: none;
+}
+
+.soft-select-option:hover .soft-select-option-more,
+.soft-select-option-more:focus-visible,
+.soft-select-option-more[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.soft-select-option-popover {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  padding: 3px 4px 4px;
+}
+
+.soft-select-menu .soft-select-option-popover > button {
+  display: flex;
+  min-height: 32px;
+  justify-content: flex-start;
+  gap: 7px;
+  padding: 6px 9px;
+  color: #a4473e;
+  background: #fff3f1;
+  transform: none;
+}
+
+.soft-select-menu .soft-select-option-popover > button:hover,
+.soft-select-menu .soft-select-option-popover > button:focus-visible {
+  color: #8f3028;
+  background: #ffe8e4;
+  transform: none;
+}
+
 .project-switcher-select .soft-select-menu {
   width: 100%;
   min-width: 100%;
@@ -2334,6 +2397,41 @@ pre.json {
 .explorer-tree-node > button.unavailable {
   opacity: .48;
   cursor: default;
+}
+
+.explorer-tree-node.file:has(.explorer-file-delete) > button:first-child {
+  padding-right: 34px;
+}
+
+.explorer-file-delete {
+  position: absolute;
+  z-index: 2;
+  top: 3px;
+  right: 3px;
+  display: inline-flex;
+  width: 25px;
+  height: 25px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  color: #a14c43;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.explorer-tree-node.file:hover > .explorer-file-delete,
+.explorer-file-delete:focus-visible {
+  opacity: 1;
+}
+
+.explorer-file-delete:hover,
+.explorer-file-delete:focus-visible {
+  outline: 0;
+  color: #8f3028;
+  background: #fbe7e4;
 }
 
 .explorer-tree-node.upload-queued > button,
@@ -2630,12 +2728,17 @@ pre.json {
   font-size: 9px;
 }
 
-.session-explorer-list > button {
+.session-explorer-item {
+  position: relative;
+  margin-bottom: 3px;
+}
+
+.session-explorer-item-main {
   display: grid;
   width: 100%;
   grid-template-columns: 8px minmax(0, 1fr);
   gap: 3px 8px;
-  margin-bottom: 3px;
+  margin-bottom: 0;
   padding: 9px 8px;
   border: 0;
   border-radius: 6px;
@@ -2646,18 +2749,22 @@ pre.json {
   transition: color 150ms ease, background 180ms ease, box-shadow 180ms ease, transform 150ms ease;
 }
 
-.session-explorer-list > button:hover,
-.session-explorer-list > button.active {
+.session-explorer-item:has(.session-item-more) > .session-explorer-item-main {
+  padding-right: 38px;
+}
+
+.session-explorer-item-main:hover,
+.session-explorer-item.active > .session-explorer-item-main {
   color: #174f43;
   background: #e1eee9;
   box-shadow: inset 2px 0 #318268;
 }
 
-.session-explorer-list > button.active {
+.session-explorer-item.active > .session-explorer-item-main {
   transform: translateX(2px);
 }
 
-.session-explorer-list > button > span:nth-child(2) {
+.session-explorer-item-main > span:nth-child(2) {
   min-width: 0;
 }
 
@@ -2665,6 +2772,74 @@ pre.json {
 .session-explorer-list small,
 .session-explorer-list em {
   display: block;
+}
+
+.session-item-more {
+  position: absolute;
+  z-index: 2;
+  top: 7px;
+  right: 6px;
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  color: #61716a;
+  background: rgb(239 246 243 / 92%);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.session-explorer-item:hover > .session-item-more,
+.session-item-more:focus-visible,
+.session-item-more[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.session-item-more:hover,
+.session-item-more:focus-visible {
+  outline: 0;
+  color: var(--accent);
+  background: #d9ebe4;
+}
+
+.session-item-popover {
+  position: absolute;
+  z-index: 20;
+  top: 36px;
+  right: 5px;
+  display: grid;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid #e1d5d2;
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 9px 24px rgb(42 52 47 / 16%);
+}
+
+.session-item-popover > button {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 6px;
+  color: #a4473e;
+  background: #fff3f1;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.session-item-popover > button:hover,
+.session-item-popover > button:focus-visible {
+  outline: 0;
+  color: #8f3028;
+  background: #ffe8e4;
 }
 
 .session-explorer-list strong {

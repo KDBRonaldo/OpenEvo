@@ -680,6 +680,8 @@ describe("Desktop v2 product renderer", () => {
     document.body.innerHTML = "";
     window.sessionStorage.clear();
     window.history.replaceState(null, "", window.location.pathname);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("shows a passive startup screen while the workspace loads", async () => {
@@ -821,6 +823,76 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Improve future Sessions");
     expect(document.querySelector(".project-explorer")).toBeTruthy();
     expect(document.querySelector(".session-explorer")).toBeTruthy();
+  });
+
+  it("offers confirmed deletion actions for Projects, terminal Sessions, and workspace files", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        workspaces: {
+          "project-1": {
+            entries: [{
+              path: "results/report.md",
+              kind: "file",
+              byteSize: 42,
+              contentSha256: DIGEST,
+              mediaType: "text/markdown",
+              content: "# Report",
+              modifiedAt: NOW,
+            }],
+            truncated: false,
+          },
+        },
+      },
+    };
+    const deleteProject = vi.fn(async () => undefined);
+    const deleteTask = vi.fn(async () => undefined);
+    const deleteWorkspaceFile = vi.fn(async () => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      deleteProject,
+      deleteTask,
+      deleteWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    root = await render(provider);
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("#v2-project-switcher")?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="More actions for Protein study"]')?.click();
+      await Promise.resolve();
+    });
+    await click("Delete project");
+    await vi.waitFor(() => expect(deleteProject).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    ));
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="More actions for Review evidence"]')?.click();
+      await Promise.resolve();
+    });
+    await click("Delete session");
+    await vi.waitFor(() => expect(deleteTask).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    ));
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Delete results/report.md"]')?.click();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(deleteWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      "results/report.md",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    ));
+    expect(globalThis.confirm).toHaveBeenCalledTimes(3);
   });
 
   it("uploads a selected folder while preserving its relative file paths", async () => {
@@ -2074,7 +2146,7 @@ describe("Desktop v2 product renderer", () => {
     };
     root = await render(providerFixture(snapshot));
 
-    const sessionButtons = () => [...document.querySelectorAll<HTMLButtonElement>(".session-explorer-list > button")];
+    const sessionButtons = () => [...document.querySelectorAll<HTMLButtonElement>(".session-explorer-item-main")];
     expect(sessionButtons()[0]?.title).toBe("Newest running session");
 
     const search = document.querySelector<HTMLInputElement>('input[aria-label="Search Sessions"]')!;

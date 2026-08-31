@@ -165,6 +165,22 @@ class FakeDaemonClient:
                 "updated_at": "2026-08-23T00:00:01Z",
             })
             return {"schema_version": "2", **project}
+        if update_project and method == "DELETE":
+            assert isinstance(body, dict)
+            project_id = update_project.group(1)
+            self.state["projects"] = [
+                item for item in self.state["projects"]
+                if item["project_id"] != project_id
+            ]
+            if self.state["active_project_id"] == project_id:
+                self.state["active_project_id"] = None
+            return {
+                "schema_version": "2",
+                "action_id": body["action_id"],
+                "resource_kind": "project",
+                "resource_id": project_id,
+                "active_project_id": self.state["active_project_id"],
+            }
         if parsed.path == "/development/tasks" and method == "POST":
             assert isinstance(body, dict)
             session_id = f"dev-session-{hashlib.sha256(body['action_id'].encode()).hexdigest()[:16]}"
@@ -204,6 +220,21 @@ class FakeDaemonClient:
             )
             session["updated_at"] = "2026-08-23T00:00:02Z"
             return self._task_presentation(session)
+        delete_task = re.fullmatch(r"/development/tasks/([^/]+)", parsed.path)
+        if delete_task and method == "DELETE":
+            assert isinstance(body, dict)
+            task_id = delete_task.group(1)
+            self.state["sessions"] = [
+                item for item in self.state["sessions"]
+                if item["session_id"] != task_id
+            ]
+            return {
+                "schema_version": "2",
+                "action_id": body["action_id"],
+                "resource_kind": "task",
+                "resource_id": task_id,
+                "active_project_id": self.state["active_project_id"],
+            }
         if parsed.path == "/tasks":
             self.task_observation_requests += 1
             items = []
@@ -409,6 +440,40 @@ class FakeDaemonClient:
                 ],
                 "next_cursor": None,
                 "has_more": False,
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        delete_task = re.fullmatch(r"development/tasks/([^/]+)", path)
+        if delete_task and method == "DELETE":
+            deletion = json.loads(body)
+            task_id = delete_task.group(1)
+            self.state["sessions"] = [
+                item for item in self.state["sessions"]
+                if item["session_id"] != task_id
+            ]
+            payload = {
+                "schema_version": "2",
+                "action_id": deletion["action_id"],
+                "resource_kind": "task",
+                "resource_id": task_id,
+                "active_project_id": self.state["active_project_id"],
+            }
+            return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
+        delete_project = re.fullmatch(r"development/projects/([^/]+)", path)
+        if delete_project and method == "DELETE":
+            deletion = json.loads(body)
+            project_id = delete_project.group(1)
+            self.state["projects"] = [
+                item for item in self.state["projects"]
+                if item["project_id"] != project_id
+            ]
+            if self.state["active_project_id"] == project_id:
+                self.state["active_project_id"] = None
+            payload = {
+                "schema_version": "2",
+                "action_id": deletion["action_id"],
+                "resource_kind": "project",
+                "resource_id": project_id,
+                "active_project_id": self.state["active_project_id"],
             }
             return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
         if path == "development/evolution-jobs" and method == "GET":
@@ -991,6 +1056,83 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
         )
         assert deleted.status_code == 200
         assert deleted.json()["deleted_path"] == "notes/answer.txt"
+
+
+def test_http_layer_proxies_authenticated_project_and_task_deletions() -> None:
+    import openevo.web_gateway.product_app as web
+
+    fake = FakeDaemonClient()
+    project_id = "project-delete-v2"
+    task_id = "task-delete-v2"
+    fake.state.update({
+        "active_project_id": project_id,
+        "projects": [{
+            "project_id": project_id,
+            "display_name": "Delete v2",
+            "config": _config(),
+            "created_at": "2026-08-23T00:00:00Z",
+            "updated_at": "2026-08-23T00:00:00Z",
+        }],
+        "sessions": [{"session_id": task_id, "project_id": project_id}],
+    })
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="d" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    with TestClient(app) as client:
+        assert client.request(
+            "DELETE",
+            f"/desktop/v2/development/tasks/{task_id}",
+            json={"schema_version": "2", "action_id": "delete-task-action"},
+        ).status_code == 401
+        task = client.request(
+            "DELETE",
+            f"/desktop/v2/development/tasks/{task_id}",
+            headers=headers,
+            json={"schema_version": "2", "action_id": "delete-task-action"},
+        )
+        assert task.status_code == 200
+        assert task.json() == {
+            "schema_version": "2",
+            "action_id": "delete-task-action",
+            "resource_kind": "task",
+            "resource_id": task_id,
+            "active_project_id": project_id,
+        }
+
+        project = client.request(
+            "DELETE",
+            f"/desktop/v2/development/projects/{project_id}",
+            headers=headers,
+            json={"schema_version": "2", "action_id": "delete-project-action"},
+        )
+        assert project.status_code == 200
+        assert project.json() == {
+            "schema_version": "2",
+            "action_id": "delete-project-action",
+            "resource_kind": "project",
+            "resource_id": project_id,
+            "active_project_id": None,
+        }
+        repeated = client.request(
+            "DELETE",
+            f"/desktop/v2/development/projects/{project_id}",
+            headers=headers,
+            json={"schema_version": "2", "action_id": "delete-project-action"},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json() == project.json()
 
 
 def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:

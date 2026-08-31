@@ -65,6 +65,8 @@ from openevo.daemon.contracts import (
     DevelopmentProjectActivateV2,
     DevelopmentProjectCreateV2,
     DevelopmentProjectUpdateV2,
+    DevelopmentResourceDeleteReceiptV2,
+    DevelopmentResourceDeleteRequestV2,
     DevelopmentStateV2,
     DevelopmentTaskTimelinePageV2,
     DevelopmentWorkspaceDeleteV2,
@@ -1662,6 +1664,78 @@ def create_development_agent_web_app(
             payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
 
+    @app.delete(
+        "/desktop/v2/development/tasks/{task_id}",
+        include_in_schema=False,
+    )
+    async def delete_development_task(task_id: str, request: Request) -> Response:
+        try:
+            deletion = DevelopmentResourceDeleteRequestV2.model_validate(
+                await request.json()
+            )
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid Task deletion request") from exc
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/tasks/{quote(task_id, safe='')}",
+            query="",
+            method="DELETE",
+            body=deletion.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.OK:
+            try:
+                receipt = DevelopmentResourceDeleteReceiptV2.model_validate_json(payload)
+                if (
+                    receipt.action_id != deletion.action_id
+                    or receipt.resource_kind != "task"
+                    or receipt.resource_id != task_id
+                ):
+                    raise ValueError("Task deletion receipt is inconsistent")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid Task deletion receipt",
+                ) from exc
+            provider._invalidate_state()
+            payload = receipt.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.delete(
+        "/desktop/v2/development/projects/{project_id}",
+        include_in_schema=False,
+    )
+    async def delete_development_project(project_id: str, request: Request) -> Response:
+        try:
+            deletion = DevelopmentResourceDeleteRequestV2.model_validate(
+                await request.json()
+            )
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid Project deletion request") from exc
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/projects/{quote(project_id, safe='')}",
+            query="",
+            method="DELETE",
+            body=deletion.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.OK:
+            try:
+                receipt = DevelopmentResourceDeleteReceiptV2.model_validate_json(payload)
+                if (
+                    receipt.action_id != deletion.action_id
+                    or receipt.resource_kind != "project"
+                    or receipt.resource_id != project_id
+                ):
+                    raise ValueError("Project deletion receipt is inconsistent")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid Project deletion receipt",
+                ) from exc
+            provider._invalidate_state()
+            payload = receipt.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
     @app.get(
         "/desktop/v2/development/projects/{project_id}/workspace",
         include_in_schema=False,
@@ -2050,7 +2124,7 @@ def create_development_agent_web_app(
 
     @app.api_route(
         "/openevo-dev-agent/v1/{path:path}",
-        methods=["GET", "POST", "PUT", "PATCH"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         include_in_schema=False,
     )
     async def proxy_development_daemon(path: str, request: Request) -> Response:

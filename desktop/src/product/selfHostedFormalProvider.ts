@@ -185,7 +185,15 @@ export function combineSelfHostedProviders(
       if (property === "featureFlags") return featureFlags;
       if (property === "refresh") return refresh;
       if (property === "subscribe") return subscribe;
-      if (["retryEvolutionJob", "startEvolutionRun", "applyEvolutionRun", "uploadWorkspaceFile"].includes(String(property))) {
+      if ([
+        "retryEvolutionJob",
+        "startEvolutionRun",
+        "applyEvolutionRun",
+        "deleteProject",
+        "deleteTask",
+        "uploadWorkspaceFile",
+        "deleteWorkspaceFile",
+      ].includes(String(property))) {
         const mutation = Reflect.get(presentation, property);
         if (typeof mutation !== "function") return mutation;
         return async (...args: unknown[]) => {

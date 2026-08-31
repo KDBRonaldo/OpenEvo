@@ -85,6 +85,21 @@ const workspaceMutationV2Schema = z.object({
   entry: workspaceEntryV2Schema,
 }).strict();
 
+const workspaceDeleteV2Schema = z.object({
+  schema_version: z.literal("2"),
+  project_id: z.string().min(1),
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  deleted_path: z.string().min(1),
+}).strict();
+
+const resourceDeleteReceiptV2Schema = z.object({
+  schema_version: z.literal("2"),
+  action_id: z.string().min(1),
+  resource_kind: z.enum(["project", "task"]),
+  resource_id: z.string().min(1),
+  active_project_id: z.string().min(1).nullable(),
+}).strict();
+
 const workspaceChangeSchema = z.object({
   path: z.string().min(1),
   change_type: z.enum(["created", "modified", "deleted"]),
@@ -831,20 +846,38 @@ export function createDevelopmentAgentProvider(
     }
   };
 
-  const requestPresentationV2 = async (path: string): Promise<unknown> => {
+  const requestPresentationV2 = async (
+    path: string,
+    init: RequestInit = {},
+  ): Promise<unknown> => {
     if (presentationV2BaseUrl === undefined) {
       throw new Error("Development presentation v2 is not configured.");
     }
-    const headers = new Headers();
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), 60_000);
+    const headers = new Headers(init.headers);
     if (options.desktopSessionToken !== undefined) {
       headers.set("X-OpenEvo-Desktop-Session", options.desktopSessionToken);
     }
-    const response = await fetchImpl(`${presentationV2BaseUrl}${path}`, { headers });
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+    try {
+      const response = await fetchImpl(`${presentationV2BaseUrl}${path}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The development mutation timed out. Check the SSH development tunnel.");
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
     }
-    return response.json();
   };
 
   const backend: DevelopmentAgentBackend = {
@@ -1098,6 +1131,46 @@ export function createDevelopmentAgentProvider(
         throw new Error("Evolution Run v2 returned inconsistent apply authority.");
       }
     },
+    deleteProject: async (projectId, actionId) => {
+      const receipt = resourceDeleteReceiptV2Schema.parse(
+        presentationV2BaseUrl === undefined
+          ? await requestJson(
+            `/projects/${encodeURIComponent(projectId)}`,
+            jsonRequest("DELETE", { schema_version: "2", action_id: actionId }),
+          )
+          : await requestPresentationV2(
+            `/projects/${encodeURIComponent(projectId)}`,
+            jsonRequest("DELETE", { schema_version: "2", action_id: actionId }),
+          ),
+      );
+      if (
+        receipt.action_id !== actionId
+        || receipt.resource_kind !== "project"
+        || receipt.resource_id !== projectId
+      ) {
+        throw new Error("Project deletion receipt did not match the requested Project.");
+      }
+    },
+    deleteSession: async (sessionId, actionId) => {
+      const receipt = resourceDeleteReceiptV2Schema.parse(
+        presentationV2BaseUrl === undefined
+          ? await requestJson(
+            `/sessions/${encodeURIComponent(sessionId)}`,
+            jsonRequest("DELETE", { schema_version: "2", action_id: actionId }),
+          )
+          : await requestPresentationV2(
+            `/tasks/${encodeURIComponent(sessionId)}`,
+            jsonRequest("DELETE", { schema_version: "2", action_id: actionId }),
+          ),
+      );
+      if (
+        receipt.action_id !== actionId
+        || receipt.resource_kind !== "task"
+        || receipt.resource_id !== sessionId
+      ) {
+        throw new Error("Session deletion receipt did not match the requested Session.");
+      }
+    },
     uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite, onProgress) => {
       if (workspaceV2BaseUrl !== undefined) {
         const bytes = await data.arrayBuffer();
@@ -1197,6 +1270,25 @@ export function createDevelopmentAgentProvider(
         fileName: path.split("/").at(-1) ?? "download",
       };
     },
+    deleteWorkspaceFile: async (projectId, path) => {
+      if (workspaceV2BaseUrl !== undefined) {
+        const response = await workspaceV2Fetch(
+          projectId,
+          `/files?path=${encodeURIComponent(path)}`,
+          { method: "DELETE" },
+        );
+        const deletion = workspaceDeleteV2Schema.parse(await response.json());
+        if (deletion.project_id !== projectId || deletion.deleted_path !== path) {
+          throw new Error("Workspace deletion receipt did not match the requested file.");
+        }
+        return;
+      }
+      await requestJson(
+        `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}`,
+        { method: "DELETE" },
+        60_000,
+      );
+    },
   };
 
   return createDevelopmentAgentDesktopProductProvider(backend);
@@ -1256,7 +1348,7 @@ function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
   };
 }
 
-function jsonRequest(method: "POST" | "PUT", body: object): RequestInit {
+function jsonRequest(method: "POST" | "PUT" | "DELETE", body: object): RequestInit {
   return {
     method,
     headers: { "Content-Type": "application/json" },

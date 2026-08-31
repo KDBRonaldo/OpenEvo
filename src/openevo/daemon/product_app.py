@@ -92,6 +92,8 @@ from openevo.daemon.contracts import (
     DevelopmentProjectCreateV2,
     DevelopmentProjectHeadV2,
     DevelopmentProjectUpdateV2,
+    DevelopmentResourceDeleteReceiptV2,
+    DevelopmentResourceDeleteRequestV2,
     DevelopmentStateV2,
     DevelopmentTaskCancelV2,
     DevelopmentTaskCreateV2,
@@ -1078,13 +1080,24 @@ class DevelopmentStateStore:
                     evolution_evidence_ready=row["session_id"] in evidence_session_ids,
                 )
                 for row in connection.execute(
-                    "SELECT * FROM development_sessions ORDER BY created_at, session_id"
+                    "SELECT session.* FROM development_sessions AS session "
+                    "LEFT JOIN development_deleted_sessions AS deleted_session "
+                    "ON deleted_session.session_id = session.session_id "
+                    "LEFT JOIN development_deleted_projects AS deleted_project "
+                    "ON deleted_project.project_id = session.project_id "
+                    "WHERE deleted_session.session_id IS NULL "
+                    "AND deleted_project.project_id IS NULL "
+                    "ORDER BY session.created_at, session.session_id"
                 )
             ]
             artifacts = [
                 self._artifact_record(row)
                 for row in connection.execute(
-                    "SELECT * FROM development_evolution_artifacts_v2 ORDER BY created_at, artifact_id"
+                    "SELECT artifact.* FROM development_evolution_artifacts_v2 AS artifact "
+                    "LEFT JOIN development_deleted_projects AS deleted "
+                    "ON deleted.project_id = artifact.project_id "
+                    "WHERE deleted.project_id IS NULL "
+                    "ORDER BY artifact.created_at, artifact.artifact_id"
                 )
             ]
             attempt_rows = connection.execute(
@@ -1098,13 +1111,25 @@ class DevelopmentStateStore:
             jobs = [
                 self._job_record(row, attempts_by_job.get(row["job_id"], []))
                 for row in connection.execute(
-                    "SELECT * FROM development_evolution_jobs ORDER BY created_at, job_id"
+                    "SELECT job.* FROM development_evolution_jobs AS job "
+                    "JOIN development_sessions AS session ON session.session_id = job.session_id "
+                    "LEFT JOIN development_deleted_sessions AS deleted_session "
+                    "ON deleted_session.session_id = session.session_id "
+                    "LEFT JOIN development_deleted_projects AS deleted_project "
+                    "ON deleted_project.project_id = session.project_id "
+                    "WHERE deleted_session.session_id IS NULL "
+                    "AND deleted_project.project_id IS NULL "
+                    "ORDER BY job.created_at, job.job_id"
                 )
             ]
             evolution_runs = [
                 self._evolution_run_record(row)
                 for row in connection.execute(
-                    "SELECT * FROM development_evolution_runs ORDER BY created_at, run_id"
+                    "SELECT run.* FROM development_evolution_runs AS run "
+                    "LEFT JOIN development_deleted_projects AS deleted "
+                    "ON deleted.project_id = run.project_id "
+                    "WHERE deleted.project_id IS NULL "
+                    "ORDER BY run.created_at, run.run_id"
                 )
             ]
         active_project_id = catalog_state.active_project_id
@@ -1147,7 +1172,11 @@ class DevelopmentStateStore:
                     {"schema_version": "2", **self._project_head_record(row)}
                 )
                 for row in connection.execute(
-                    "SELECT * FROM development_project_heads ORDER BY project_id, generation"
+                    "SELECT head.* FROM development_project_heads AS head "
+                    "LEFT JOIN development_deleted_projects AS deleted "
+                    "ON deleted.project_id = head.project_id "
+                    "WHERE deleted.project_id IS NULL "
+                    "ORDER BY head.project_id, head.generation"
                 )
             ]
         return DevelopmentStateV2(
@@ -1293,6 +1322,20 @@ class DevelopmentStateStore:
     def activate_project(self, project_id: str) -> None:
         self.project_catalog.activate(project_id)
 
+    def delete_project(self, project_id: str, action_id: str) -> str | None:
+        try:
+            return self.project_catalog.delete(project_id, action_id)
+        except ProjectCatalogConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
+
+    def delete_session(self, session_id: str, action_id: str) -> str | None:
+        try:
+            self.session_store.delete(session_id, action_id)
+            with self._lock, self._connection() as connection:
+                return self.project_catalog.read_state(connection).active_project_id
+        except SessionConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
+
     def _append_task_log_v2(
         self,
         connection: sqlite3.Connection,
@@ -1431,12 +1474,25 @@ class DevelopmentStateStore:
         with self._lock, self._connection() as connection:
             if project_id is None:
                 rows = connection.execute(
-                    "SELECT * FROM development_sessions ORDER BY created_at, session_id"
+                    "SELECT session.* FROM development_sessions AS session "
+                    "LEFT JOIN development_deleted_sessions AS deleted_session "
+                    "ON deleted_session.session_id = session.session_id "
+                    "LEFT JOIN development_deleted_projects AS deleted_project "
+                    "ON deleted_project.project_id = session.project_id "
+                    "WHERE deleted_session.session_id IS NULL "
+                    "AND deleted_project.project_id IS NULL "
+                    "ORDER BY session.created_at, session.session_id"
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT * FROM development_sessions WHERE project_id = ? "
-                    "ORDER BY created_at, session_id",
+                    "SELECT session.* FROM development_sessions AS session "
+                    "LEFT JOIN development_deleted_sessions AS deleted_session "
+                    "ON deleted_session.session_id = session.session_id "
+                    "LEFT JOIN development_deleted_projects AS deleted_project "
+                    "ON deleted_project.project_id = session.project_id "
+                    "WHERE session.project_id = ? AND deleted_session.session_id IS NULL "
+                    "AND deleted_project.project_id IS NULL "
+                    "ORDER BY session.created_at, session.session_id",
                     (project_id,),
                 ).fetchall()
         observations = [self._task_observation_v2(row) for row in rows]
@@ -1461,7 +1517,13 @@ class DevelopmentStateStore:
     def task_observation_v2(self, task_id: str) -> DevelopmentTaskObservationV2:
         with self._lock, self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM development_sessions WHERE session_id = ?",
+                "SELECT session.* FROM development_sessions AS session "
+                "LEFT JOIN development_deleted_sessions AS deleted_session "
+                "ON deleted_session.session_id = session.session_id "
+                "LEFT JOIN development_deleted_projects AS deleted_project "
+                "ON deleted_project.project_id = session.project_id "
+                "WHERE session.session_id = ? AND deleted_session.session_id IS NULL "
+                "AND deleted_project.project_id IS NULL",
                 (task_id,),
             ).fetchone()
         if row is None:
@@ -1477,15 +1539,15 @@ class DevelopmentStateStore:
     ) -> DevelopmentTaskPresentationPageV2:
         with self._lock, self._connection() as connection:
             if (
-                connection.execute(
-                    "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
-                ).fetchone()
-                is None
+                not self.project_catalog.exists(connection, project_id)
             ):
                 raise KeyError(project_id)
             rows = connection.execute(
-                "SELECT * FROM development_sessions WHERE project_id = ? "
-                "ORDER BY created_at, session_id",
+                "SELECT session.* FROM development_sessions AS session "
+                "LEFT JOIN development_deleted_sessions AS deleted "
+                "ON deleted.session_id = session.session_id "
+                "WHERE session.project_id = ? AND deleted.session_id IS NULL "
+                "ORDER BY session.created_at, session.session_id",
                 (project_id,),
             ).fetchall()
             evidence_ids = {
@@ -1523,7 +1585,14 @@ class DevelopmentStateStore:
     def task_presentation_v2(self, task_id: str) -> DevelopmentTaskPresentationV2:
         with self._lock, self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM development_sessions WHERE session_id = ?", (task_id,)
+                "SELECT session.* FROM development_sessions AS session "
+                "LEFT JOIN development_deleted_sessions AS deleted_session "
+                "ON deleted_session.session_id = session.session_id "
+                "LEFT JOIN development_deleted_projects AS deleted_project "
+                "ON deleted_project.project_id = session.project_id "
+                "WHERE session.session_id = ? AND deleted_session.session_id IS NULL "
+                "AND deleted_project.project_id IS NULL",
+                (task_id,),
             ).fetchone()
             evidence_ready = (
                 connection.execute(
@@ -1651,6 +1720,8 @@ class DevelopmentStateStore:
 
     def project_config(self, project_id: str) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
+            if not self.project_catalog.exists(connection, project_id):
+                raise KeyError(project_id)
             row = connection.execute(
                 "SELECT config_json FROM development_projects WHERE project_id = ?",
                 (project_id,),
@@ -1661,6 +1732,8 @@ class DevelopmentStateStore:
 
     def project(self, project_id: str) -> dict[str, Any]:
         with self._lock, self._connection() as connection:
+            if not self.project_catalog.exists(connection, project_id):
+                raise KeyError(project_id)
             row = connection.execute(
                 "SELECT * FROM development_projects WHERE project_id = ?",
                 (project_id,),
@@ -1708,9 +1781,14 @@ class DevelopmentStateStore:
 
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM development_sessions "
-                "WHERE state = 'completed' AND response IS NOT NULL "
-                "ORDER BY created_at, session_id"
+                "SELECT session.* FROM development_sessions AS session "
+                "LEFT JOIN development_deleted_sessions AS deleted_session "
+                "ON deleted_session.session_id = session.session_id "
+                "LEFT JOIN development_deleted_projects AS deleted_project "
+                "ON deleted_project.project_id = session.project_id "
+                "WHERE session.state = 'completed' AND session.response IS NOT NULL "
+                "AND deleted_session.session_id IS NULL AND deleted_project.project_id IS NULL "
+                "ORDER BY session.created_at, session.session_id"
             ).fetchall()
         return [self._session_record(row) for row in rows]
 
@@ -1772,17 +1850,15 @@ class DevelopmentStateStore:
                 raise StateConflictError("Base Project Head is unavailable for this Project")
             if base_head["manifest_sha256"] != base_project_head_manifest_sha256:
                 raise StateConflictError("Base Project Head changed before Evolution admission")
-            if (
-                connection.execute(
-                    "SELECT 1 FROM development_projects WHERE project_id = ?",
-                    (request["project_id"],),
-                ).fetchone()
-                is None
-            ):
+            if not self.project_catalog.exists(connection, request["project_id"]):
                 raise KeyError(request["project_id"])
             rows = connection.execute(
-                f"SELECT session_id, project_id, state FROM development_sessions "
-                f"WHERE session_id IN ({','.join('?' for _ in session_ids)})",
+                f"SELECT session.session_id, session.project_id, session.state "
+                f"FROM development_sessions AS session "
+                f"LEFT JOIN development_deleted_sessions AS deleted "
+                f"ON deleted.session_id = session.session_id "
+                f"WHERE deleted.session_id IS NULL AND session.session_id IN "
+                f"({','.join('?' for _ in session_ids)})",
                 tuple(session_ids),
             ).fetchall()
             by_id = {row["session_id"]: row for row in rows}
@@ -3398,6 +3474,26 @@ class DevelopmentSessionCoordinator:
         finally:
             self._turn_lock.release()
 
+    def delete_project(self, project_id: str, action_id: str) -> str | None:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "Projects cannot be deleted while a Session or Evolution Run is active"
+            )
+        try:
+            return self._store.delete_project(project_id, action_id)
+        finally:
+            self._turn_lock.release()
+
+    def delete_session(self, session_id: str, action_id: str) -> str | None:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "Sessions cannot be deleted while a Session or Evolution Run is active"
+            )
+        try:
+            return self._store.delete_session(session_id, action_id)
+        finally:
+            self._turn_lock.release()
+
     def upload_workspace_file_v2(
         self,
         project_id: str,
@@ -4540,7 +4636,54 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed_path = urlsplit(self.path)
-        workspace_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
+        project_match = (
+            DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
+            or PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
+        )
+        task_match = (
+            DAEMON_V2_DEVELOPMENT_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
+            or SESSION_PATH_PATTERN.fullmatch(parsed_path.path)
+        )
+        if project_match or task_match:
+            resource_kind = "project" if project_match else "task"
+            resource_id = (project_match or task_match).group(1)  # type: ignore[union-attr]
+            try:
+                if not ID_PATTERN.fullmatch(resource_id):
+                    raise RequestError(f"{resource_kind}_id is invalid")
+                request = DevelopmentResourceDeleteRequestV2.model_validate(
+                    self._read_json()
+                )
+                if resource_kind == "project":
+                    active_project_id = self.server.sessions.delete_project(
+                        resource_id, request.action_id
+                    )
+                else:
+                    active_project_id = self.server.sessions.delete_session(
+                        resource_id, request.action_id
+                    )
+                receipt = DevelopmentResourceDeleteReceiptV2(
+                    action_id=request.action_id,
+                    resource_kind=resource_kind,
+                    resource_id=resource_id,
+                    active_project_id=active_project_id,
+                )
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(
+                    HTTPStatus.NOT_FOUND, "not_found", f"{resource_kind} not found"
+                )
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.OK, receipt.model_dump(mode="json"))
+            return
+        workspace_match = (
+            DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
+            or WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
+        )
         if not workspace_match:
             self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
             return

@@ -10,6 +10,7 @@ import {
   ChevronRight,
   CircleDot,
   Download,
+  EllipsisVertical,
   FolderTree,
   FolderOpen,
   FileText,
@@ -24,6 +25,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -737,6 +739,50 @@ export function DesktopProductApp({
     );
   };
 
+  const deleteProject = (project: ProjectV2): void => {
+    if (!provider.deleteProject) return;
+    if (!globalThis.confirm(`Delete Project "${project.display_name}"? Its Sessions will also be removed from EvoLab.`)) return;
+    void (async () => {
+      const result = await act(
+        () => provider.deleteProject!(project.project_id, intentFor(snapshot, "delete-project")),
+        `${project.display_name} deleted.`,
+      );
+      if (result?.snapshot === null || result === null) return;
+      setSelectedWorkspacePath(null);
+      setWorkspace("research");
+      const nextProjectId = result.snapshot.state.active_project_id;
+      setSelectedTaskId(nextProjectId === null ? null : activeTaskIdV2(nextProjectId, result.snapshot.tasks));
+    })();
+  };
+
+  const deleteSession = (task: TaskV2, title: string): void => {
+    if (!provider.deleteTask) return;
+    if (!globalThis.confirm(`Delete Session "${title}"? This removes it from the Project history view.`)) return;
+    void (async () => {
+      const result = await act(
+        () => provider.deleteTask!(task.task_id, intentFor(snapshot, "delete-session")),
+        `${title} deleted.`,
+      );
+      if (result !== null && selectedTaskId === task.task_id) setSelectedTaskId(null);
+    })();
+  };
+
+  const deleteWorkspaceFile = (path: string): void => {
+    if (displayedProject === null || !provider.deleteWorkspaceFile) return;
+    if (!globalThis.confirm(`Delete workspace file "${path}"? This cannot be undone.`)) return;
+    void (async () => {
+      const result = await act(
+        () => provider.deleteWorkspaceFile!(
+          displayedProject.project_id,
+          path,
+          intentFor(snapshot, "delete-workspace-file"),
+        ),
+        `${path} deleted from the remote workspace.`,
+      );
+      if (result !== null && selectedWorkspacePath === path) setSelectedWorkspacePath(null);
+    })();
+  };
+
   return (
     <div
       className="product-shell product-v2-shell"
@@ -765,9 +811,13 @@ export function DesktopProductApp({
         busy={busy || startingSession !== null}
         switching={switchingProjectId !== null}
         fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
+        projectDeleteAvailable={provider.deleteProject !== undefined}
+        fileDeleteAvailable={provider.deleteWorkspaceFile !== undefined}
         onSelectProject={selectProject}
+        onDeleteProject={deleteProject}
         onCreateProject={() => { setProjectEditing(false); setProjectOpen(true); }}
         onSelectFile={(path) => { setWorkspace("research"); setSelectedTaskId(null); setSelectedWorkspacePath(path); }}
+        onDeleteFile={deleteWorkspaceFile}
         onUpload={uploadWorkspaceFiles}
         generation={generation}
         paneWidth={projectPaneWidth}
@@ -790,6 +840,9 @@ export function DesktopProductApp({
           setSelectedTaskId(null);
           setNewSessionDraftKey((current) => current + 1);
         }}
+        deleteAvailable={provider.deleteTask !== undefined}
+        busy={busy || startingSession !== null}
+        onDeleteTask={deleteSession}
         paneWidth={sessionPaneWidth}
         onResizePane={setSessionPaneWidth}
       />
@@ -1580,6 +1633,12 @@ type SoftSelectOptionV2 = {
   readonly value: string;
   readonly label: string;
   readonly disabled?: boolean;
+  readonly menuAction?: {
+    readonly label: string;
+    readonly ariaLabel: string;
+    readonly disabled?: boolean;
+    readonly onSelect: () => void;
+  };
 };
 
 function SoftSelectV2({
@@ -1604,6 +1663,7 @@ function SoftSelectV2({
   readonly onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [actionValue, setActionValue] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const matchedIndex = options.findIndex((option) => option.value === value);
@@ -1612,11 +1672,15 @@ function SoftSelectV2({
   useEffect(() => {
     if (!open) return undefined;
     const closeOnOutsidePointer = (event: PointerEvent): void => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+        setActionValue(null);
+      }
     };
     const closeOnEscape = (event: KeyboardEvent): void => {
       if (event.key !== "Escape") return;
       setOpen(false);
+      setActionValue(null);
       triggerRef.current?.focus();
     };
     globalThis.document.addEventListener("pointerdown", closeOnOutsidePointer);
@@ -1627,7 +1691,10 @@ function SoftSelectV2({
     };
   }, [open]);
   useEffect(() => {
-    if (disabled) setOpen(false);
+    if (disabled) {
+      setOpen(false);
+      setActionValue(null);
+    }
   }, [disabled]);
   const moveOptionFocus = (event: ReactKeyboardEvent<HTMLButtonElement>, direction: 1 | -1): void => {
     event.preventDefault();
@@ -1649,7 +1716,10 @@ function SoftSelectV2({
         autoFocus={autoFocus}
         disabled={disabled || options.length === 0}
         title={selected?.label}
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          setOpen((current) => !current);
+          setActionValue(null);
+        }}
         onKeyDown={(event) => {
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {
             event.preventDefault();
@@ -1665,29 +1735,53 @@ function SoftSelectV2({
           {options.map((option, index) => {
             const optionSelected = index === selectedIndex;
             return (
-              <button
-                type="button"
-                role="option"
-                aria-selected={optionSelected}
-                className={optionSelected ? "selected" : ""}
-                key={option.key ?? option.value}
-                data-value={option.value}
-                disabled={option.disabled}
-                title={option.label}
-                autoFocus={optionSelected}
-                onKeyDown={(event) => {
-                  if (event.key === "ArrowDown") moveOptionFocus(event, 1);
-                  if (event.key === "ArrowUp") moveOptionFocus(event, -1);
-                }}
-                onClick={() => {
-                  setOpen(false);
-                  if (!optionSelected) onChange(option.value);
-                  triggerRef.current?.focus();
-                }}
-              >
-                <span>{option.label}</span>
-                {optionSelected ? <CheckCircle2 size={15} /> : null}
-              </button>
+              <div className="soft-select-option" key={option.key ?? option.value}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={optionSelected}
+                  className={optionSelected ? "selected" : ""}
+                  data-value={option.value}
+                  disabled={option.disabled}
+                  title={option.label}
+                  autoFocus={optionSelected}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowDown") moveOptionFocus(event, 1);
+                    if (event.key === "ArrowUp") moveOptionFocus(event, -1);
+                  }}
+                  onClick={() => {
+                    setOpen(false);
+                    setActionValue(null);
+                    if (!optionSelected) onChange(option.value);
+                    triggerRef.current?.focus();
+                  }}
+                >
+                  <span>{option.label}</span>
+                  {optionSelected ? <CheckCircle2 size={15} /> : null}
+                </button>
+                {option.menuAction ? (
+                  <button
+                    type="button"
+                    className="soft-select-option-more"
+                    aria-label={option.menuAction.ariaLabel}
+                    aria-haspopup="menu"
+                    aria-expanded={actionValue === option.value}
+                    disabled={option.menuAction.disabled}
+                    onClick={() => setActionValue((current) => current === option.value ? null : option.value)}
+                  >
+                    <EllipsisVertical size={15} />
+                  </button>
+                ) : null}
+                {option.menuAction && actionValue === option.value ? (
+                  <div className="soft-select-option-popover" role="menu">
+                    <button type="button" role="menuitem" onClick={() => {
+                      setOpen(false);
+                      setActionValue(null);
+                      option.menuAction?.onSelect();
+                    }}><Trash2 size={14} /><span>{option.menuAction.label}</span></button>
+                  </div>
+                ) : null}
+              </div>
             );
           })}
         </div>
@@ -1705,9 +1799,13 @@ function ProjectExplorerV2({
   busy,
   switching,
   fileTransferAvailable,
+  projectDeleteAvailable,
+  fileDeleteAvailable,
   onSelectProject,
+  onDeleteProject,
   onCreateProject,
   onSelectFile,
+  onDeleteFile,
   onUpload,
   generation,
   paneWidth,
@@ -1721,9 +1819,13 @@ function ProjectExplorerV2({
   readonly busy: boolean;
   readonly switching: boolean;
   readonly fileTransferAvailable: boolean;
+  readonly projectDeleteAvailable: boolean;
+  readonly fileDeleteAvailable: boolean;
   readonly onSelectProject: (projectId: string) => void;
+  readonly onDeleteProject: (project: ProjectV2) => void;
   readonly onCreateProject: () => void;
   readonly onSelectFile: (path: string) => void;
+  readonly onDeleteFile: (path: string) => void;
   readonly onUpload: (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean) => void;
   readonly generation: number;
   readonly paneWidth: number;
@@ -1848,6 +1950,18 @@ function ProjectExplorerV2({
             ) : null}
           </span>
         </button>
+        {!directory && node.kind === "file" && upload === null && fileDeleteAvailable ? (
+          <button
+            type="button"
+            className="explorer-file-delete"
+            aria-label={`Delete ${node.path}`}
+            title={`Delete ${node.path}`}
+            disabled={busy}
+            onClick={() => onDeleteFile(node.path)}
+          >
+            <Trash2 size={13} />
+          </button>
+        ) : null}
         {directory && expanded && node.children.length > 0 ? (
           <div className="explorer-tree-branch" role="group">{renderTreeNodes(node.children, level + 1)}</div>
         ) : null}
@@ -1862,7 +1976,16 @@ function ProjectExplorerV2({
           id="v2-project-switcher"
           ariaLabel="Select project"
           value={activeProject?.project_id ?? ""}
-          options={projects.map((project) => ({ value: project.project_id, label: project.display_name }))}
+          options={projects.map((project) => ({
+            value: project.project_id,
+            label: project.display_name,
+            menuAction: projectDeleteAvailable ? {
+              label: "Delete project",
+              ariaLabel: `More actions for ${project.display_name}`,
+              disabled: busy || switching,
+              onSelect: () => onDeleteProject(project),
+            } : undefined,
+          }))}
           disabled={busy || switching || projects.length === 0}
           className="project-switcher-select"
           onChange={onSelectProject}
@@ -1899,6 +2022,9 @@ function SessionExplorerV2({
   selectedTaskId,
   onSelectTask,
   onNewSession,
+  deleteAvailable,
+  busy,
+  onDeleteTask,
   paneWidth,
   onResizePane,
 }: {
@@ -1908,11 +2034,15 @@ function SessionExplorerV2({
   readonly selectedTaskId: string | null;
   readonly onSelectTask: (taskId: string) => void;
   readonly onNewSession: () => void;
+  readonly deleteAvailable: boolean;
+  readonly busy: boolean;
+  readonly onDeleteTask: (task: TaskV2, title: string) => void;
   readonly paneWidth: number;
   readonly onResizePane: (width: number) => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "active" | "completed" | "failed">("all");
+  const [openTaskMenu, setOpenTaskMenu] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const projectId = project?.project_id ?? null;
   const sortedTasks = useMemo(() => [...tasks].sort(compareTasksNewestFirst), [tasks]);
@@ -1930,6 +2060,7 @@ function SessionExplorerV2({
   useEffect(() => {
     setQuery("");
     setFilter("all");
+    setOpenTaskMenu(null);
     if (projectId === null) return;
     const remembered = Number.parseFloat(readPersistedRecord(PROJECT_SESSION_SCROLLS_KEY)[projectId] ?? "0");
     const timer = globalThis.setTimeout(() => {
@@ -1937,6 +2068,22 @@ function SessionExplorerV2({
     }, 0);
     return () => globalThis.clearTimeout(timer);
   }, [projectId]);
+  useEffect(() => {
+    if (openTaskMenu === null) return undefined;
+    const closeMenu = (event: PointerEvent): void => {
+      const item = (event.target as Element | null)?.closest<HTMLElement>(".session-explorer-item");
+      if (item?.dataset.taskId !== openTaskMenu) setOpenTaskMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpenTaskMenu(null);
+    };
+    globalThis.document.addEventListener("pointerdown", closeMenu);
+    globalThis.document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      globalThis.document.removeEventListener("pointerdown", closeMenu);
+      globalThis.document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openTaskMenu]);
   const rememberScroll = (): void => {
     if (projectId === null || listRef.current === null) return;
     persistRecord(PROJECT_SESSION_SCROLLS_KEY, {
@@ -1967,7 +2114,12 @@ function SessionExplorerV2({
       <div ref={listRef} className="session-explorer-list" onScroll={rememberScroll}>
         {visibleTasks.length ? visibleTasks.map((task, index) => {
           const title = presentation?.[task.task_id]?.instruction?.title ?? `Session ${sortedTasks.length - index}`;
-          return <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)} title={title}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{taskStateLabelV2(task.state)}</em></button>;
+          const terminal = ["completed", "closed", "failed", "cancelled"].includes(task.state);
+          return <div className={`session-explorer-item${task.task_id === selectedTaskId ? " active" : ""}`} data-task-id={task.task_id} key={task.task_id}>
+            <button type="button" className="session-explorer-item-main" onClick={() => { setOpenTaskMenu(null); onSelectTask(task.task_id); }} title={title}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{taskStateLabelV2(task.state)}</em></button>
+            {deleteAvailable && terminal ? <button type="button" className="session-item-more" aria-label={`More actions for ${title}`} aria-haspopup="menu" aria-expanded={openTaskMenu === task.task_id} disabled={busy} onClick={() => setOpenTaskMenu((current) => current === task.task_id ? null : task.task_id)}><EllipsisVertical size={15} /></button> : null}
+            {openTaskMenu === task.task_id ? <div className="session-item-popover" role="menu"><button type="button" role="menuitem" onClick={() => { setOpenTaskMenu(null); onDeleteTask(task, title); }}><Trash2 size={14} /><span>Delete session</span></button></div> : null}
+          </div>;
         }) : <div className="explorer-empty">{tasks.length ? "No Sessions match the current filters" : "No Sessions yet. Use + to create one."}</div>}
       </div>
       <VerticalResizeHandle label="Resize Session pane" value={paneWidth} defaultValue={232} minimum={180} maximum={420} onChange={onResizePane} />

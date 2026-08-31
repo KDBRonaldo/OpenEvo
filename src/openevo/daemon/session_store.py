@@ -87,6 +87,11 @@ class SqliteSessionStore:
             );
             CREATE INDEX IF NOT EXISTS development_sessions_project_created
                 ON development_sessions(project_id, created_at, session_id);
+            CREATE TABLE IF NOT EXISTS development_deleted_sessions (
+                session_id TEXT PRIMARY KEY REFERENCES development_sessions(session_id),
+                action_id TEXT NOT NULL UNIQUE,
+                deleted_at TEXT NOT NULL
+            );
             """
         )
 
@@ -411,7 +416,10 @@ class SqliteSessionStore:
     def get(self, session_id: str) -> dict[str, Any]:
         with self._lock, self._connection_factory() as connection:
             row = connection.execute(
-                "SELECT * FROM development_sessions WHERE session_id = ?",
+                "SELECT session.* FROM development_sessions AS session "
+                "LEFT JOIN development_deleted_sessions AS deleted "
+                "ON deleted.session_id = session.session_id "
+                "WHERE session.session_id = ? AND deleted.session_id IS NULL",
                 (session_id,),
             ).fetchone()
             evidence_ready = connection.execute(
@@ -421,6 +429,41 @@ class SqliteSessionStore:
         if row is None:
             raise KeyError(session_id)
         return self.record(row, evolution_evidence_ready=evidence_ready)
+
+    def delete(self, session_id: str, action_id: str) -> str:
+        """Persistently hide one terminal Session while retaining linked evidence."""
+
+        now = self._clock()
+        with self._lock, self._connection_factory() as connection:
+            row = connection.execute(
+                "SELECT project_id, state FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            deleted = connection.execute(
+                "SELECT action_id FROM development_deleted_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if deleted is not None:
+                if deleted["action_id"] != action_id:
+                    raise KeyError(session_id)
+                return row["project_id"]
+            if row["state"] == "running":
+                raise SessionConflictError(
+                    "running Sessions must be cancelled before deletion"
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO development_deleted_sessions(session_id, action_id, deleted_at) "
+                    "VALUES (?, ?, ?)",
+                    (session_id, action_id, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise SessionConflictError(
+                    "action_id is already bound to another Session deletion"
+                ) from exc
+            return row["project_id"]
 
     def cancellation_requested(self, session_id: str) -> bool:
         with self._lock, self._connection_factory() as connection:

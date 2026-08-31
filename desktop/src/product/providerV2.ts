@@ -258,6 +258,8 @@ export interface DesktopProductProviderV2 {
     baseProjectHead?: ProjectHeadRefV2,
   ): Promise<void>;
   applyEvolutionRun?(runId: string, intent: ProductMutationIntentV2): Promise<void>;
+  deleteProject?(projectId: string, intent: ProductMutationIntentV2): Promise<void>;
+  deleteTask?(taskId: string, intent: ProductMutationIntentV2): Promise<void>;
   uploadWorkspaceFile?(
     projectId: string,
     upload: WorkspaceFileUploadV2,
@@ -267,6 +269,11 @@ export interface DesktopProductProviderV2 {
     projectId: string,
     path: string,
   ): Promise<WorkspaceFileDownloadV2>;
+  deleteWorkspaceFile?(
+    projectId: string,
+    path: string,
+    intent: ProductMutationIntentV2,
+  ): Promise<void>;
   loadTaskLogs(taskId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;

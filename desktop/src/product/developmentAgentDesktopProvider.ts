@@ -198,6 +198,8 @@ export interface DevelopmentAgentBackend {
     baseProjectHead?: { readonly projectHeadId: string; readonly manifestSha256: string },
   ): Promise<void>;
   applyEvolutionRun(runId: string): Promise<void>;
+  deleteProject(projectId: string, actionId: string): Promise<void>;
+  deleteSession(sessionId: string, actionId: string): Promise<void>;
   uploadWorkspaceFile(
     projectId: string,
     path: string,
@@ -210,6 +212,7 @@ export interface DevelopmentAgentBackend {
     projectId: string,
     path: string,
   ): Promise<{ readonly fileName: string; readonly mediaType: string; readonly data: Blob }>;
+  deleteWorkspaceFile(projectId: string, path: string): Promise<void>;
 }
 
 interface DevelopmentProviderOptions {
@@ -507,6 +510,18 @@ function createRemoteBackedDesktopProductProvider(
       await ensureDevelopmentState(true);
       notifySubscribers();
     },
+    deleteProject: async (projectId, intent) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.deleteProject(projectId, intent.actionId);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+    },
+    deleteTask: async (taskId, intent) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.deleteSession(taskId, intent.actionId);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+    },
     uploadWorkspaceFile: async (projectId, upload) => {
       await ensureDevelopmentState();
       await options.developmentBackend.uploadWorkspaceFile(
@@ -523,6 +538,12 @@ function createRemoteBackedDesktopProductProvider(
     downloadWorkspaceFile: async (projectId, path) => (
       options.developmentBackend.downloadWorkspaceFile(projectId, path)
     ),
+    deleteWorkspaceFile: async (projectId, path) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.deleteWorkspaceFile(projectId, path);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+    },
     loadTaskLogs: async (taskId) => {
       await ensureDevelopmentState(true);
       return {

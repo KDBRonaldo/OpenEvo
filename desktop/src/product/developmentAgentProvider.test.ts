@@ -472,6 +472,15 @@ describe("development agent provider", () => {
           },
         }, 201);
       }
+      if (url.includes("/workspace/files?") && init?.method === "DELETE") {
+        expect(new Headers(init.headers).get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+        return jsonResponse({
+          schema_version: "2",
+          project_id: projectId,
+          deleted_path: "existing.txt",
+          manifest_sha256: "f".repeat(64),
+        });
+      }
       if (url.includes("/workspace/files?") && init?.method === undefined) {
         return new Response(downloadedBytes, {
           headers: {
@@ -551,6 +560,97 @@ describe("development agent provider", () => {
     expect(uploadHeaders.get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
     const downloaded = await provider.downloadWorkspaceFile?.(projectId, "download.txt");
     expect(await downloaded?.data.text()).toBe("verified download\n");
+    await provider.deleteWorkspaceFile?.(
+      projectId,
+      "existing.txt",
+      { actionId: "delete-v2", streamEpoch: refreshed.snapshot.stream.epoch },
+    );
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `/desktop/v2/development/projects/${projectId}/workspace/files?path=existing.txt`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+
+  it("deletes Projects and Sessions through the authenticated presentation v2 bridge", async () => {
+    const projectId = "project-delete-v2";
+    const taskId = "task-delete-v2";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      expect(headers.get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
+      if (url.endsWith("/presentation-state")) {
+        return jsonResponse({
+          schema_version: "2",
+          active_project_id: projectId,
+          projects: [{
+            schema_version: "2",
+            project_id: projectId,
+            display_name: "Delete v2",
+            config,
+            active_project_head_id: null,
+            created_at: "2026-08-23T00:00:00Z",
+            updated_at: "2026-08-23T00:00:00Z",
+          }],
+          project_heads: [],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "2",
+          authority: "development_catalog_unverified",
+          capabilities: {
+            schema_version: "1",
+            core_version: "development",
+            registry_digest: "a".repeat(64),
+            evaluated_profile: {
+              execution_mode: "subscription",
+              capture_mode: "transcript",
+              harness_id: "codex",
+              harness_capabilities: [],
+              runtime_capabilities: [],
+            },
+            targets: [],
+          },
+        });
+      }
+      const body = JSON.parse(String(init?.body)) as { action_id: string };
+      if (url.endsWith(`/tasks/${taskId}`) && init?.method === "DELETE") {
+        return jsonResponse({
+          schema_version: "2",
+          action_id: body.action_id,
+          resource_kind: "task",
+          resource_id: taskId,
+          active_project_id: projectId,
+        });
+      }
+      if (url.endsWith(`/projects/${projectId}`) && init?.method === "DELETE") {
+        return jsonResponse({
+          schema_version: "2",
+          action_id: body.action_id,
+          resource_kind: "project",
+          resource_id: projectId,
+          active_project_id: null,
+        });
+      }
+      throw new Error(`Unexpected deletion v2 request: ${init?.method ?? "GET"} ${url}`);
+    });
+    const provider = createDevelopmentAgentProvider({
+      fetchImpl,
+      presentationV2BaseUrl: "/desktop/v2/development",
+      desktopSessionToken: "session-secret",
+    });
+
+    await provider.deleteTask?.(taskId, { actionId: "delete-task-v2", streamEpoch: 1 });
+    await provider.deleteProject?.(projectId, { actionId: "delete-project-v2", streamEpoch: 1 });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `/desktop/v2/development/tasks/${taskId}`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `/desktop/v2/development/projects/${projectId}`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
   });
 
   it("loads rich artifact presentation through the authenticated daemon v2 bridge", async () => {
