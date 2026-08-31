@@ -482,10 +482,44 @@ describe("development agent provider", () => {
       }
       throw new Error(`Unexpected workspace v2 request: ${init?.method ?? "GET"} ${url}`);
     });
+    let progressListener: ((event: ProgressEvent) => void) | null = null;
+    const uploadHeaders = new Headers();
+    const uploadRequest = {
+      status: 201,
+      statusText: "Created",
+      responseText: "",
+      timeout: 0,
+      onload: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+      onabort: null as (() => void) | null,
+      ontimeout: null as (() => void) | null,
+      upload: {
+        addEventListener: vi.fn((type: string, listener: (event: ProgressEvent) => void) => {
+          if (type === "progress") progressListener = listener;
+        }),
+      },
+      open: vi.fn(),
+      setRequestHeader: vi.fn((name: string, value: string) => uploadHeaders.set(name, value)),
+      send: vi.fn((body: Document | XMLHttpRequestBodyInit | null) => {
+        const bytes = body as ArrayBuffer;
+        uploadRequest.responseText = JSON.stringify({
+          schema_version: "2", project_id: projectId, manifest_sha256: "e".repeat(64),
+          entry: {
+            schema_version: "2", path: "progress.txt", kind: "file",
+            byte_size: bytes.byteLength,
+            content_sha256: uploadHeaders.get("X-OpenEvo-Content-SHA256"),
+            media_type: "text/plain", content: "progress\n", modified_at: "2026-08-23T00:00:02Z",
+          },
+        });
+        progressListener?.({ lengthComputable: true, loaded: 5, total: 10 } as ProgressEvent);
+        uploadRequest.onload?.();
+      }),
+    };
     const provider = createDevelopmentAgentProvider({
       fetchImpl,
       workspaceV2BaseUrl: "/desktop/v2/development/projects",
       desktopSessionToken: "session-secret",
+      xhrFactory: () => uploadRequest as unknown as XMLHttpRequest,
     });
 
     const refreshed = await provider.refresh();
@@ -497,6 +531,24 @@ describe("development agent provider", () => {
       { path: "upload.txt", data: new Blob(["upload\n"]), mediaType: "text/plain", overwrite: false },
       { actionId: "upload-v2", streamEpoch: refreshed.snapshot.stream.epoch },
     );
+    const progress: number[] = [];
+    await provider.uploadWorkspaceFile?.(
+      projectId,
+      {
+        path: "progress.txt",
+        data: new Blob(["progress\n"]),
+        mediaType: "text/plain",
+        overwrite: false,
+        onProgress: (percentage) => progress.push(percentage),
+      },
+      { actionId: "upload-v2-progress", streamEpoch: refreshed.snapshot.stream.epoch },
+    );
+    expect(progress).toEqual([50, 100]);
+    expect(uploadRequest.open).toHaveBeenCalledWith(
+      "PUT",
+      `/desktop/v2/development/projects/${projectId}/workspace/files?path=progress.txt&overwrite=false`,
+    );
+    expect(uploadHeaders.get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
     const downloaded = await provider.downloadWorkspaceFile?.(projectId, "download.txt");
     expect(await downloaded?.data.text()).toBe("verified download\n");
   });

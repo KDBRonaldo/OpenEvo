@@ -204,6 +204,7 @@ export interface DevelopmentAgentBackend {
     data: Blob,
     mediaType: string,
     overwrite: boolean,
+    onProgress?: (percentage: number) => void,
   ): Promise<void>;
   downloadWorkspaceFile(
     projectId: string,
@@ -514,6 +515,7 @@ function createRemoteBackedDesktopProductProvider(
         upload.data,
         upload.mediaType,
         upload.overwrite,
+        upload.onProgress,
       );
       await ensureDevelopmentState(true);
       notifySubscribers();

@@ -199,6 +199,7 @@ export interface WorkspaceFileUploadV2 {
   readonly data: Blob;
   readonly mediaType: string;
   readonly overwrite: boolean;
+  readonly onProgress?: (percentage: number) => void;
 }
 
 export interface WorkspaceFileDownloadV2 {

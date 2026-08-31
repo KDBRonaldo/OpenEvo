@@ -385,6 +385,7 @@ export interface DevelopmentAgentProviderOptions {
   readonly taskPresentationV2BaseUrl?: string;
   readonly presentationV2BaseUrl?: string;
   readonly desktopSessionToken?: string;
+  readonly xhrFactory?: () => XMLHttpRequest;
 }
 
 /**
@@ -396,6 +397,7 @@ export function createDevelopmentAgentProvider(
 ): DesktopProductProviderV2 {
   const baseUrl = (options.baseUrl ?? "/openevo-dev-agent/v1").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
+  const xhrFactory = options.xhrFactory ?? (() => new XMLHttpRequest());
   const workspaceV2BaseUrl = options.workspaceV2BaseUrl?.replace(/\/$/, "");
   const artifactV2BaseUrl = options.artifactV2BaseUrl?.replace(/\/$/, "");
   const evolutionV2BaseUrl = options.evolutionV2BaseUrl?.replace(/\/$/, "");
@@ -407,6 +409,39 @@ export function createDevelopmentAgentProvider(
     new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", payload)),
     (value) => value.toString(16).padStart(2, "0"),
   ).join("");
+
+  const uploadWithProgress = (
+    url: string,
+    body: Blob | ArrayBuffer,
+    headers: Readonly<Record<string, string>>,
+    onProgress: (percentage: number) => void,
+  ): Promise<string> => new Promise((resolve, reject) => {
+    const request = xhrFactory();
+    request.open("PUT", url);
+    request.timeout = 60_000;
+    Object.entries(headers).forEach(([name, value]) => request.setRequestHeader(name, value));
+    request.upload.addEventListener("progress", (event) => {
+      const total = event.lengthComputable && event.total > 0
+        ? event.total
+        : body instanceof Blob ? body.size : body.byteLength;
+      if (total <= 0) return;
+      onProgress(Math.min(100, Math.max(0, (event.loaded / total) * 100)));
+    });
+    request.onload = () => {
+      if (request.status < 200 || request.status >= 300) {
+        reject(new Error(
+          `Remote development daemon failed (${request.status}): ${request.responseText || request.statusText}`,
+        ));
+        return;
+      }
+      onProgress(100);
+      resolve(request.responseText);
+    };
+    request.onerror = () => reject(new Error("The workspace upload failed while sending data through the SSH development tunnel."));
+    request.onabort = () => reject(new Error("The workspace upload was cancelled before it completed."));
+    request.ontimeout = () => reject(new Error("The workspace upload timed out. Check the SSH development tunnel."));
+    request.send(body);
+  });
 
   const workspaceV2Fetch = async (
     projectId: string,
@@ -1063,10 +1098,34 @@ export function createDevelopmentAgentProvider(
         throw new Error("Evolution Run v2 returned inconsistent apply authority.");
       }
     },
-    uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite) => {
+    uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite, onProgress) => {
       if (workspaceV2BaseUrl !== undefined) {
         const bytes = await data.arrayBuffer();
         const contentSha256 = await digestHex(bytes);
+        if (onProgress !== undefined) {
+          const headers: Record<string, string> = {
+            "Content-Type": mediaType || "application/octet-stream",
+            "X-OpenEvo-Content-SHA256": contentSha256,
+          };
+          if (options.desktopSessionToken !== undefined) {
+            headers["X-OpenEvo-Desktop-Session"] = options.desktopSessionToken;
+          }
+          const responseText = await uploadWithProgress(
+            `${workspaceV2BaseUrl}/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
+            bytes,
+            headers,
+            onProgress,
+          );
+          const mutation = workspaceMutationV2Schema.parse(JSON.parse(responseText) as unknown);
+          if (
+            mutation.project_id !== projectId
+            || mutation.entry.path !== path
+            || mutation.entry.content_sha256 !== contentSha256
+          ) {
+            throw new Error("Workspace v2 upload receipt did not match the submitted file.");
+          }
+          return;
+        }
         const response = await workspaceV2Fetch(
           projectId,
           `/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
@@ -1087,6 +1146,15 @@ export function createDevelopmentAgentProvider(
         ) {
           throw new Error("Workspace v2 upload receipt did not match the submitted file.");
         }
+        return;
+      }
+      if (onProgress !== undefined) {
+        await uploadWithProgress(
+          `${baseUrl}/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
+          data,
+          { "Content-Type": mediaType || "application/octet-stream" },
+          onProgress,
+        );
         return;
       }
       await requestJson(

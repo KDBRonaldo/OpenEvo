@@ -2336,6 +2336,26 @@ pre.json {
   cursor: default;
 }
 
+.explorer-tree-node.upload-queued > button,
+.explorer-tree-node.upload-uploading > button,
+.explorer-tree-node.upload-uploaded > button,
+.explorer-tree-node.upload-failed > button {
+  height: 51px;
+  align-items: flex-start;
+  padding-top: 6px;
+  opacity: 1;
+}
+
+.explorer-tree-node.upload-queued > button:hover,
+.explorer-tree-node.upload-uploading > button:hover,
+.explorer-tree-node.upload-uploaded > button:hover {
+  background: #f3f7f5;
+}
+
+.explorer-tree-node.upload-failed > button {
+  background: #fff5f3;
+}
+
 .explorer-tree-toggle {
   display: inline-flex;
   width: 14px;
@@ -2369,6 +2389,68 @@ pre.json {
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.explorer-tree-content {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 3px;
+}
+
+.explorer-upload-state {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.explorer-upload-state-label {
+  grid-column: 2;
+  grid-row: 1;
+  color: #65736c;
+  font-size: 8px;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.explorer-upload-progress {
+  position: relative;
+  display: block;
+  height: 3px;
+  grid-column: 1;
+  grid-row: 1;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dfe9e4;
+}
+
+.explorer-upload-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #4b9b81, #78bda6);
+  transition: width 120ms ease-out;
+}
+
+.explorer-upload-state[data-status="queued"] .explorer-upload-progress > span {
+  width: 18% !important;
+  animation: explorer-upload-queued 1.15s ease-in-out infinite alternate;
+}
+
+.explorer-upload-state[data-status="failed"] {
+  display: block;
+}
+
+.explorer-upload-state[data-status="failed"] .explorer-upload-state-label {
+  color: #b14d42;
+}
+
+@keyframes explorer-upload-queued {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(560%); }
 }
 
 .explorer-tree-node.directory > button > .explorer-tree-label {

@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopProductSnapshotV2 } from "./providerV2";
+import type { DesktopProductSnapshotV2, WorkspaceFileUploadV2 } from "./providerV2";
 import type { OperationV2 } from "../api/v2/schemas";
 import {
   unavailableDesktopProductProviderV2,
@@ -871,6 +871,53 @@ describe("Desktop v2 product renderer", () => {
       expect.objectContaining({ path: "research/docs/notes.md", data: markdownFile, overwrite: false }),
       expect.anything(),
     );
+  });
+
+  it("shows a selected file in the Workspace tree with live upload progress", async () => {
+    let finishUpload: (() => void) | undefined;
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      upload: WorkspaceFileUploadV2,
+    ) => new Promise<void>((resolve) => {
+      finishUpload = resolve;
+      upload.onProgress?.(37);
+    }));
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      uploadWorkspaceFile,
+      downloadWorkspaceFile: vi.fn(async () => ({
+        fileName: "unused.txt",
+        mediaType: "text/plain",
+        data: new Blob(),
+      })),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    const uploadButton = document.querySelector<HTMLButtonElement>('[aria-label="Upload to workspace"]')!;
+    await act(async () => uploadButton.click());
+    const uploadFilesOption = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')][0]!;
+    await act(async () => uploadFilesOption.click());
+    const fileInput = document.querySelector<HTMLInputElement>('[aria-label="Choose files to upload"]')!;
+    const file = new File(["a,b\n1,2\n"], "large-dataset.csv", { type: "text/csv" });
+    Object.defineProperty(fileInput, "files", { configurable: true, value: [file] });
+
+    await act(async () => {
+      fileInput.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
+    const pendingTreeItem = document.querySelector<HTMLElement>('[role="treeitem"][title="large-dataset.csv"]');
+    expect(pendingTreeItem).toBeTruthy();
+    expect(pendingTreeItem?.textContent).toContain("37% uploaded");
+    expect(pendingTreeItem?.getAttribute("aria-busy")).toBe("true");
+    expect(pendingTreeItem?.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("37");
+
+    await act(async () => {
+      finishUpload?.();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(document.querySelector('[aria-label="Uploading large-dataset.csv"]')).toBeNull());
   });
 
   it("keeps one authoritative event subscription across the initial refresh", async () => {

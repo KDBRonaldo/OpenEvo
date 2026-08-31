@@ -78,6 +78,15 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
+type WorkspaceUploadStateV2 = {
+  readonly id: string;
+  readonly projectId: string;
+  readonly path: string;
+  readonly percentage: number;
+  readonly status: "queued" | "uploading" | "uploaded" | "failed";
+  readonly error: string | null;
+};
+
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
@@ -296,6 +305,7 @@ export function DesktopProductApp({
   const [newSessionDraftKey, setNewSessionDraftKey] = useState(0);
   const [startingSession, setStartingSession] = useState<StartingSessionV2 | null>(null);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
+  const [workspaceUploads, setWorkspaceUploads] = useState<readonly WorkspaceUploadStateV2[]>([]);
   const [projectPaneWidth, setProjectPaneWidth] = usePersistedPaneWidth(
     PROJECT_PANE_WIDTH_KEY,
     248,
@@ -481,6 +491,9 @@ export function DesktopProductApp({
   const displayedWorkspace = displayedProject === null
     ? undefined
     : snapshot.runtimePresentation?.workspaces?.[displayedProject.project_id];
+  const displayedWorkspaceUploads = displayedProject === null
+    ? []
+    : workspaceUploads.filter((upload) => upload.projectId === displayedProject.project_id);
   const selectedWorkspaceEntry = displayedWorkspace?.entries.find(
     (entry) => entry.kind === "file" && entry.path === selectedWorkspacePath,
   ) ?? null;
@@ -630,24 +643,80 @@ export function DesktopProductApp({
 
   const uploadWorkspaceFiles = (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean): void => {
     if (displayedProject === null) return;
-    void act(
-      async () => {
+    const projectId = displayedProject.project_id;
+    const pending = uploads.map((upload): WorkspaceUploadStateV2 => ({
+      id: actionIdV2("workspace-upload-row"),
+      projectId,
+      path: upload.path,
+      percentage: 0,
+      status: "queued",
+      error: null,
+    }));
+    const pendingByPath = new Map(pending.map((upload) => [upload.path, upload]));
+    const updateUpload = (id: string, update: Partial<WorkspaceUploadStateV2>): void => {
+      setWorkspaceUploads((current) => current.map((upload) => (
+        upload.id === id ? { ...upload, ...update } : upload
+      )));
+    };
+    setWorkspaceUploads((current) => [
+      ...current.filter((upload) => upload.projectId !== projectId || !pendingByPath.has(upload.path)),
+      ...pending,
+    ]);
+    setBusy(true);
+    setActionError(null);
+    setActionStatus(null);
+    void (async () => {
+      const failed: string[] = [];
+      try {
         if (!provider.uploadWorkspaceFile) throw new Error("This backend does not support workspace uploads.");
-        for (const upload of uploads) {
-          await provider.uploadWorkspaceFile(
-            displayedProject.project_id,
-            {
-              path: upload.path,
-              data: upload.file,
-              mediaType: upload.file.type || "application/octet-stream",
-              overwrite,
-            },
-            intentFor(snapshot, "upload-workspace-file"),
-          );
+        for (const [index, upload] of uploads.entries()) {
+          const uploadState = pending[index]!;
+          updateUpload(uploadState.id, { status: "uploading" });
+          try {
+            await provider.uploadWorkspaceFile(
+              projectId,
+              {
+                path: upload.path,
+                data: upload.file,
+                mediaType: upload.file.type || "application/octet-stream",
+                overwrite,
+                onProgress: (percentage) => updateUpload(uploadState.id, {
+                  percentage: Math.round(Math.min(100, Math.max(0, percentage))),
+                }),
+              },
+              intentFor(snapshot, "upload-workspace-file"),
+            );
+            updateUpload(uploadState.id, { percentage: 100, status: "uploaded" });
+          } catch (error) {
+            const message = userMessageV2(error);
+            failed.push(`${upload.path}: ${message}`);
+            updateUpload(uploadState.id, { status: "failed", error: message });
+          }
         }
-      },
-      `${uploads.length} workspace file${uploads.length === 1 ? "" : "s"} uploaded to the remote server.`,
-    );
+        const refreshed = await refresh();
+        if (refreshed !== null) {
+          setWorkspaceUploads((current) => current.filter((upload) => (
+            upload.projectId !== projectId || upload.status !== "uploaded"
+          )));
+        }
+        if (failed.length > 0) {
+          setActionError(`${failed.length} workspace file${failed.length === 1 ? "" : "s"} failed to upload. ${failed[0]}`);
+        } else {
+          setActionStatus(`${uploads.length} workspace file${uploads.length === 1 ? "" : "s"} uploaded to the remote server.`);
+        }
+      } catch (error) {
+        const message = userMessageV2(error);
+        setWorkspaceUploads((current) => current.map((upload) => (
+          pending.some((candidate) => candidate.id === upload.id) && upload.status === "queued"
+            ? { ...upload, status: "failed", error: message }
+            : upload
+        )));
+        setActionError(message);
+        await refresh();
+      } finally {
+        setBusy(false);
+      }
+    })();
   };
 
   const downloadWorkspaceFile = (path: string): void => {
@@ -685,6 +754,7 @@ export function DesktopProductApp({
         projects={snapshot.projects}
         activeProject={displayedProject}
         workspace={displayedWorkspace}
+        uploads={displayedWorkspaceUploads}
         selectedPath={selectedWorkspacePath}
         busy={busy || startingSession !== null}
         switching={switchingProjectId !== null}
@@ -1397,28 +1467,42 @@ type ProjectFileTreeNodeV2 = {
   path: string;
   name: string;
   kind: ProjectWorkspaceEntryV2["kind"];
+  upload: WorkspaceUploadStateV2 | null;
   children: ProjectFileTreeNodeV2[];
 };
 
-function buildProjectFileTreeV2(entries: readonly ProjectWorkspaceEntryV2[]): ProjectFileTreeNodeV2[] {
+function buildProjectFileTreeV2(
+  entries: readonly ProjectWorkspaceEntryV2[],
+  uploads: readonly WorkspaceUploadStateV2[] = [],
+): ProjectFileTreeNodeV2[] {
   const roots: ProjectFileTreeNodeV2[] = [];
   const nodes = new Map<string, ProjectFileTreeNodeV2>();
-  for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
+  const addPath = (
+    entry: Pick<ProjectWorkspaceEntryV2, "path" | "kind">,
+    upload: WorkspaceUploadStateV2 | null,
+  ): void => {
     const parts = entry.path.split("/").filter(Boolean);
     parts.forEach((name, index) => {
       const path = parts.slice(0, index + 1).join("/");
       const leaf = index === parts.length - 1;
       let node = nodes.get(path);
       if (node === undefined) {
-        node = { path, name, kind: leaf ? entry.kind : "directory", children: [] };
+        node = { path, name, kind: leaf ? entry.kind : "directory", upload: leaf ? upload : null, children: [] };
         nodes.set(path, node);
         const parentPath = parts.slice(0, index).join("/");
         const parent = nodes.get(parentPath);
         if (parent) parent.children.push(node); else roots.push(node);
       } else if (leaf) {
         node.kind = entry.kind;
+        node.upload = upload;
       }
     });
+  };
+  for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
+    addPath(entry, null);
+  }
+  for (const upload of uploads) {
+    addPath({ path: upload.path, kind: "file" }, upload);
   }
   const sortNodes = (items: ProjectFileTreeNodeV2[]): void => {
     items.sort((left, right) => {
@@ -1610,6 +1694,7 @@ function ProjectExplorerV2({
   projects,
   activeProject,
   workspace,
+  uploads,
   selectedPath,
   busy,
   switching,
@@ -1625,6 +1710,7 @@ function ProjectExplorerV2({
   readonly projects: readonly ProjectV2[];
   readonly activeProject: ProjectV2 | null;
   readonly workspace: ProjectWorkspacePresentationV2 | undefined;
+  readonly uploads: readonly WorkspaceUploadStateV2[];
   readonly selectedPath: string | null;
   readonly busy: boolean;
   readonly switching: boolean;
@@ -1639,6 +1725,7 @@ function ProjectExplorerV2({
 }) {
   const entries = workspace?.entries ?? [];
   const files = entries.filter((entry) => entry.kind === "file");
+  const displayedFileCount = new Set([...files.map((file) => file.path), ...uploads.map((upload) => upload.path)]).size;
   const [collapsedDirectories, setCollapsedDirectories] = useState<ReadonlySet<string>>(new Set());
   const [fileQuery, setFileQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1646,7 +1733,7 @@ function ProjectExplorerV2({
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const folderUploadInputRef = useRef<HTMLInputElement>(null);
   const uploadMenuRef = useRef<HTMLDivElement>(null);
-  const fileTree = useMemo(() => buildProjectFileTreeV2(entries), [entries]);
+  const fileTree = useMemo(() => buildProjectFileTreeV2(entries, uploads), [entries, uploads]);
   const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
   const visibleFileTree = useMemo(
     () => filterProjectFileTreeV2(fileTree, normalizedFileQuery),
@@ -1695,17 +1782,29 @@ function ProjectExplorerV2({
     const collapsed = directory && collapsedDirectories.has(node.path);
     const expanded = directory && (normalizedFileQuery !== "" || !collapsed);
     const unavailable = !directory && node.kind !== "file";
+    const upload = node.upload;
+    const uploadPending = upload !== null && upload.status !== "failed";
+    const uploadLabel = upload?.status === "queued"
+      ? "Waiting to upload"
+      : upload?.status === "uploaded"
+        ? "Finishing upload"
+        : upload?.status === "failed"
+          ? "Upload failed"
+          : upload === null
+            ? null
+            : `${upload.percentage}% uploaded`;
     return (
-      <div className={`explorer-tree-node ${directory ? "directory" : "file"}`} key={`${node.kind}:${node.path}`}>
+      <div className={`explorer-tree-node ${directory ? "directory" : "file"}${upload ? ` upload-${upload.status}` : ""}`} key={`${node.kind}:${node.path}`}>
         <button
           type="button"
           role="treeitem"
           aria-level={level}
           aria-selected={selected}
           aria-expanded={directory ? expanded : undefined}
-          aria-disabled={unavailable || undefined}
-          className={`${selected ? "selected" : ""}${unavailable ? " unavailable" : ""}`}
-          title={node.path}
+          aria-disabled={unavailable || upload !== null || undefined}
+          aria-busy={uploadPending || undefined}
+          className={`${selected ? "selected" : ""}${unavailable || upload ? " unavailable" : ""}`}
+          title={upload?.error ? `${node.path}: ${upload.error}` : node.path}
           onClick={() => {
             if (directory) {
               setCollapsedDirectories((current) => {
@@ -1713,7 +1812,7 @@ function ProjectExplorerV2({
                 if (next.has(node.path)) next.delete(node.path); else next.add(node.path);
                 return next;
               });
-            } else if (node.kind === "file") onSelectFile(node.path);
+            } else if (node.kind === "file" && upload === null) onSelectFile(node.path);
           }}
         >
           <span className="explorer-tree-toggle" aria-hidden="true">
@@ -1722,7 +1821,26 @@ function ProjectExplorerV2({
           <span className="explorer-tree-kind" aria-hidden="true">
             {directory ? <FolderOpen size={15} /> : <ProjectFileTypeIconV2 path={node.path} />}
           </span>
-          <span className="explorer-tree-label">{node.name}</span>
+          <span className="explorer-tree-content">
+            <span className="explorer-tree-label">{node.name}</span>
+            {upload ? (
+              <span className="explorer-upload-state" data-status={upload.status}>
+                <span className="explorer-upload-state-label">{uploadLabel}</span>
+                {upload.status === "uploading" || upload.status === "queued" || upload.status === "uploaded" ? (
+                  <span
+                    className="explorer-upload-progress"
+                    role="progressbar"
+                    aria-label={`Uploading ${node.path}`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={upload.percentage}
+                  >
+                    <span style={{ width: `${upload.percentage}%` }} />
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
+          </span>
         </button>
         {directory && expanded && node.children.length > 0 ? (
           <div className="explorer-tree-branch" role="group">{renderTreeNodes(node.children, level + 1)}</div>
@@ -1746,7 +1864,7 @@ function ProjectExplorerV2({
         {switching ? <span className="project-switching-indicator" role="status">Switching</span> : null}
       </div>
       <div className="explorer-files-header">
-        <div className="explorer-files-title"><span className="explorer-files-mark"><FolderTree size={17} /></span><span><strong>Workspace</strong><small>{files.length} {files.length === 1 ? "file" : "files"}</small></span></div>
+        <div className="explorer-files-title"><span className="explorer-files-mark"><FolderTree size={17} /></span><span><strong>Workspace</strong><small>{displayedFileCount} {displayedFileCount === 1 ? "file" : "files"}</small></span></div>
         <div className="explorer-files-actions"><button type="button" className={searchOpen ? "active" : ""} aria-label="Search files" title="Search files" aria-pressed={searchOpen} onClick={() => { setSearchOpen((current) => !current); if (searchOpen) setFileQuery(""); }}><Search size={15} /></button>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
@@ -1759,7 +1877,7 @@ function ProjectExplorerV2({
       </div>
       {searchOpen ? <label className="explorer-file-search"><Search size={14} /><input autoFocus type="search" aria-label="Filter workspace files" placeholder="Filter files" value={fileQuery} onChange={(event) => setFileQuery(event.target.value)} />{fileQuery ? <button type="button" aria-label="Clear file search" onClick={() => setFileQuery("")}><X size={13} /></button> : null}</label> : null}
       <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
-        {visibleFileTree.length ? renderTreeNodes(visibleFileTree) : <div className="explorer-empty">{entries.length ? "No matching files" : "No files yet"}</div>}
+        {visibleFileTree.length ? renderTreeNodes(visibleFileTree) : <div className="explorer-empty">{entries.length || uploads.length ? "No matching files" : "No files yet"}</div>}
       </div>
       {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
       <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
