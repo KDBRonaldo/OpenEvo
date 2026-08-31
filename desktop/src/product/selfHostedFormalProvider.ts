@@ -107,7 +107,7 @@ export function combineSelfHostedProviders(
   presentation: DesktopProductProviderV2,
 ): DesktopProductProviderV2 {
   const featureFlags = Object.freeze([
-    ...new Set([...formal.featureFlags, ...presentation.featureFlags]),
+    ...new Set([...formal.featureFlags, ...presentation.featureFlags, "browser_folder_snapshot"]),
   ]);
   let presentationAuthorityKey: string | null = null;
   let cachedPresentation: DesktopProductSnapshotV2["runtimePresentation"];

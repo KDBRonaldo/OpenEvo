@@ -83,6 +83,11 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
+type BrowserFolderSelectionV2 = {
+  readonly displayName: string;
+  readonly uploads: readonly BrowserWorkspaceUploadV2[];
+};
+
 type WorkspaceUploadStateV2 = {
   readonly id: string;
   readonly projectId: string;
@@ -102,6 +107,10 @@ const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
 const WORKSPACE_UPLOAD_MINIMUM_VISIBLE_MS = 1_400;
+const BROWSER_FOLDER_SNAPSHOT_FEATURE = "browser_folder_snapshot";
+const BROWSER_FOLDER_MAX_FILES = 1_000;
+const BROWSER_FOLDER_MAX_FILE_BYTES = 32 * 1024 * 1024;
+const BROWSER_FOLDER_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
 const PROJECT_TASK_PLACEHOLDER = {
   title: "Untitled Session",
   objective: "Task details are provided when the Session starts.",
@@ -921,11 +930,15 @@ export function DesktopProductApp({
 
       <div className="product-stage">
         <main className="product-main">
-          {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
-          {actionError ? <Notice tone="error" title="Action not completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
-          {actionStatus ? <Notice tone="success" title="Action completed" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
-          {snapshot.stream.status !== "fresh" ? (
-            <Notice tone="warning" title="Synchronizing remote state" detail="Write actions remain paused until synchronization completes." compact />
+          {loadError || actionError || actionStatus || snapshot.stream.status !== "fresh" ? (
+            <div className="product-feedback-stack" aria-label="Product status">
+              {loadError ? <ErrorNoticeV2 context="refresh" error={loadError} onRetry={() => void refresh()} /> : null}
+              {actionError ? <ErrorNoticeV2 context="action" error={actionError} onDismiss={() => setActionError(null)} /> : null}
+              {actionStatus ? <Notice tone="success" title="Done" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
+              {snapshot.stream.status !== "fresh" ? (
+                <Notice tone="warning" title="Updating remote state" detail="Changes are briefly paused while EvoLab confirms the latest server state." compact />
+              ) : null}
+            </div>
           ) : null}
 
           {displayedProject === null ? (
@@ -1232,6 +1245,7 @@ function InitialV2View({
   readonly error: string | null;
   readonly onRetry: () => void;
 }) {
+  const errorCopy = error === null ? null : errorNoticeCopyV2(error, "startup");
   return (
     <div className={`product-shell initial-launch-shell${error ? " has-error" : ""}`}>
       <main className="initial-launch-main">
@@ -1242,10 +1256,10 @@ function InitialV2View({
           </h1>
           {error ? (
             <>
-              <p>The workspace could not be prepared automatically. Retry the startup when you are ready.</p>
+              <p>{errorCopy?.detail}</p>
               <div className="initial-launch-status is-error" role="status">
                 <AlertCircle size={17} />
-                <div><strong>Startup did not complete</strong><span>{error}</span></div>
+                <div><strong>{errorCopy?.title}</strong><span>{errorCopy?.guidance}</span></div>
               </div>
             </>
           ) : (
@@ -1405,7 +1419,7 @@ function RemoteWorkspaceSetupV2({
           <button className="icon-button" type="button" aria-label="Close remote workspace setup" onClick={onClose} disabled={busy}><X size={18} /></button>
         </div>
         <div className="drawer-content">
-          {error ? <Notice tone="error" title="Connection action failed" detail={error} onDismiss={onClearError} /> : null}
+          {error ? <ErrorNoticeV2 context="connection" error={error} onDismiss={onClearError} /> : null}
           <section className="form-section">
             <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>EvoLab reads aliases from your system <code>~/.ssh/config</code> and invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for host, port, user, identities, ProxyJump, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
             {snapshot.catalog.warnings.length > 0 ? (
@@ -1542,13 +1556,40 @@ function NewProjectDialogV2({
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState(project?.config.workspace.display_name ?? "Research workspace");
   const [executionMode, setExecutionMode] = useState<ScienceProjectConfigV2["execution"]["mode"]>(project?.config.execution.mode ?? "codex_subscription_transcript");
   const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
+  const [browserFolderUploads, setBrowserFolderUploads] = useState<readonly BrowserWorkspaceUploadV2[]>([]);
+  const [folderImportProgress, setFolderImportProgress] = useState<number | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const closedRef = useRef(false);
   const dialogRef = useDialogBoundary(onClose);
   const projectTask = project?.config.task ?? PROJECT_TASK_PLACEHOLDER;
+  const browserFolderAvailable = project === null
+    && provider.featureFlags.includes(BROWSER_FOLDER_SNAPSHOT_FEATURE)
+    && provider.uploadWorkspaceFile !== undefined;
+  const browserFolderBytes = browserFolderUploads.reduce((total, upload) => total + upload.file.size, 0);
   const baseDraftValid = displayName.trim() !== "";
   const valid = baseDraftValid
-    && (workspaceKind === "scratch" || sourceActionId !== null || project !== null);
+    && (workspaceKind === "scratch" || sourceActionId !== null || browserFolderUploads.length > 0 || project !== null);
+
+  useEffect(() => {
+    folderInputRef.current?.setAttribute("webkitdirectory", "");
+    folderInputRef.current?.setAttribute("directory", "");
+  }, []);
+
+  const selectBrowserFolder = (files: readonly File[]): void => {
+    try {
+      const selection = browserFolderSelectionV2(files);
+      setBrowserFolderUploads(selection.uploads);
+      setWorkspaceKind("native_folder_snapshot");
+      setSelectedSourceDisplayName(selection.displayName);
+      setWorkspaceDisplayName(selection.displayName);
+    } catch (error) {
+      setBrowserFolderUploads([]);
+      setWorkspaceKind("scratch");
+      setSelectedSourceDisplayName(null);
+      onError(error);
+    }
+  };
 
   const chooseFolder = async (): Promise<void> => {
     const actionId = actionIdV2("select-workspace");
@@ -1605,9 +1646,62 @@ function NewProjectDialogV2({
       executionMode,
     );
     onBusy(true);
+    let browserCreatedProjectId: string | null = null;
     try {
       if (project) {
         await provider.updateProject(project.project_id, displayName.trim(), { ...config, evolution: project.config.evolution }, { actionId, streamEpoch: snapshot.stream.epoch });
+      } else if (workspaceKind === "native_folder_snapshot" && browserFolderUploads.length > 0) {
+        if (!provider.uploadWorkspaceFile) throw new Error("This browser cannot upload a folder snapshot.");
+        const scratchConfig: ScienceProjectConfigV2 = {
+          ...config,
+          workspace: { ...config.workspace, kind: "scratch" },
+        };
+        const created = await provider.createProject({
+          profileId: profile.profile_id,
+          displayName: displayName.trim(),
+          config: scratchConfig,
+        }, { actionId: actionIdV2("create-folder-project"), streamEpoch: snapshot.stream.epoch });
+        if (created.status !== "succeeded" || created.result?.result_kind !== "project") {
+          throw new Error("The remote project was not ready for its folder snapshot.");
+        }
+        browserCreatedProjectId = created.result.project_id;
+        const totalBytes = Math.max(1, browserFolderBytes);
+        let completedBytes = 0;
+        setFolderImportProgress(0);
+        for (const upload of browserFolderUploads) {
+          await provider.uploadWorkspaceFile(
+            browserCreatedProjectId,
+            {
+              path: upload.path,
+              data: upload.file,
+              mediaType: upload.file.type || "application/octet-stream",
+              overwrite: false,
+              onProgress: (percentage) => setFolderImportProgress(Math.round(
+                ((completedBytes + (upload.file.size * percentage / 100)) / totalBytes) * 100,
+              )),
+            },
+            { actionId: actionIdV2("upload-folder-file"), streamEpoch: snapshot.stream.epoch },
+          );
+          completedBytes += upload.file.size;
+          setFolderImportProgress(Math.round((completedBytes / totalBytes) * 100));
+        }
+        setFolderImportProgress(100);
+        const refreshed = await provider.refresh();
+        if (refreshed.status !== "fresh") {
+          throw new Error("The imported Project could not be refreshed before finalization.");
+        }
+        const importedProject = refreshed.snapshot.projects.find((candidate) => (
+          candidate.project_id === browserCreatedProjectId
+        ));
+        if (importedProject === undefined) {
+          throw new Error("The imported Project is missing from the remote state.");
+        }
+        await provider.updateProject(
+          browserCreatedProjectId,
+          displayName.trim(),
+          { ...config, evolution: importedProject.config.evolution },
+          { actionId: actionIdV2("finalize-folder-project"), streamEpoch: refreshed.snapshot.stream.epoch },
+        );
       } else {
         await provider.createProject({
           profileId: profile.profile_id,
@@ -1617,8 +1711,15 @@ function NewProjectDialogV2({
       }
       await onCreated();
     } catch (error) {
+      if (browserCreatedProjectId !== null && provider.deleteProject) {
+        await provider.deleteProject(
+          browserCreatedProjectId,
+          { actionId: actionIdV2("rollback-folder-project"), streamEpoch: snapshot.stream.epoch },
+        ).catch(() => {});
+      }
       onError(error);
     } finally {
+      setFolderImportProgress(null);
       onBusy(false);
     }
   };
@@ -1642,8 +1743,14 @@ function NewProjectDialogV2({
           </section>
           <section className="form-section">
             <h3>Workspace snapshot</h3>
-            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null || project !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null || project !== null} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
-            <p className="form-help">{project ? `${project.config.workspace.display_name} · the immutable workspace source cannot be replaced from project settings.` : workspaceKind === "native_folder_snapshot" ? selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
+            {browserFolderAvailable ? <input ref={folderInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose project folder snapshot" onChange={(event) => {
+              const selectedFiles = Array.from(event.currentTarget.files ?? []);
+              event.currentTarget.value = "";
+              if (selectedFiles.length > 0) selectBrowserFolder(selectedFiles);
+            }} /> : null}
+            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null || project !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setBrowserFolderUploads([]); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null || project !== null} onClick={() => { if (browserFolderAvailable) folderInputRef.current?.click(); else void chooseFolder(); }}><FolderOpen size={15} /> Choose folder snapshot</button></div>
+            <p className="form-help">{project ? `${project.config.workspace.display_name} · the immutable workspace source cannot be replaced from project settings.` : workspaceKind === "native_folder_snapshot" ? browserFolderUploads.length > 0 ? `${selectedSourceDisplayName} · ${browserFolderUploads.length} file${browserFolderUploads.length === 1 ? "" : "s"} · ${formatBytes(browserFolderBytes)}` : selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
+            {folderImportProgress !== null ? <div className="folder-snapshot-progress" role="progressbar" aria-label="Uploading folder snapshot" aria-valuemin={0} aria-valuemax={100} aria-valuenow={folderImportProgress}><span style={{ width: `${folderImportProgress}%` }} /><small>{folderImportProgress}% uploaded</small></div> : null}
           </section>
           <section className="form-section">
             <h3>Execution</h3>
@@ -3609,8 +3716,47 @@ function WorkspaceButton({ active, onClick, icon: Icon, children }: { readonly a
   return <button type="button" className={`product-nav-item ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={onClick}><Icon size={17} /> {children}</button>;
 }
 
-function Notice({ tone, title, detail, action, compact = false, onDismiss }: { readonly tone: "error" | "warning" | "success" | "info"; readonly title: string; readonly detail: string; readonly action?: React.ReactNode; readonly compact?: boolean; readonly onDismiss?: () => void }) {
-  return <div className={`v2-notice ${tone}${compact ? " compact" : ""}`} role={tone === "error" ? "alert" : "status"}>{tone === "success" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}<div><strong>{title}</strong><span>{detail}</span></div>{action}{onDismiss ? <button type="button" className="icon-button" aria-label="Dismiss notice" onClick={onDismiss}><X size={15} /></button> : null}</div>;
+type ErrorNoticeContextV2 = "refresh" | "action" | "connection" | "startup";
+
+type ErrorNoticeCopyV2 = {
+  readonly title: string;
+  readonly detail: string;
+  readonly guidance: string;
+};
+
+function ErrorNoticeV2({ context, error, onRetry, onDismiss }: {
+  readonly context: ErrorNoticeContextV2;
+  readonly error: string;
+  readonly onRetry?: () => void;
+  readonly onDismiss?: () => void;
+}) {
+  const copy = errorNoticeCopyV2(error, context);
+  return <Notice
+    tone="error"
+    title={copy.title}
+    detail={copy.detail}
+    guidance={copy.guidance}
+    action={onRetry ? <button type="button" className="v2-notice-action" onClick={onRetry}><RefreshCw size={12} /> Retry</button> : undefined}
+    onDismiss={onDismiss}
+  />;
+}
+
+function Notice({ tone, title, detail, guidance, action, compact = false, onDismiss }: {
+  readonly tone: "error" | "warning" | "success" | "info";
+  readonly title: string;
+  readonly detail: string;
+  readonly guidance?: string;
+  readonly action?: React.ReactNode;
+  readonly compact?: boolean;
+  readonly onDismiss?: () => void;
+}) {
+  const icon = tone === "success" ? <CheckCircle2 size={15} /> : tone === "info" ? <CircleDot size={14} /> : <AlertCircle size={15} />;
+  return <div className={`v2-notice ${tone}${compact ? " compact" : ""}`} role={tone === "error" ? "alert" : "status"}>
+    <span className="v2-notice-mark" aria-hidden="true">{icon}</span>
+    <div className="v2-notice-copy"><strong>{title}</strong><span>{detail}</span>{guidance ? <small>{guidance}</small> : null}</div>
+    {action ? <div className="v2-notice-actions">{action}</div> : null}
+    {onDismiss ? <button type="button" className="v2-notice-dismiss" aria-label="Dismiss notice" onClick={onDismiss}><X size={14} /></button> : null}
+  </div>;
 }
 
 function useDialogBoundary(onClose: () => void) {
@@ -3695,6 +3841,138 @@ function userMessageV2(error: unknown): string {
   if (isDesktopErrorV2(error)) return error.summary;
   if (error instanceof Error && error.message.length > 0 && error.message.length <= 768) return error.message;
   return "EvoLab could not complete this action. Refresh the remote state and try again.";
+}
+
+function errorNoticeCopyV2(error: string, context: ErrorNoticeContextV2): ErrorNoticeCopyV2 {
+  const extracted = extractRemoteErrorDetailV2(error);
+  const message = (extracted ?? error).replace(/\s+/g, " ").trim();
+  const searchable = `${error} ${message}`.toLocaleLowerCase();
+  const fallbackTitle: Record<ErrorNoticeContextV2, string> = {
+    refresh: "Remote state unavailable",
+    action: "Couldn’t complete that action",
+    connection: "Couldn’t connect to the server",
+    startup: "Startup couldn’t finish",
+  };
+  if (searchable.includes("desktop local api request failed")) {
+    return {
+      title: "Connection to EvoLab was lost",
+      detail: "The browser cannot reach the local API that carries requests through the SSH tunnel.",
+      guidance: "Keep the `openevo webui` launcher terminal running. If it stopped, start it again, then retry.",
+    };
+  }
+  if (searchable.includes("connection refused") || searchable.includes("failed to fetch") || searchable.includes("networkerror") || searchable.includes("ssh tunnel")) {
+    return {
+      title: "Remote service is unreachable",
+      detail: "The local tunnel is closed, or the remote Web Layer is not accepting connections yet.",
+      guidance: "Check the launcher terminal and remote daemon status, then retry when both services are ready.",
+    };
+  }
+  if (searchable.includes("timed out") || searchable.includes("timeout")) {
+    return {
+      title: "The server took too long to respond",
+      detail: "EvoLab stopped waiting before the remote operation returned a valid response.",
+      guidance: "Check the network and remote load. Retrying is safe because mutations use an idempotent action ID.",
+    };
+  }
+  if (searchable.includes("content-length is invalid")) {
+    return {
+      title: "Browser and daemon versions do not match",
+      detail: "The remote daemon rejected the request body before it could process the action.",
+      guidance: "Commit the current WebUI build and restart `openevo webui` so the browser and remote daemon use the same revision.",
+    };
+  }
+  if (searchable.includes("bootstrap") || searchable.includes("session expired") || /\b(401|403)\b/.test(searchable)) {
+    return {
+      title: "This browser session is no longer valid",
+      detail: "The Web Layer rejected the browser’s temporary authentication session.",
+      guidance: "Open EvoLab again from the URL printed by a running `openevo webui` launcher.",
+    };
+  }
+  if (searchable.includes("contract") || searchable.includes("digest") || /\b426\b/.test(searchable)) {
+    return {
+      title: "EvoLab components are out of sync",
+      detail: "The browser and remote service reported incompatible API or schema versions.",
+      guidance: "Commit the current source and restart the remote launcher to deploy one matching revision.",
+    };
+  }
+  if (searchable.includes("conflict") || searchable.includes("etag") || searchable.includes("stale") || /\b(409|412)\b/.test(searchable)) {
+    return {
+      title: "The remote state changed first",
+      detail: "EvoLab did not apply the action because its local view was older than the server state.",
+      guidance: "Refresh the page state, review the latest Project or Session, and try the action again.",
+    };
+  }
+  if (searchable.includes("not found") || /\b404\b/.test(searchable)) {
+    return {
+      title: "That item is no longer available",
+      detail: "The Project, Session, or file was removed before this request reached the server.",
+      guidance: "Refresh the remote state to remove the outdated item from this view.",
+    };
+  }
+  if (searchable.includes("invalid_request") || searchable.includes("invalid request") || /\b400\b/.test(searchable)) {
+    return {
+      title: "The remote service rejected the request",
+      detail: message || "The request did not match the daemon’s expected format.",
+      guidance: "Review the selected values. If they are valid, restart the launcher to ensure both sides use the same revision.",
+    };
+  }
+  return {
+    title: fallbackTitle[context],
+    detail: message || "EvoLab did not receive a usable response from the remote service.",
+    guidance: context === "action"
+      ? "The action was not confirmed. Review the current state before trying again."
+      : "Check the launcher connection and retry. Existing remote data has not been removed.",
+  };
+}
+
+function extractRemoteErrorDetailV2(message: string): string | null {
+  const objectStart = message.indexOf("{");
+  if (objectStart < 0) return null;
+  try {
+    const payload = JSON.parse(message.slice(objectStart)) as unknown;
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+    const record = payload as Record<string, unknown>;
+    const nested = typeof record.error === "object" && record.error !== null && !Array.isArray(record.error)
+      ? record.error as Record<string, unknown>
+      : null;
+    const candidate = nested?.message ?? record.message ?? record.detail;
+    return typeof candidate === "string" && candidate.trim() !== "" ? candidate.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function browserFolderSelectionV2(files: readonly File[]): BrowserFolderSelectionV2 {
+  if (files.length === 0) throw new Error("Choose a folder that contains at least one file.");
+  if (files.length > BROWSER_FOLDER_MAX_FILES) {
+    throw new Error(`The selected folder contains more than ${BROWSER_FOLDER_MAX_FILES} files.`);
+  }
+  let displayName: string | null = null;
+  let totalBytes = 0;
+  const paths = new Set<string>();
+  const uploads = files.map((file): BrowserWorkspaceUploadV2 => {
+    const parts = file.webkitRelativePath.replaceAll("\\", "/").split("/");
+    if (parts.length < 2 || parts.some((part) => part === "" || part === "." || part === ".." || /[\u0000-\u001f\u007f]/.test(part))) {
+      throw new Error(`The selected folder contains an unsafe path: ${file.webkitRelativePath || file.name}`);
+    }
+    const rootName = parts[0]!;
+    if (rootName.length > 256) throw new Error("The selected folder name exceeds 256 characters.");
+    if (displayName === null) displayName = rootName;
+    if (displayName !== rootName) throw new Error("Choose exactly one folder snapshot.");
+    const path = parts.slice(1).join("/");
+    if (paths.has(path)) throw new Error(`The selected folder contains the duplicate path ${path}.`);
+    paths.add(path);
+    if (file.size > BROWSER_FOLDER_MAX_FILE_BYTES) {
+      throw new Error(`${path} exceeds the 32 MiB per-file upload limit.`);
+    }
+    totalBytes += file.size;
+    if (totalBytes > BROWSER_FOLDER_MAX_TOTAL_BYTES) {
+      throw new Error("The selected folder exceeds the 512 MiB workspace limit.");
+    }
+    return { file, path };
+  });
+  if (displayName === null) throw new Error("Choose a folder that contains at least one file.");
+  return { displayName, uploads };
 }
 
 function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {

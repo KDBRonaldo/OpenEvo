@@ -4722,66 +4722,147 @@ pre.json {
   margin: 0 auto;
 }
 
-.v2-notice {
+.product-feedback-stack {
+  position: relative;
+  z-index: 20;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 13px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  color: var(--ink);
-  background: var(--surface);
+  width: min(720px, calc(100% - 36px));
+  gap: 6px;
+  margin: 14px 18px 0;
 }
 
-.v2-notice > div > strong,
-.v2-notice > div > span {
+.v2-notice {
+  --notice-tone: #53615c;
+  position: relative;
+  display: grid;
+  min-height: 52px;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px 8px 11px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0 7px 7px 0;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--notice-tone) 5%, var(--surface));
+  box-shadow: none;
+}
+
+.v2-notice::before {
+  position: absolute;
+  inset: 7px auto 7px 0;
+  width: 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--notice-tone) 68%, transparent);
+  content: "";
+}
+
+.v2-notice.error { --notice-tone: #a94b4b; }
+.v2-notice.warning { --notice-tone: #9a6a22; }
+.v2-notice.success { --notice-tone: #347d69; }
+.v2-notice.info { --notice-tone: #477895; }
+
+.v2-notice-mark {
+  display: grid;
+  width: 27px;
+  height: 27px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--notice-tone);
+  background: color-mix(in srgb, var(--notice-tone) 10%, transparent);
+}
+
+.v2-notice-copy {
+  min-width: 0;
+}
+
+.v2-notice-copy > strong,
+.v2-notice-copy > span,
+.v2-notice-copy > small {
   display: block;
 }
 
-.v2-notice > div > strong {
-  font-size: 12px;
+.v2-notice-copy > strong {
+  font-size: 11.5px;
+  font-weight: 680;
+  letter-spacing: -.01em;
 }
 
-.v2-notice > div > span {
+.v2-notice-copy > span {
   margin-top: 2px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
+  color: #596660;
+  font-size: 10.5px;
+  line-height: 1.42;
 }
 
-.v2-notice.error {
-  border-color: #e4baba;
-  background: var(--danger-soft);
+.v2-notice-copy > small {
+  margin-top: 3px;
+  color: #78827e;
+  font-size: 9.5px;
+  line-height: 1.4;
 }
 
-.v2-notice.error > svg { color: var(--danger); }
-.v2-notice.warning { border-color: #ead19e; background: var(--warning-soft); }
-.v2-notice.warning > svg { color: var(--warning); }
-.v2-notice.success { border-color: #bcd8cd; background: #edf7f3; }
-.v2-notice.success > svg { color: var(--accent); }
-.v2-notice.info { border-color: #c3d4e2; background: var(--blue-soft); }
-.v2-notice.info > svg { color: var(--blue); }
+.v2-notice-actions {
+  display: flex;
+  align-items: center;
+}
+
+.v2-notice-action {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  color: color-mix(in srgb, var(--notice-tone) 82%, #17201d);
+  background: color-mix(in srgb, var(--notice-tone) 9%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.v2-notice-action:hover {
+  background: color-mix(in srgb, var(--notice-tone) 15%, transparent);
+}
+
+.v2-notice-dismiss {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  color: #76817c;
+  background: transparent;
+  cursor: pointer;
+}
+
+.v2-notice-dismiss:hover {
+  color: #29332f;
+  background: rgb(45 66 58 / 6%);
+}
 
 .v2-notice.compact {
   min-height: 38px;
-  gap: 8px;
-  padding: 7px 10px;
+  grid-template-columns: 23px minmax(0, 1fr) auto;
+  gap: 7px;
+  padding: 6px 8px 6px 10px;
 }
 
-.v2-notice.compact > svg {
-  width: 15px;
-  height: 15px;
+.v2-notice.compact .v2-notice-mark {
+  width: 23px;
+  height: 23px;
 }
 
-.v2-notice.compact > div {
+.v2-notice.compact .v2-notice-copy {
   display: flex;
-  min-width: 0;
   align-items: baseline;
   gap: 7px;
 }
 
-.v2-notice.compact > div > span {
+.v2-notice.compact .v2-notice-copy > span {
   min-width: 0;
   margin-top: 0;
   overflow: hidden;
@@ -7281,6 +7362,33 @@ pre.json {
   clip: rect(0 0 0 0);
   clip-path: inset(50%);
   white-space: nowrap;
+}
+
+.folder-snapshot-progress {
+  position: relative;
+  height: 20px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #e4ece8;
+}
+
+.folder-snapshot-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #397f70, #6aab96);
+  transition: width 120ms ease-out;
+}
+
+.folder-snapshot-progress > small {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #1f4037;
+  font-size: 9px;
+  font-weight: 700;
 }
 
 .project-workspace-empty {

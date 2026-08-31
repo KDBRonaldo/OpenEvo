@@ -703,6 +703,36 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-topbar")).toBeNull();
   });
 
+  it("explains a lost local API connection with a compact actionable status", async () => {
+    let refreshCount = 0;
+    let listener: Parameters<DesktopProductProviderV2["subscribe"]>[0] | null = null;
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      refresh: vi.fn(async () => {
+        refreshCount += 1;
+        if (refreshCount > 1) throw new Error("Desktop Local API request failed");
+        return { status: "fresh" as const, snapshot: authoritySnapshot() };
+      }),
+      subscribe: vi.fn((next: Parameters<DesktopProductProviderV2["subscribe"]>[0]) => {
+        listener = next;
+        return () => { listener = null; };
+      }),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await act(async () => {
+      listener?.({ kind: "snapshot_changed" });
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Connection to EvoLab was lost"));
+
+    expect(document.body.textContent).toContain("cannot reach the local API");
+    expect(document.body.textContent).toContain("Keep the `openevo webui` launcher terminal running");
+    expect(document.body.textContent).not.toContain("Refresh failed");
+    expect(document.querySelector(".product-feedback-stack .v2-notice")).toBeTruthy();
+    expect([...document.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Retry")).toBe(true);
+  });
+
   it("uses configured OpenSSH aliases in the localhost browser host", async () => {
     window.history.replaceState(
       null,
@@ -2885,6 +2915,111 @@ describe("Desktop v2 product renderer", () => {
     await click("Cancel");
 
     expect(cancelNativeWorkspace).toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("creates a browser folder snapshot and uploads its contents at the workspace root", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const initialSnapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    let created = false;
+    const createProject = vi.fn(async () => {
+      created = true;
+      return {
+        schema_version: "2" as const,
+        operation_id: "project-create-browser-folder-1",
+        kind: "project_create" as const,
+        resource: { resource_kind: "project" as const, resource_id: "project-1" },
+        request_sha256: DIGEST,
+        status: "succeeded" as const,
+        phase: "finalizing" as const,
+        phase_index: 16,
+        phase_total: 17,
+        progress: { kind: "items" as const, completed: 1, total: 1 },
+        cancellable: false,
+        result: { result_kind: "project" as const, project_id: "project-1" },
+        failure: null,
+        log_sequence_high_watermark: 0,
+        created_at: NOW,
+        started_at: NOW,
+        updated_at: NOW,
+        finished_at: NOW,
+        etag: ETAG,
+      };
+    });
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      upload: WorkspaceFileUploadV2,
+    ) => {
+      upload.onProgress?.(50);
+      upload.onProgress?.(100);
+    });
+    const updateProject = vi.fn(async () => authoritySnapshot().projects[0]!);
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles", "browser_folder_snapshot"],
+      refresh: vi.fn(async () => ({
+        status: "fresh" as const,
+        snapshot: created ? authoritySnapshot() : initialSnapshot,
+      })),
+      createProject,
+      updateProject,
+      uploadWorkspaceFile,
+      deleteProject: vi.fn(async () => {}),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    const folderInput = document.querySelector<HTMLInputElement>('[aria-label="Choose project folder snapshot"]');
+    expect(folderInput).toBeTruthy();
+    expect(folderInput?.hasAttribute("webkitdirectory")).toBe(true);
+    const source = new File(["export const answer = 42;\n"], "index.ts", { type: "text/typescript" });
+    const notes = new File(["# Notes\n"], "notes.md", { type: "text/markdown" });
+    Object.defineProperty(source, "webkitRelativePath", { value: "my-project/src/index.ts" });
+    Object.defineProperty(notes, "webkitRelativePath", { value: "my-project/docs/notes.md" });
+    Object.defineProperty(folderInput!, "files", { configurable: true, value: [source, notes] });
+    await act(async () => {
+      folderInput!.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("my-project · 2 files");
+    await click("Create project");
+    await vi.waitFor(() => expect(updateProject).toHaveBeenCalledTimes(1));
+
+    expect(createProject).toHaveBeenCalledWith(
+      expect.objectContaining({ config: expect.objectContaining({ workspace: expect.objectContaining({ kind: "scratch" }) }) }),
+      expect.anything(),
+    );
+    expect(uploadWorkspaceFile).toHaveBeenNthCalledWith(
+      1,
+      "project-1",
+      expect.objectContaining({ path: "src/index.ts", data: source, overwrite: false }),
+      expect.anything(),
+    );
+    expect(uploadWorkspaceFile).toHaveBeenNthCalledWith(
+      2,
+      "project-1",
+      expect.objectContaining({ path: "docs/notes.md", data: notes, overwrite: false }),
+      expect.anything(),
+    );
+    expect(updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "New research project",
+      expect.objectContaining({ workspace: { kind: "native_folder_snapshot", display_name: "my-project" } }),
+      expect.anything(),
+    );
   });
 });
 

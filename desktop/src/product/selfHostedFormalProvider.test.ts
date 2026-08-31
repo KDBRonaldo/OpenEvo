@@ -187,6 +187,7 @@ describe("self-hosted formal provider", () => {
     expect(combineSelfHostedProviders(formal, presentation).featureFlags).toEqual([
       "development_agent_bridge_v2",
       "development_agent_bridge",
+      "browser_folder_snapshot",
     ]);
   });
 });
