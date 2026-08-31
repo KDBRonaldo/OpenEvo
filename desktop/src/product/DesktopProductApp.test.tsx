@@ -856,8 +856,21 @@ describe("Desktop v2 product renderer", () => {
       deleteTask,
       deleteWorkspaceFile,
     } satisfies DesktopProductProviderV2;
-    vi.stubGlobal("confirm", vi.fn(() => true));
+    const browserConfirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", browserConfirm);
     root = await render(provider);
+
+    const confirmDialog = () => document.querySelector<HTMLElement>('[role="alertdialog"]');
+    const confirmInDialog = async (label: string): Promise<void> => {
+      const confirmation = [...(confirmDialog()?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
+        .find((candidate) => candidate.textContent?.trim() === label);
+      if (!confirmation) throw new Error(`confirmation button not found: ${label}`);
+      await act(async () => {
+        confirmation.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    };
 
     await act(async () => {
       document.querySelector<HTMLButtonElement>("#v2-project-switcher")?.click();
@@ -868,6 +881,10 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
     await click("Delete project");
+    expect(confirmDialog()?.textContent).toContain("Delete Project?");
+    expect(confirmDialog()?.textContent).toContain("Protein study");
+    expect(deleteProject).not.toHaveBeenCalled();
+    await confirmInDialog("Delete Project");
     await vi.waitFor(() => expect(deleteProject).toHaveBeenCalledWith(
       "project-1",
       expect.objectContaining({ actionId: expect.any(String) }),
@@ -878,6 +895,10 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
     await click("Delete session");
+    expect(confirmDialog()?.textContent).toContain("Delete Session?");
+    expect(confirmDialog()?.textContent).toContain("Review evidence");
+    expect(deleteTask).not.toHaveBeenCalled();
+    await confirmInDialog("Delete Session");
     await vi.waitFor(() => expect(deleteTask).toHaveBeenCalledWith(
       "task-1",
       expect.objectContaining({ actionId: expect.any(String) }),
@@ -887,12 +908,16 @@ describe("Desktop v2 product renderer", () => {
       document.querySelector<HTMLButtonElement>('[aria-label="Delete results/report.md"]')?.click();
       await Promise.resolve();
     });
+    expect(confirmDialog()?.textContent).toContain("Delete file?");
+    expect(confirmDialog()?.textContent).toContain("results/report.md");
+    expect(deleteWorkspaceFile).not.toHaveBeenCalled();
+    await confirmInDialog("Delete file");
     await vi.waitFor(() => expect(deleteWorkspaceFile).toHaveBeenCalledWith(
       "project-1",
       "results/report.md",
       expect.objectContaining({ actionId: expect.any(String) }),
     ));
-    expect(globalThis.confirm).toHaveBeenCalledTimes(3);
+    expect(browserConfirm).not.toHaveBeenCalled();
   });
 
   it("uploads a selected folder while preserving its relative file paths", async () => {

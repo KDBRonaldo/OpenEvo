@@ -89,6 +89,11 @@ type WorkspaceUploadStateV2 = {
   readonly error: string | null;
 };
 
+type DeleteConfirmationV2 =
+  | { readonly kind: "project"; readonly project: ProjectV2 }
+  | { readonly kind: "session"; readonly task: TaskV2; readonly title: string }
+  | { readonly kind: "file"; readonly projectId: string; readonly path: string };
+
 const PROJECT_PANE_WIDTH_KEY = "openevo.desktop.layout.project-pane-width";
 const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
@@ -308,6 +313,7 @@ export function DesktopProductApp({
   const [newSessionDraftKey, setNewSessionDraftKey] = useState(0);
   const [startingSession, setStartingSession] = useState<StartingSessionV2 | null>(null);
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmationV2 | null>(null);
   const [workspaceUploads, setWorkspaceUploads] = useState<readonly WorkspaceUploadStateV2[]>([]);
   const [projectPaneWidth, setProjectPaneWidth] = usePersistedPaneWidth(
     PROJECT_PANE_WIDTH_KEY,
@@ -741,7 +747,10 @@ export function DesktopProductApp({
 
   const deleteProject = (project: ProjectV2): void => {
     if (!provider.deleteProject) return;
-    if (!globalThis.confirm(`Delete Project "${project.display_name}"? Its Sessions will also be removed from EvoLab.`)) return;
+    setDeleteConfirmation({ kind: "project", project });
+  };
+
+  const confirmDeleteProject = (project: ProjectV2): void => {
     void (async () => {
       const result = await act(
         () => provider.deleteProject!(project.project_id, intentFor(snapshot, "delete-project")),
@@ -757,7 +766,10 @@ export function DesktopProductApp({
 
   const deleteSession = (task: TaskV2, title: string): void => {
     if (!provider.deleteTask) return;
-    if (!globalThis.confirm(`Delete Session "${title}"? This removes it from the Project history view.`)) return;
+    setDeleteConfirmation({ kind: "session", task, title });
+  };
+
+  const confirmDeleteSession = (task: TaskV2, title: string): void => {
     void (async () => {
       const result = await act(
         () => provider.deleteTask!(task.task_id, intentFor(snapshot, "delete-session")),
@@ -769,11 +781,14 @@ export function DesktopProductApp({
 
   const deleteWorkspaceFile = (path: string): void => {
     if (displayedProject === null || !provider.deleteWorkspaceFile) return;
-    if (!globalThis.confirm(`Delete workspace file "${path}"? This cannot be undone.`)) return;
+    setDeleteConfirmation({ kind: "file", projectId: displayedProject.project_id, path });
+  };
+
+  const confirmDeleteWorkspaceFile = (projectId: string, path: string): void => {
     void (async () => {
       const result = await act(
         () => provider.deleteWorkspaceFile!(
-          displayedProject.project_id,
+          projectId,
           path,
           intentFor(snapshot, "delete-workspace-file"),
         ),
@@ -781,6 +796,19 @@ export function DesktopProductApp({
       );
       if (result !== null && selectedWorkspacePath === path) setSelectedWorkspacePath(null);
     })();
+  };
+
+  const confirmDeletion = (): void => {
+    if (deleteConfirmation === null || busy) return;
+    const confirmed = deleteConfirmation;
+    setDeleteConfirmation(null);
+    if (confirmed.kind === "project") {
+      confirmDeleteProject(confirmed.project);
+    } else if (confirmed.kind === "session") {
+      confirmDeleteSession(confirmed.task, confirmed.title);
+    } else {
+      confirmDeleteWorkspaceFile(confirmed.projectId, confirmed.path);
+    }
   };
 
   return (
@@ -1076,6 +1104,79 @@ export function DesktopProductApp({
           onError={(error) => setActionError(userMessageV2(error))}
         />
       ) : null}
+
+      {deleteConfirmation ? (
+        <DeleteConfirmationDialogV2
+          confirmation={deleteConfirmation}
+          busy={busy}
+          onCancel={() => setDeleteConfirmation(null)}
+          onConfirm={confirmDeletion}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function DeleteConfirmationDialogV2({
+  confirmation,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  readonly confirmation: DeleteConfirmationV2;
+  readonly busy: boolean;
+  readonly onCancel: () => void;
+  readonly onConfirm: () => void;
+}) {
+  const title = confirmation.kind === "project"
+    ? "Delete Project?"
+    : confirmation.kind === "session"
+      ? "Delete Session?"
+      : "Delete file?";
+  const resourceName = confirmation.kind === "project"
+    ? confirmation.project.display_name
+    : confirmation.kind === "session"
+      ? confirmation.title
+      : confirmation.path;
+  const detail = confirmation.kind === "project"
+    ? "The Project and its Sessions will be removed from EvoLab."
+    : confirmation.kind === "session"
+      ? "This Session will be removed from the Project history view."
+      : "This file will be permanently removed from the remote workspace.";
+  const confirmLabel = confirmation.kind === "project"
+    ? "Delete Project"
+    : confirmation.kind === "session"
+      ? "Delete Session"
+      : "Delete file";
+  const dialogRef = useDialogBoundary(() => {
+    if (!busy) onCancel();
+  });
+  return (
+    <div className="v2-modal-backdrop delete-confirm-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) onCancel();
+    }}>
+      <section
+        ref={dialogRef}
+        className="v2-modal delete-confirm-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="delete-confirm-title"
+        aria-describedby="delete-confirm-description"
+        tabIndex={-1}
+      >
+        <div className="delete-confirm-head">
+          <span className="delete-confirm-icon" aria-hidden="true"><Trash2 size={19} /></span>
+          <div><span className="panel-kicker">Confirm deletion</span><h2 id="delete-confirm-title">{title}</h2></div>
+        </div>
+        <div className="delete-confirm-content">
+          <strong title={resourceName}>{resourceName}</strong>
+          <p id="delete-confirm-description">{detail}</p>
+        </div>
+        <div className="delete-confirm-actions">
+          <button type="button" className="secondary-button" disabled={busy} onClick={onCancel}>Cancel</button>
+          <button type="button" className="danger-button" disabled={busy} onClick={onConfirm}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{confirmLabel}</button>
+        </div>
+      </section>
     </div>
   );
 }

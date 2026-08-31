@@ -2403,14 +2403,14 @@ pre.json {
   padding-right: 34px;
 }
 
-.explorer-file-delete {
+.explorer-tree-node > .explorer-file-delete {
   position: absolute;
   z-index: 2;
-  top: 3px;
-  right: 3px;
+  top: 0;
+  right: 1px;
   display: inline-flex;
-  width: 25px;
-  height: 25px;
+  width: 31px;
+  height: 31px;
   align-items: center;
   justify-content: center;
   border: 0;
@@ -2423,12 +2423,12 @@ pre.json {
 }
 
 .explorer-tree-node.file:hover > .explorer-file-delete,
-.explorer-file-delete:focus-visible {
+.explorer-tree-node > .explorer-file-delete:focus-visible {
   opacity: 1;
 }
 
-.explorer-file-delete:hover,
-.explorer-file-delete:focus-visible {
+.explorer-tree-node > .explorer-file-delete:hover,
+.explorer-tree-node > .explorer-file-delete:focus-visible {
   outline: 0;
   color: #8f3028;
   background: #fbe7e4;
@@ -4942,6 +4942,72 @@ pre.json {
   border-radius: 9px;
   background: var(--surface);
   box-shadow: 0 20px 60px rgb(20 28 23 / 22%);
+}
+
+.delete-confirm-backdrop {
+  z-index: 80;
+  background: rgb(20 27 23 / 42%);
+}
+
+.delete-confirm-dialog {
+  grid-template-rows: auto auto auto;
+  width: min(440px, calc(100vw - 40px));
+  max-height: none;
+  border-radius: 12px;
+}
+
+.delete-confirm-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 22px 14px;
+}
+
+.delete-confirm-head h2 {
+  margin: 3px 0 0;
+  font-size: 20px;
+}
+
+.delete-confirm-icon {
+  display: inline-flex;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.delete-confirm-content {
+  min-width: 0;
+  padding: 0 22px 20px;
+}
+
+.delete-confirm-content > strong {
+  display: block;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.delete-confirm-content > p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.delete-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 22px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-soft);
 }
 
 .v2-source-choice {

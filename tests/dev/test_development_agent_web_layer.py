@@ -7,6 +7,7 @@ import sys
 import json
 import re
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -920,6 +921,54 @@ def test_daemon_client_accepts_bounded_aggregate_state_larger_than_one_mib(
     result = DevelopmentDaemonClient("http://127.0.0.1:8765", "secret").request("/state")
 
     assert result["schema_version"] == "1"
+
+
+def test_daemon_client_forwards_delete_request_body(monkeypatch) -> None:
+    captured: list[urllib.request.Request] = []
+    response_payload = json.dumps({"schema_version": "2"}).encode()
+
+    class Response:
+        status = 200
+        headers = {"Content-Length": str(len(response_payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit: int) -> bytes:
+            assert limit > len(response_payload)
+            return response_payload
+
+        def close(self) -> None:
+            return None
+
+    def open_request(request: urllib.request.Request, timeout: int) -> Response:
+        assert timeout == 65
+        captured.append(request)
+        return Response()
+
+    monkeypatch.setattr(
+        "openevo.web_gateway.product_app.urllib.request.urlopen",
+        open_request,
+    )
+    body = b'{"schema_version":"2","action_id":"delete-action"}'
+
+    status, payload, _headers = DevelopmentDaemonClient(
+        "http://127.0.0.1:8765", "secret"
+    ).proxy_v2(
+        "development/tasks/task-delete",
+        query="",
+        method="DELETE",
+        body=body,
+        content_type="application/json",
+    )
+
+    assert status == 200
+    assert payload == response_payload
+    assert captured[0].method == "DELETE"
+    assert captured[0].data == body
 
 
 def test_module_imports_when_launcher_is_started_from_desktop() -> None:

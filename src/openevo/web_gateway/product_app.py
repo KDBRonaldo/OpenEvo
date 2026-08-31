@@ -232,7 +232,7 @@ class DevelopmentDaemonClient:
             headers["X-OpenEvo-Content-SHA256"] = content_sha256
         upstream = urllib.request.Request(
             url,
-            data=body if method in {"POST", "PUT", "PATCH"} else None,
+            data=body if method in {"POST", "PUT", "PATCH", "DELETE"} else None,
             headers=headers,
             method=method,
         )
