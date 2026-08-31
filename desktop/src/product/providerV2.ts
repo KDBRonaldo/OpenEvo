@@ -208,6 +208,96 @@ export interface WorkspaceFileDownloadV2 {
   readonly data: Blob;
 }
 
+export function withoutProjectV2(
+  snapshot: DesktopProductSnapshotV2,
+  projectId: string,
+): DesktopProductSnapshotV2 {
+  const projects = snapshot.projects.filter((project) => project.project_id !== projectId);
+  const tasks = snapshot.tasks.filter((task) => task.project_id !== projectId);
+  const artifacts = snapshot.artifacts.filter((artifact) => artifact.project_id !== projectId);
+  const retainedTaskIds = new Set(tasks.map((task) => task.task_id));
+  const retainedArtifactIds = new Set(artifacts.map((artifact) => artifact.artifact_id));
+  const activeProjectId = snapshot.state.active_project_id === projectId
+    ? projects.at(-1)?.project_id ?? null
+    : snapshot.state.active_project_id;
+  const runtimePresentation = snapshot.runtimePresentation === undefined
+    ? undefined
+    : {
+      ...snapshot.runtimePresentation,
+      evolutionRuns: snapshot.runtimePresentation.evolutionRuns?.filter(
+        (run) => run.projectId !== projectId,
+      ),
+      tasks: Object.fromEntries(Object.entries(snapshot.runtimePresentation.tasks).filter(
+        ([taskId]) => retainedTaskIds.has(taskId),
+      )),
+      artifacts: Object.fromEntries(Object.entries(snapshot.runtimePresentation.artifacts).filter(
+        ([artifactId]) => retainedArtifactIds.has(artifactId),
+      )),
+      workspaces: snapshot.runtimePresentation.workspaces === undefined
+        ? undefined
+        : Object.fromEntries(Object.entries(snapshot.runtimePresentation.workspaces).filter(
+          ([candidateProjectId]) => candidateProjectId !== projectId,
+        )),
+    };
+  return {
+    ...snapshot,
+    state: { ...snapshot.state, active_project_id: activeProjectId },
+    projects,
+    tasks,
+    artifacts,
+    capability: snapshot.capability?.project_id === projectId ? null : snapshot.capability,
+    validation: snapshot.validation?.project_id === projectId ? null : snapshot.validation,
+    runtimePresentation,
+  };
+}
+
+export function withoutTaskV2(
+  snapshot: DesktopProductSnapshotV2,
+  taskId: string,
+): DesktopProductSnapshotV2 {
+  const taskPresentations = snapshot.runtimePresentation?.tasks;
+  return {
+    ...snapshot,
+    tasks: snapshot.tasks.filter((task) => task.task_id !== taskId),
+    timelines: Object.fromEntries(Object.entries(snapshot.timelines).filter(
+      ([candidateTaskId]) => candidateTaskId !== taskId,
+    )),
+    runtimePresentation: snapshot.runtimePresentation === undefined
+      ? undefined
+      : {
+        ...snapshot.runtimePresentation,
+        tasks: taskPresentations === undefined
+          ? {}
+          : Object.fromEntries(Object.entries(taskPresentations).filter(
+            ([candidateTaskId]) => candidateTaskId !== taskId,
+          )),
+      },
+  };
+}
+
+export function withoutWorkspaceFileV2(
+  snapshot: DesktopProductSnapshotV2,
+  projectId: string,
+  path: string,
+): DesktopProductSnapshotV2 {
+  const workspaces = snapshot.runtimePresentation?.workspaces;
+  const workspace = workspaces?.[projectId];
+  if (workspace === undefined || workspaces === undefined) return snapshot;
+  return {
+    ...snapshot,
+    runtimePresentation: {
+      ...snapshot.runtimePresentation!,
+      workspaces: {
+        ...workspaces,
+        [projectId]: {
+          ...workspace,
+          entries: workspace.entries.filter((entry) => entry.path !== path),
+        },
+      },
+    },
+  };
+}
+
 export interface DesktopProductProviderV2 {
   readonly apiVersion: 2;
   readonly providerKind: "desktop_sidecar";

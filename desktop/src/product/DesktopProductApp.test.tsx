@@ -873,6 +873,36 @@ describe("Desktop v2 product renderer", () => {
     };
 
     await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Delete results/report.md"]')?.click();
+      await Promise.resolve();
+    });
+    expect(confirmDialog()?.textContent).toContain("Delete file?");
+    expect(confirmDialog()?.textContent).toContain("results/report.md");
+    expect(deleteWorkspaceFile).not.toHaveBeenCalled();
+    await confirmInDialog("Delete file");
+    await vi.waitFor(() => expect(deleteWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      "results/report.md",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    ));
+    expect(document.querySelector('[aria-label="Delete results/report.md"]')).toBeNull();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="More actions for Review evidence"]')?.click();
+      await Promise.resolve();
+    });
+    await click("Delete session");
+    expect(confirmDialog()?.textContent).toContain("Delete Session?");
+    expect(confirmDialog()?.textContent).toContain("Review evidence");
+    expect(deleteTask).not.toHaveBeenCalled();
+    await confirmInDialog("Delete Session");
+    await vi.waitFor(() => expect(deleteTask).toHaveBeenCalledWith(
+      "task-1",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    ));
+    expect(document.querySelector('[aria-label="More actions for Review evidence"]')).toBeNull();
+
+    await act(async () => {
       document.querySelector<HTMLButtonElement>("#v2-project-switcher")?.click();
       await Promise.resolve();
     });
@@ -889,34 +919,7 @@ describe("Desktop v2 product renderer", () => {
       "project-1",
       expect.objectContaining({ actionId: expect.any(String) }),
     ));
-
-    await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="More actions for Review evidence"]')?.click();
-      await Promise.resolve();
-    });
-    await click("Delete session");
-    expect(confirmDialog()?.textContent).toContain("Delete Session?");
-    expect(confirmDialog()?.textContent).toContain("Review evidence");
-    expect(deleteTask).not.toHaveBeenCalled();
-    await confirmInDialog("Delete Session");
-    await vi.waitFor(() => expect(deleteTask).toHaveBeenCalledWith(
-      "task-1",
-      expect.objectContaining({ actionId: expect.any(String) }),
-    ));
-
-    await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Delete results/report.md"]')?.click();
-      await Promise.resolve();
-    });
-    expect(confirmDialog()?.textContent).toContain("Delete file?");
-    expect(confirmDialog()?.textContent).toContain("results/report.md");
-    expect(deleteWorkspaceFile).not.toHaveBeenCalled();
-    await confirmInDialog("Delete file");
-    await vi.waitFor(() => expect(deleteWorkspaceFile).toHaveBeenCalledWith(
-      "project-1",
-      "results/report.md",
-      expect.objectContaining({ actionId: expect.any(String) }),
-    ));
+    expect(document.body.textContent).toContain("No project yet");
     expect(browserConfirm).not.toHaveBeenCalled();
   });
 

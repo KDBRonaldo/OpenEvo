@@ -9,6 +9,9 @@ import {
 } from "../api/v2/schemas";
 import {
   unavailableDesktopProductProviderV2,
+  withoutProjectV2,
+  withoutTaskV2,
+  withoutWorkspaceFileV2,
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
   type ProductSubscriptionSignalV2,
@@ -513,13 +516,14 @@ function createRemoteBackedDesktopProductProvider(
     deleteProject: async (projectId, intent) => {
       await ensureDevelopmentState();
       await options.developmentBackend.deleteProject(projectId, intent.actionId);
-      await ensureDevelopmentState(true);
+      snapshot = withoutProjectV2(snapshot, projectId);
       notifySubscribers();
     },
     deleteTask: async (taskId, intent) => {
       await ensureDevelopmentState();
       await options.developmentBackend.deleteSession(taskId, intent.actionId);
-      await ensureDevelopmentState(true);
+      snapshot = withoutTaskV2(snapshot, taskId);
+      taskLogs.delete(taskId);
       notifySubscribers();
     },
     uploadWorkspaceFile: async (projectId, upload) => {
@@ -541,7 +545,7 @@ function createRemoteBackedDesktopProductProvider(
     deleteWorkspaceFile: async (projectId, path) => {
       await ensureDevelopmentState();
       await options.developmentBackend.deleteWorkspaceFile(projectId, path);
-      await ensureDevelopmentState(true);
+      snapshot = withoutWorkspaceFileV2(snapshot, projectId, path);
       notifySubscribers();
     },
     loadTaskLogs: async (taskId) => {

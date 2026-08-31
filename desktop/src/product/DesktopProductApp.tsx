@@ -61,6 +61,9 @@ import {
 } from "./LifecycleOperationPanelV2";
 import {
   unavailableDesktopProductProviderV2,
+  withoutProjectV2,
+  withoutTaskV2,
+  withoutWorkspaceFileV2,
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
   type ProductMutationIntentV2,
@@ -752,15 +755,28 @@ export function DesktopProductApp({
 
   const confirmDeleteProject = (project: ProjectV2): void => {
     void (async () => {
-      const result = await act(
-        () => provider.deleteProject!(project.project_id, intentFor(snapshot, "delete-project")),
-        `${project.display_name} deleted.`,
-      );
-      if (result?.snapshot === null || result === null) return;
-      setSelectedWorkspacePath(null);
-      setWorkspace("research");
-      const nextProjectId = result.snapshot.state.active_project_id;
-      setSelectedTaskId(nextProjectId === null ? null : activeTaskIdV2(nextProjectId, result.snapshot.tasks));
+      setBusy(true);
+      setActionError(null);
+      setActionStatus(null);
+      try {
+        await provider.deleteProject!(project.project_id, intentFor(snapshot, "delete-project"));
+        const current = snapshotRef.current;
+        if (current !== null) {
+          const next = withoutProjectV2(current, project.project_id);
+          snapshotRef.current = next;
+          setSnapshot(next);
+          setSelectedWorkspacePath(null);
+          setWorkspace("research");
+          const nextProjectId = next.state.active_project_id;
+          setSelectedTaskId(nextProjectId === null ? null : activeTaskIdV2(nextProjectId, next.tasks));
+        }
+        setActionStatus(`${project.display_name} deleted.`);
+      } catch (error) {
+        setActionError(userMessageV2(error));
+        void refresh();
+      } finally {
+        setBusy(false);
+      }
     })();
   };
 
@@ -771,11 +787,25 @@ export function DesktopProductApp({
 
   const confirmDeleteSession = (task: TaskV2, title: string): void => {
     void (async () => {
-      const result = await act(
-        () => provider.deleteTask!(task.task_id, intentFor(snapshot, "delete-session")),
-        `${title} deleted.`,
-      );
-      if (result !== null && selectedTaskId === task.task_id) setSelectedTaskId(null);
+      setBusy(true);
+      setActionError(null);
+      setActionStatus(null);
+      try {
+        await provider.deleteTask!(task.task_id, intentFor(snapshot, "delete-session"));
+        const current = snapshotRef.current;
+        if (current !== null) {
+          const next = withoutTaskV2(current, task.task_id);
+          snapshotRef.current = next;
+          setSnapshot(next);
+        }
+        if (selectedTaskId === task.task_id) setSelectedTaskId(null);
+        setActionStatus(`${title} deleted.`);
+      } catch (error) {
+        setActionError(userMessageV2(error));
+        void refresh();
+      } finally {
+        setBusy(false);
+      }
     })();
   };
 
@@ -786,15 +816,29 @@ export function DesktopProductApp({
 
   const confirmDeleteWorkspaceFile = (projectId: string, path: string): void => {
     void (async () => {
-      const result = await act(
-        () => provider.deleteWorkspaceFile!(
+      setBusy(true);
+      setActionError(null);
+      setActionStatus(null);
+      try {
+        await provider.deleteWorkspaceFile!(
           projectId,
           path,
           intentFor(snapshot, "delete-workspace-file"),
-        ),
-        `${path} deleted from the remote workspace.`,
-      );
-      if (result !== null && selectedWorkspacePath === path) setSelectedWorkspacePath(null);
+        );
+        const current = snapshotRef.current;
+        if (current !== null) {
+          const next = withoutWorkspaceFileV2(current, projectId, path);
+          snapshotRef.current = next;
+          setSnapshot(next);
+        }
+        if (selectedWorkspacePath === path) setSelectedWorkspacePath(null);
+        setActionStatus(`${path} deleted from the remote workspace.`);
+      } catch (error) {
+        setActionError(userMessageV2(error));
+        void refresh();
+      } finally {
+        setBusy(false);
+      }
     })();
   };
 

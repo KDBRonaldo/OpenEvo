@@ -560,6 +560,9 @@ describe("development agent provider", () => {
     expect(uploadHeaders.get("X-OpenEvo-Desktop-Session")).toBe("session-secret");
     const downloaded = await provider.downloadWorkspaceFile?.(projectId, "download.txt");
     expect(await downloaded?.data.text()).toBe("verified download\n");
+    const stateReadsBeforeDelete = fetchImpl.mock.calls.filter(
+      ([input]) => String(input).endsWith("/state"),
+    ).length;
     await provider.deleteWorkspaceFile?.(
       projectId,
       "existing.txt",
@@ -569,6 +572,9 @@ describe("development agent provider", () => {
       `/desktop/v2/development/projects/${projectId}/workspace/files?path=existing.txt`,
       expect.objectContaining({ method: "DELETE" }),
     );
+    expect(fetchImpl.mock.calls.filter(
+      ([input]) => String(input).endsWith("/state"),
+    )).toHaveLength(stateReadsBeforeDelete);
   });
 
   it("deletes Projects and Sessions through the authenticated presentation v2 bridge", async () => {
@@ -651,6 +657,12 @@ describe("development agent provider", () => {
       `/desktop/v2/development/projects/${projectId}`,
       expect.objectContaining({ method: "DELETE" }),
     );
+    expect(fetchImpl.mock.calls.filter(
+      ([input]) => String(input).endsWith("/presentation-state"),
+    )).toHaveLength(1);
+    expect(fetchImpl.mock.calls.filter(
+      ([input]) => String(input).endsWith("/capabilities"),
+    )).toHaveLength(1);
   });
 
   it("loads rich artifact presentation through the authenticated daemon v2 bridge", async () => {
