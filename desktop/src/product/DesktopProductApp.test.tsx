@@ -2014,7 +2014,7 @@ describe("Desktop v2 product renderer", () => {
     expect(createProject).toBeTruthy();
     await act(async () => createProject!.click());
 
-    expect(dialog()?.textContent).toContain("Create science project");
+    expect(dialog()?.textContent).toContain("Create a project");
     expect(input("Project name").value).toBe("New research project");
     expect(dialog()?.textContent).not.toContain("Task title");
     expect(dialog()?.textContent).not.toContain("Task objective");
@@ -2026,12 +2026,12 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     await click("Edit project");
-    expect(dialog()?.textContent).toContain("Edit science project");
+    expect(dialog()?.textContent).toContain("Edit project");
     expect(dialog()?.textContent).not.toContain("Task title");
     expect(dialog()?.textContent).not.toContain("Task objective");
 
     setInput("Project name", "Renamed protein study");
-    await click("Save project");
+    await click("Save changes");
     expect(provider.updateProject).toHaveBeenCalledWith(
       "project-1",
       "Renamed protein study",
@@ -2669,7 +2669,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Diagnostic status: running");
   });
 
-  it("creates a project with the release-owned Self-Deployed execution profile", async () => {
+  it("only offers the supported Codex Subscription execution profile", async () => {
     const connected = systemProfile({
       connection_state: "connected",
       core_api_major: 2,
@@ -2687,7 +2687,7 @@ describe("Desktop v2 product renderer", () => {
     });
     const createProject = vi.fn(async () => ({
       schema_version: "2" as const,
-      operation_id: "project-create-self-deployed-1",
+      operation_id: "project-create-subscription-1",
       kind: "project_create" as const,
       resource: {
         resource_kind: "project" as const,
@@ -2718,8 +2718,8 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     await click("New project");
-    await click("Self-Deployed");
-    expect(document.body.textContent).toContain("Qwen3 0.6B");
+    expect(document.body.textContent).not.toContain("Self-Deployed");
+    expect(document.body.textContent).toContain("Codex Subscription");
     await click("Create project");
 
     expect(createProject).toHaveBeenCalledWith(
@@ -2730,12 +2730,13 @@ describe("Desktop v2 product renderer", () => {
             objective: "Task details are provided when the Session starts.",
           },
           execution: {
-            mode: "self-deployed",
+            mode: "codex_subscription_transcript",
             capture_mode: "transcript",
             token_level_metrics_available: false,
             harness_id: "codex",
-            model_profile_id: "qwen3-0.6b-v1",
-            token_limit: 8_192,
+            codex_model: "gpt-5.3-codex-spark",
+            reasoning_effort: "high",
+            token_limit: 32_000,
             task_network_allow_internet: true,
           },
         }),
@@ -2910,7 +2911,7 @@ describe("Desktop v2 product renderer", () => {
     root = await render(provider);
 
     await click("New project");
-    await click("Choose folder snapshot");
+    await click("Import a folder");
     expect(selectNativeWorkspace).toHaveBeenCalledTimes(1);
     await click("Cancel");
 

@@ -1554,7 +1554,6 @@ function NewProjectDialogV2({
   const [displayName, setDisplayName] = useState(project?.display_name ?? "New research project");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">(project?.config.workspace.kind ?? "scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState(project?.config.workspace.display_name ?? "Research workspace");
-  const [executionMode, setExecutionMode] = useState<ScienceProjectConfigV2["execution"]["mode"]>(project?.config.execution.mode ?? "codex_subscription_transcript");
   const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
   const [browserFolderUploads, setBrowserFolderUploads] = useState<readonly BrowserWorkspaceUploadV2[]>([]);
   const [folderImportProgress, setFolderImportProgress] = useState<number | null>(null);
@@ -1570,6 +1569,7 @@ function NewProjectDialogV2({
   const baseDraftValid = displayName.trim() !== "";
   const valid = baseDraftValid
     && (workspaceKind === "scratch" || sourceActionId !== null || browserFolderUploads.length > 0 || project !== null);
+  const supportedExecution = project?.config.execution.mode !== "self-deployed";
 
   useEffect(() => {
     folderInputRef.current?.setAttribute("webkitdirectory", "");
@@ -1601,7 +1601,7 @@ function NewProjectDialogV2({
         projectTask.objective,
         "native_folder_snapshot",
         workspaceDisplayName,
-        executionMode,
+        project?.config.execution,
       );
       const source = await provider.selectNativeWorkspace({
         kind: "native_folder_snapshot",
@@ -1643,7 +1643,7 @@ function NewProjectDialogV2({
       projectTask.objective,
       workspaceKind,
       workspaceDisplayName,
-      executionMode,
+      project?.config.execution,
     );
     onBusy(true);
     let browserCreatedProjectId: string | null = null;
@@ -1734,35 +1734,55 @@ function NewProjectDialogV2({
   };
 
   return (
-    <div className="v2-modal-backdrop" role="presentation">
-      <section ref={dialogRef} className="v2-modal" role="dialog" aria-modal="true" aria-labelledby="new-project-title" tabIndex={-1}>
-        <div className="drawer-head"><div><span className="panel-kicker">Remote project</span><h2 id="new-project-title">{project ? "Edit science project" : "Create science project"}</h2></div><button type="button" className="icon-button" aria-label="Close project setup" onClick={() => void close()}><X size={18} /></button></div>
-        <div className="drawer-content">
-          <section className="form-section">
-            <label>Project name<input maxLength={256} value={displayName} disabled={sourceActionId !== null} onChange={(event) => setDisplayName(event.target.value)} /></label>
+    <div className="v2-modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !busy) void close();
+    }}>
+      <section ref={dialogRef} className="v2-modal project-setup-modal" role="dialog" aria-modal="true" aria-labelledby="new-project-title" tabIndex={-1}>
+        <div className="project-setup-head">
+          <div>
+            <span className="project-setup-kicker">{project ? "Project settings" : "New project"}</span>
+            <h2 id="new-project-title">{project ? "Edit project" : "Create a project"}</h2>
+            <p>{project ? "Update how this project appears in EvoLab." : "Name your project and choose its starting workspace."}</p>
+          </div>
+          <button type="button" className="icon-button" aria-label="Close project setup" onClick={() => void close()}><X size={17} /></button>
+        </div>
+        <div className="project-setup-content">
+          <section className="project-setup-section project-name-section">
+            <label htmlFor="project-name-input"><span>Project name</span><small>Shown in the project switcher and Session workspace.</small><input id="project-name-input" autoFocus maxLength={256} value={displayName} disabled={sourceActionId !== null} onChange={(event) => setDisplayName(event.target.value)} /></label>
           </section>
-          <section className="form-section">
-            <h3>Workspace snapshot</h3>
+          <section className="project-setup-section">
+            <div className="project-setup-section-heading"><div><h3>Starting workspace</h3><p>Choose an empty workspace or import a folder snapshot.</p></div></div>
             {browserFolderAvailable ? <input ref={folderInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose project folder snapshot" onChange={(event) => {
               const selectedFiles = Array.from(event.currentTarget.files ?? []);
               event.currentTarget.value = "";
               if (selectedFiles.length > 0) selectBrowserFolder(selectedFiles);
             }} /> : null}
-            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null || project !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setBrowserFolderUploads([]); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null || project !== null} onClick={() => { if (browserFolderAvailable) folderInputRef.current?.click(); else void chooseFolder(); }}><FolderOpen size={15} /> Choose folder snapshot</button></div>
-            <p className="form-help">{project ? `${project.config.workspace.display_name} · the immutable workspace source cannot be replaced from project settings.` : workspaceKind === "native_folder_snapshot" ? browserFolderUploads.length > 0 ? `${selectedSourceDisplayName} · ${browserFolderUploads.length} file${browserFolderUploads.length === 1 ? "" : "s"} · ${formatBytes(browserFolderBytes)}` : selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
+            {project ? (
+              <div className="project-workspace-locked">
+                <span><FolderOpen size={17} /></span>
+                <div><strong>{project.config.workspace.display_name}</strong><small>The workspace source is fixed after project creation.</small></div>
+                <span className="project-workspace-lock-label">Locked</span>
+              </div>
+            ) : (
+              <div className="project-workspace-options" role="radiogroup" aria-label="Starting workspace">
+                <button type="button" role="radio" aria-checked={workspaceKind === "scratch"} className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setBrowserFolderUploads([]); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>
+                  <span className="project-workspace-option-icon"><Plus size={17} /></span>
+                  <span className="project-workspace-option-copy"><strong>Start empty</strong><small>Create a clean workspace for a new line of work.</small></span>
+                  <CheckCircle2 className="project-workspace-option-check" size={17} />
+                </button>
+                <button type="button" role="radio" aria-checked={workspaceKind === "native_folder_snapshot"} className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null} onClick={() => { if (browserFolderAvailable) folderInputRef.current?.click(); else void chooseFolder(); }}>
+                  <span className="project-workspace-option-icon"><FolderOpen size={17} /></span>
+                  <span className="project-workspace-option-copy"><strong>Import a folder</strong><small>Copy a local folder into the remote workspace.</small></span>
+                  <CheckCircle2 className="project-workspace-option-check" size={17} />
+                </button>
+              </div>
+            )}
+            {!project && workspaceKind === "native_folder_snapshot" ? <div className="project-workspace-selection" role="status"><FolderOpen size={14} /><span>{browserFolderUploads.length > 0 ? <><strong>{selectedSourceDisplayName}</strong> · {browserFolderUploads.length} file{browserFolderUploads.length === 1 ? "" : "s"} · {formatBytes(browserFolderBytes)}</> : selectedSourceDisplayName ?? "Preparing selected workspace…"}</span></div> : null}
             {folderImportProgress !== null ? <div className="folder-snapshot-progress" role="progressbar" aria-label="Uploading folder snapshot" aria-valuemin={0} aria-valuemax={100} aria-valuenow={folderImportProgress}><span style={{ width: `${folderImportProgress}%` }} /><small>{folderImportProgress}% uploaded</small></div> : null}
           </section>
-          <section className="form-section">
-            <h3>Execution</h3>
-            <div className="v2-source-choice">
-              <button type="button" className={executionMode === "codex_subscription_transcript" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => setExecutionMode("codex_subscription_transcript")}>Codex Subscription</button>
-              <button type="button" className={executionMode === "self-deployed" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => setExecutionMode("self-deployed")}>Self-Deployed</button>
-            </div>
-            <div className="agent-note"><ShieldCheck size={17} /><span>{executionMode === "self-deployed" ? "Codex → Core Gateway → managed vLLM · Qwen3 0.6B · exact release profile" : "Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort"}</span></div>
-            {executionMode === "self-deployed" ? <p className="form-help">Requires a supported NVIDIA GPU, NVIDIA Container Toolkit, Docker Engine, and at least 30 GiB free storage. EvoLab prepares the pinned image and exact model snapshot on first run.</p> : null}
-          </section>
+          <div className="project-execution-summary"><span><ShieldCheck size={16} /></span><div><small>Execution</small><strong>{supportedExecution ? "Codex Subscription" : "Existing project profile"}</strong></div><p>{supportedExecution ? "Transcript capture · high effort" : "Preserved until a supported migration is available"}</p></div>
         </div>
-        <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : project ? <Settings size={15} /> : <Plus size={15} />} {project ? "Save project" : "Create project"}</button></div>
+        <div className="project-setup-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : project ? <Settings size={15} /> : <Plus size={15} />} {project ? "Save changes" : "Create project"}</button></div>
       </section>
     </div>
   );
@@ -3795,19 +3815,9 @@ function scienceProjectConfig(
   objective: string,
   workspaceKind: "scratch" | "native_folder_snapshot",
   workspaceDisplayName: string,
-  executionMode: ScienceProjectConfigV2["execution"]["mode"],
+  existingExecution?: ScienceProjectConfigV2["execution"],
 ): ScienceProjectConfigV2 {
-  const execution: ScienceProjectConfigV2["execution"] = executionMode === "self-deployed"
-    ? {
-      mode: "self-deployed",
-      capture_mode: "transcript",
-      token_level_metrics_available: false,
-      harness_id: "codex",
-      model_profile_id: "qwen3-0.6b-v1",
-      token_limit: 8_192,
-      task_network_allow_internet: true,
-    }
-    : {
+  const execution: ScienceProjectConfigV2["execution"] = existingExecution ?? {
       mode: "codex_subscription_transcript",
       capture_mode: "transcript",
       token_level_metrics_available: false,
