@@ -840,6 +840,12 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector('[data-testid="project-file-workspace"]')).toBeTruthy();
     expect(document.body.textContent).toContain("A project workspace file.");
 
+    await click("New Session");
+    expect(document.querySelector('[data-testid="project-file-workspace"]')).toBeNull();
+    expect(document.querySelector('[data-testid="session-composer"]')).toBeTruthy();
+    expect(input("Task title").value).toBe("");
+    expect(textarea("Task instructions").value).toBe("");
+
     await click("Review evidence");
     expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
     expect(document.querySelector('[aria-label="Session inspector"]')).toBeTruthy();

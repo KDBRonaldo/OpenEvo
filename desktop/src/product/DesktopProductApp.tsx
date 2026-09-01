@@ -953,6 +953,11 @@ export function DesktopProductApp({
               entry={selectedWorkspaceEntry}
               fileTransferAvailable={provider.downloadWorkspaceFile !== undefined}
               busy={busy || switchingProjectId !== null}
+              onBack={() => {
+                setSelectedWorkspacePath(null);
+                setSelectedTaskId(null);
+                setNewSessionDraftKey((current) => current + 1);
+              }}
               onDownload={() => downloadWorkspaceFile(selectedWorkspaceEntry.path)}
             />
           ) : workspace === "research" ? (
@@ -2404,16 +2409,23 @@ function ProjectFileWorkspaceV2({
   entry,
   fileTransferAvailable,
   busy,
+  onBack,
   onDownload,
 }: {
   readonly project: ProjectV2;
   readonly entry: ProjectWorkspacePresentationV2["entries"][number];
   readonly fileTransferAvailable: boolean;
   readonly busy: boolean;
+  readonly onBack: () => void;
   readonly onDownload: () => void;
 }) {
   return (
     <div className="workspace-stack project-file-workspace" data-testid="project-file-workspace">
+      <div className="session-detail-navigation">
+        <button type="button" className="session-back-button" onClick={onBack}>
+          <ArrowLeft size={14} /> New Session
+        </button>
+      </div>
       <div className="workspace-heading"><div><p className="eyebrow">{project.display_name} / File</p><h1>{entry.path}</h1><p>{entry.mediaType ?? "unknown format"} · {formatBytes(entry.byteSize)}</p></div>{fileTransferAvailable ? <button type="button" className="secondary-button" disabled={busy} onClick={onDownload}><Download size={15} /> Download</button> : null}</div>
       <section className="product-panel project-file-editor"><header><FileText size={16} /><strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header>{entry.content !== null ? <pre>{entry.content}</pre> : <div className="quiet-empty"><FileText size={24} /><p>This file is available to the remote Agent, but its format or size is outside the bounded browser preview.</p></div>}</section>
     </div>
