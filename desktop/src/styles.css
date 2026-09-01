@@ -6012,6 +6012,100 @@ pre.json {
   cursor: not-allowed;
 }
 
+.session-image-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.next-task-fields > .session-image-attachments {
+  padding: 0 18px 12px;
+}
+
+.session-chat-composer > .session-image-attachments,
+.session-chat-composer > .form-error {
+  width: min(820px, 100%);
+  margin: 0 auto 9px;
+}
+
+.session-image-attachment {
+  position: relative;
+  display: grid;
+  grid-template-columns: 58px minmax(72px, 1fr);
+  width: 178px;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #cfdbd5;
+  border-radius: 11px;
+  background: #f7faf8;
+}
+
+.session-image-attachment img,
+.session-image-placeholder {
+  width: 58px;
+  height: 58px;
+  object-fit: cover;
+  background: #e7efeb;
+}
+
+.session-image-placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--accent-strong);
+}
+
+.session-image-attachment figcaption {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 7px 26px 7px 9px;
+}
+
+.session-image-attachment figcaption strong,
+.session-image-attachment figcaption small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-image-attachment figcaption strong {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.session-image-attachment figcaption small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.session-image-attachment > button,
+.session-chat-composer .session-image-attachment > button {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgb(32 49 43 / 72%);
+  color: #fff;
+  box-shadow: none;
+  cursor: pointer;
+}
+
+.session-image-attachment > button:disabled,
+.session-chat-composer .session-image-attachment > button:disabled {
+  background: rgb(103 116 110 / 55%);
+  color: #fff;
+  cursor: not-allowed;
+}
+
 .session-inspector-preview-mode {
   min-height: 100%;
 }

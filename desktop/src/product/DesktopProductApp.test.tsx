@@ -1508,6 +1508,52 @@ describe("Desktop v2 product renderer", () => {
     ).toBeTruthy();
   });
 
+  it("uploads an image pasted into the Session composer and references it in the task", async () => {
+    const snapshot = authoritySnapshot();
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      _upload: WorkspaceFileUploadV2,
+    ) => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    setInput("Task title", "Inspect pasted screenshot");
+    setTextarea("Task instructions", "Explain what is visible in this screenshot.");
+    const screenshot = new File(["png-image"], "screenshot.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { files: [screenshot] } });
+    await act(async () => {
+      textarea("Task instructions").dispatchEvent(paste);
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[aria-label="Pasted images"]')).toBeTruthy();
+    expect(document.body.textContent).toContain("Image 1");
+    await click("Start session");
+
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
+    const upload = uploadWorkspaceFile.mock.calls[0]![1];
+    expect(upload).toMatchObject({
+      data: screenshot,
+      mediaType: "image/png",
+      overwrite: true,
+    });
+    expect(upload.path).toMatch(/^session-attachments\/pasted-image-[a-z0-9-]+\.png$/);
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      expect.objectContaining({
+        task: expect.objectContaining({
+          objective: expect.stringContaining(upload.path),
+        }),
+      }),
+      expect.anything(),
+    );
+  });
+
   it("starts a session with the historical Project Head selected by the user", async () => {
     const original = authoritySnapshot();
     const historicalHead = {
@@ -1792,6 +1838,51 @@ describe("Desktop v2 product renderer", () => {
     );
     expect(provider.validateProject).toHaveBeenCalled();
     expect(provider.submitTask).toHaveBeenCalled();
+  });
+
+  it("accepts a pasted screenshot in the Session conversation composer", async () => {
+    const snapshot = authoritySnapshot();
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      _upload: WorkspaceFileUploadV2,
+    ) => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+    await click("Review evidence");
+
+    const composer = document.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="Message for the next Session"]',
+    )!;
+    const screenshot = new File(["clipboard-png"], "image.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { files: [screenshot] } });
+    await act(async () => {
+      composer.dispatchEvent(paste);
+      await Promise.resolve();
+    });
+    setAriaTextarea("Message for the next Session", "Inspect this screenshot for errors.");
+
+    expect(document.querySelector('[aria-label="Pasted images"]')).toBeTruthy();
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Start next Session"]')?.disabled).toBe(false);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Start next Session"]')!.click();
+      await Promise.resolve();
+    });
+
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
+    const upload = uploadWorkspaceFile.mock.calls[0]![1];
+    expect(upload.path).toMatch(/^session-attachments\/pasted-image-[a-z0-9-]+\.png$/);
+    await vi.waitFor(() => expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      expect.objectContaining({
+        task: expect.objectContaining({ objective: expect.stringContaining(upload.path) }),
+      }),
+      expect.anything(),
+    ));
   });
 
   it("separates Evolution history from run details and opens the latest run by default", async () => {

@@ -16,6 +16,7 @@ import {
   FileText,
   FolderUp,
   History,
+  Image as ImageIcon,
   LoaderCircle,
   Play,
   Plus,
@@ -37,6 +38,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -83,6 +85,13 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
+type SessionImageAttachmentV2 = {
+  readonly id: string;
+  readonly file: File;
+  readonly path: string;
+  readonly previewUrl: string | null;
+};
+
 type BrowserFolderSelectionV2 = {
   readonly displayName: string;
   readonly uploads: readonly BrowserWorkspaceUploadV2[];
@@ -111,6 +120,14 @@ const BROWSER_FOLDER_SNAPSHOT_FEATURE = "browser_folder_snapshot";
 const BROWSER_FOLDER_MAX_FILES = 1_000;
 const BROWSER_FOLDER_MAX_FILE_BYTES = 32 * 1024 * 1024;
 const BROWSER_FOLDER_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const SESSION_IMAGE_MAX_COUNT = 8;
+const SESSION_IMAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const SESSION_IMAGE_MEDIA_EXTENSIONS: Readonly<Record<string, string>> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
 const PROJECT_TASK_PLACEHOLDER = {
   title: "Untitled Session",
   objective: "Task details are provided when the Session starts.",
@@ -533,6 +550,7 @@ export function DesktopProductApp({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
     selectedProjectHead: ProjectHeadRefV2,
+    imageAttachments: readonly SessionImageAttachmentV2[] = [],
   ): Promise<boolean> => {
     if (project.state !== "ready") return false;
     setWorkspace("research");
@@ -559,6 +577,33 @@ export function DesktopProductApp({
       }
       let currentSnapshot = startingSnapshot;
       let currentProject = startingProject;
+      if (imageAttachments.length > 0) {
+        if (!provider.uploadWorkspaceFile) {
+          throw new Error("This backend does not support pasted image uploads.");
+        }
+        for (const attachment of imageAttachments) {
+          await provider.uploadWorkspaceFile(
+            currentProject.project_id,
+            {
+              path: attachment.path,
+              data: attachment.file,
+              mediaType: attachment.file.type,
+              overwrite: true,
+            },
+            intentFor(currentSnapshot, "upload-session-image"),
+          );
+          const refreshed = await refresh();
+          if (refreshed === null) {
+            throw new Error("The pasted image was uploaded, but the current project state could not be reloaded.");
+          }
+          const refreshedProject = refreshed.projects.find((candidate) => candidate.project_id === project.project_id);
+          if (!refreshedProject || refreshedProject.state !== "ready") {
+            throw new Error("The project is not ready after uploading the pasted image.");
+          }
+          currentSnapshot = refreshed;
+          currentProject = refreshedProject;
+        }
+      }
       const nextConfig = sessionEvolutionAvailable
         ? withSessionDocumentEvolution(currentProject.config, task, selectedEvolutionTargets)
         : { ...currentProject.config, task };
@@ -975,14 +1020,15 @@ export function DesktopProductApp({
               busy={busy || switchingProjectId !== null}
               sessionStartBlocked={developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
+              sessionImageUploadAvailable={provider.uploadWorkspaceFile !== undefined}
               onSelectTask={(taskId) => {
                 setSelectedTaskId(taskId);
                 if (taskId === null) setNewSessionDraftKey((current) => current + 1);
               }}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
-              onRun={(task, selectedEvolutionTargets, projectHead) => (
-                runProject(displayedProject, task, selectedEvolutionTargets, projectHead)
+              onRun={(task, selectedEvolutionTargets, projectHead, imageAttachments) => (
+                runProject(displayedProject, task, selectedEvolutionTargets, projectHead, imageAttachments)
               )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
@@ -2432,6 +2478,40 @@ function ProjectFileWorkspaceV2({
   );
 }
 
+function SessionImageAttachmentsV2({
+  attachments,
+  disabled,
+  onRemove,
+}: {
+  readonly attachments: readonly SessionImageAttachmentV2[];
+  readonly disabled: boolean;
+  readonly onRemove: (id: string) => void;
+}) {
+  return (
+    <div className="session-image-attachments" aria-label="Pasted images">
+      {attachments.map((attachment, index) => (
+        <figure key={attachment.id} className="session-image-attachment">
+          {attachment.previewUrl
+            ? <img src={attachment.previewUrl} alt={`Pasted image ${index + 1}`} />
+            : <span className="session-image-placeholder"><ImageIcon size={22} /></span>}
+          <figcaption>
+            <strong>Image {index + 1}</strong>
+            <small>{formatBytes(attachment.file.size)}</small>
+          </figcaption>
+          <button
+            type="button"
+            aria-label={`Remove pasted image ${index + 1}`}
+            disabled={disabled}
+            onClick={() => onRemove(attachment.id)}
+          >
+            <X size={13} />
+          </button>
+        </figure>
+      ))}
+    </div>
+  );
+}
+
 function StartingSessionChatV2({
   project,
   session,
@@ -2482,6 +2562,7 @@ function ResearchWorkspaceV2({
   busy,
   sessionStartBlocked,
   sessionEvolutionAvailable,
+  sessionImageUploadAvailable,
   onSelectTask,
   onOpenSettings,
   onRetryInitialization,
@@ -2505,6 +2586,7 @@ function ResearchWorkspaceV2({
   readonly busy: boolean;
   readonly sessionStartBlocked: boolean;
   readonly sessionEvolutionAvailable: boolean;
+  readonly sessionImageUploadAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
   readonly onOpenSettings: () => void;
   readonly onRetryInitialization: () => void;
@@ -2512,6 +2594,7 @@ function ResearchWorkspaceV2({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
     projectHead: ProjectHeadRefV2,
+    imageAttachments?: readonly SessionImageAttachmentV2[],
   ) => Promise<boolean>;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
@@ -2546,6 +2629,8 @@ function ResearchWorkspaceV2({
   );
   const [taskTitle, setTaskTitle] = useState("");
   const [taskObjective, setTaskObjective] = useState("");
+  const [imageAttachments, setImageAttachments] = useState<readonly SessionImageAttachmentV2[]>([]);
+  const [imagePasteError, setImagePasteError] = useState<string | null>(null);
   const sessionEvolutionCapabilities = useMemo(() => (
     capability?.project_id === project.project_id
       ? capability.capabilities.targets
@@ -2585,6 +2670,11 @@ function ResearchWorkspaceV2({
   useEffect(() => {
     setTaskTitle("");
     setTaskObjective("");
+    setImagePasteError(null);
+    setImageAttachments((current) => {
+      revokeSessionImagePreviewsV2(current);
+      return [];
+    });
   }, [newSessionDraftKey, project.project_id]);
   useEffect(() => {
     if (availableProjectHeads.some((head) => head.project_head_id === selectedProjectHeadId)) return;
@@ -2599,9 +2689,10 @@ function ResearchWorkspaceV2({
     title: taskTitle.trim(),
     objective: taskObjective.trim(),
   };
+  const submittedTask = withSessionImageReferencesV2(normalizedTask, imageAttachments);
   const displayedTaskTitle = visibleStartingSession?.task.title ?? taskTitle;
   const displayedTaskObjective = visibleStartingSession?.task.objective ?? taskObjective;
-  const taskValid = normalizedTask.title.length > 0 && normalizedTask.objective.length > 0;
+  const taskValid = submittedTask.title.length > 0 && submittedTask.objective.length > 0;
   const canStartDraft = !formBusy
     && !sessionStartBlocked
     && ready
@@ -2612,15 +2703,42 @@ function ResearchWorkspaceV2({
     const optimistic = {
       projectId: project.project_id,
       projectHeadGeneration: selectedProjectHead.generation,
-      task: normalizedTask,
+      task: submittedTask,
       phase: "validating" as const,
     };
     setOptimisticStartingSession(optimistic);
     try {
-      await onRun(normalizedTask, selectedEvolutionTargets, selectedProjectHead);
+      if (await onRun(submittedTask, selectedEvolutionTargets, selectedProjectHead, imageAttachments)) {
+        revokeSessionImagePreviewsV2(imageAttachments);
+        setImageAttachments([]);
+        setImagePasteError(null);
+      }
     } finally {
       setOptimisticStartingSession(null);
     }
+  };
+  const pasteSessionImages = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
+    const pastedFiles = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
+    if (pastedFiles.length === 0) return;
+    event.preventDefault();
+    if (!sessionImageUploadAvailable) {
+      setImagePasteError("This backend does not support pasted image uploads.");
+      return;
+    }
+    try {
+      setImageAttachments(addPastedSessionImagesV2(imageAttachments, pastedFiles));
+      setImagePasteError(null);
+    } catch (error) {
+      setImagePasteError(userMessageV2(error));
+    }
+  };
+  const removeSessionImage = (id: string): void => {
+    setImageAttachments((current) => current.filter((attachment) => {
+      if (attachment.id !== id) return true;
+      revokeSessionImagePreviewsV2([attachment]);
+      return false;
+    }));
+    setImagePasteError(null);
   };
   if (visibleStartingSession?.phase === "admitting" && selectedTask === null) {
     return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
@@ -2651,9 +2769,10 @@ function ResearchWorkspaceV2({
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
           canContinue={ready && activeTask === null && !sessionStartBlocked}
-          onContinue={(task) => selectedProjectHead === null
+          sessionImageUploadAvailable={sessionImageUploadAvailable}
+          onContinue={(task, imageAttachments) => selectedProjectHead === null
             ? Promise.resolve(false)
-            : onRun(task, selectedEvolutionTargets, selectedProjectHead)}
+            : onRun(task, selectedEvolutionTargets, selectedProjectHead, imageAttachments)}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
           onRetryEvolutionJob={onRetryEvolutionJob}
@@ -2722,6 +2841,7 @@ function ResearchWorkspaceV2({
                 placeholder="What should the Agent do next?"
                 disabled={formBusy || sessionStartBlocked}
                 onChange={(event) => setTaskObjective(event.target.value)}
+                onPaste={pasteSessionImages}
                 onKeyDown={(event) => {
                   if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
                   event.preventDefault();
@@ -2729,6 +2849,10 @@ function ResearchWorkspaceV2({
                 }}
               />
             </label>
+            {imageAttachments.length > 0 ? (
+              <SessionImageAttachmentsV2 attachments={imageAttachments} disabled={formBusy} onRemove={removeSessionImage} />
+            ) : null}
+            {imagePasteError ? <p className="form-error" role="status">{imagePasteError}</p> : null}
             {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
               <legend>Evolution after this Session <span>{selectedEvolutionCount} selected</span></legend>
               <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
@@ -3017,6 +3141,7 @@ function TaskAuthorityCardV2({
   logs,
   busy,
   canContinue,
+  sessionImageUploadAvailable,
   onContinue,
   onCancel,
   onRetry,
@@ -3033,7 +3158,11 @@ function TaskAuthorityCardV2({
   readonly logs: readonly LogEntryV2[];
   readonly busy: boolean;
   readonly canContinue: boolean;
-  readonly onContinue: (task: ScienceProjectConfigV2["task"]) => Promise<boolean>;
+  readonly sessionImageUploadAvailable: boolean;
+  readonly onContinue: (
+    task: ScienceProjectConfigV2["task"],
+    imageAttachments?: readonly SessionImageAttachmentV2[],
+  ) => Promise<boolean>;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
@@ -3075,22 +3204,61 @@ function TaskAuthorityCardV2({
     | null
   >(null);
   const [followUp, setFollowUp] = useState("");
+  const [imageAttachments, setImageAttachments] = useState<readonly SessionImageAttachmentV2[]>([]);
+  const [imagePasteError, setImagePasteError] = useState<string | null>(null);
   const [submittingFollowUp, setSubmittingFollowUp] = useState(false);
   useEffect(() => {
     setSelectedResult(null);
     setFollowUp("");
+    setImagePasteError(null);
+    setImageAttachments((current) => {
+      revokeSessionImagePreviewsV2(current);
+      return [];
+    });
   }, [task.task_id]);
   const submitFollowUp = async (): Promise<void> => {
     const objective = followUp.trim();
-    if (!objective || !canContinue || busy || submittingFollowUp) return;
-    const firstLine = objective.split(/\r?\n/, 1)[0]!.trim();
+    if ((!objective && imageAttachments.length === 0) || !canContinue || busy || submittingFollowUp) return;
+    const taskWithImages = withSessionImageReferencesV2({
+      title: "",
+      objective,
+    }, imageAttachments);
+    const firstLine = taskWithImages.objective.split(/\r?\n/, 1)[0]!.trim();
     const title = (firstLine || "Follow-up research task").slice(0, 256);
     setSubmittingFollowUp(true);
     try {
-      if (await onContinue({ title, objective })) setFollowUp("");
+      if (await onContinue({ title, objective: taskWithImages.objective }, imageAttachments)) {
+        setFollowUp("");
+        revokeSessionImagePreviewsV2(imageAttachments);
+        setImageAttachments([]);
+        setImagePasteError(null);
+      }
     } finally {
       setSubmittingFollowUp(false);
     }
+  };
+  const pasteSessionImages = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
+    const pastedFiles = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
+    if (pastedFiles.length === 0) return;
+    event.preventDefault();
+    if (!sessionImageUploadAvailable) {
+      setImagePasteError("This backend does not support pasted image uploads.");
+      return;
+    }
+    try {
+      setImageAttachments(addPastedSessionImagesV2(imageAttachments, pastedFiles));
+      setImagePasteError(null);
+    } catch (error) {
+      setImagePasteError(userMessageV2(error));
+    }
+  };
+  const removeSessionImage = (id: string): void => {
+    setImageAttachments((current) => current.filter((attachment) => {
+      if (attachment.id !== id) return true;
+      revokeSessionImagePreviewsV2([attachment]);
+      return false;
+    }));
+    setImagePasteError(null);
   };
   const [inspectorWidth, setInspectorWidth] = usePersistedPaneWidth(
     SESSION_INSPECTOR_WIDTH_KEY,
@@ -3139,6 +3307,10 @@ function TaskAuthorityCardV2({
           void submitFollowUp();
         }}
       >
+        {imageAttachments.length > 0 ? (
+          <SessionImageAttachmentsV2 attachments={imageAttachments} disabled={busy || submittingFollowUp} onRemove={removeSessionImage} />
+        ) : null}
+        {imagePasteError ? <p className="form-error" role="status">{imagePasteError}</p> : null}
         <div className="session-chat-composer-box">
           <textarea
             aria-label="Message for the next Session"
@@ -3150,6 +3322,7 @@ function TaskAuthorityCardV2({
             value={followUp}
             disabled={busy || submittingFollowUp || !canContinue}
             onChange={(event) => setFollowUp(event.target.value)}
+            onPaste={pasteSessionImages}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
@@ -3160,7 +3333,7 @@ function TaskAuthorityCardV2({
           <button
             type="submit"
             aria-label="Start next Session"
-            disabled={!followUp.trim() || busy || submittingFollowUp || !canContinue}
+            disabled={(!followUp.trim() && imageAttachments.length === 0) || busy || submittingFollowUp || !canContinue}
           >
             {submittingFollowUp || busy
               ? <LoaderCircle className="spin" size={18} />
@@ -3853,6 +4026,7 @@ function intentFor(snapshot: DesktopProductSnapshotV2, prefix: string): ProductM
 }
 
 let actionSequence = 0;
+let sessionImageSequence = 0;
 function actionIdV2(prefix: string): string {
   actionSequence += 1;
   return `${prefix}-${Date.now().toString(36)}-${actionSequence.toString(36).padStart(8, "0")}`;
@@ -3962,6 +4136,69 @@ function extractRemoteErrorDetailV2(message: string): string | null {
   } catch {
     return null;
   }
+}
+
+function addPastedSessionImagesV2(
+  current: readonly SessionImageAttachmentV2[],
+  files: readonly File[],
+): readonly SessionImageAttachmentV2[] {
+  if (current.length + files.length > SESSION_IMAGE_MAX_COUNT) {
+    throw new Error(`A Session can include up to ${SESSION_IMAGE_MAX_COUNT} pasted images.`);
+  }
+  const totalBytes = [...current.map((attachment) => attachment.file.size), ...files.map((file) => file.size)]
+    .reduce((total, size) => total + size, 0);
+  if (totalBytes > SESSION_IMAGE_MAX_TOTAL_BYTES) {
+    throw new Error("Pasted images exceed the 64 MiB Session limit.");
+  }
+  for (const file of files) {
+    if (SESSION_IMAGE_MEDIA_EXTENSIONS[file.type] === undefined) {
+      throw new Error("Pasted images must be PNG, JPEG, WebP, or GIF files.");
+    }
+    if (file.size > BROWSER_FOLDER_MAX_FILE_BYTES) {
+      throw new Error("A pasted image exceeds the 32 MiB per-file upload limit.");
+    }
+  }
+  const additions = files.map((file): SessionImageAttachmentV2 => {
+    const extension = SESSION_IMAGE_MEDIA_EXTENSIONS[file.type]!;
+    sessionImageSequence += 1;
+    const id = `pasted-image-${Date.now().toString(36)}-${sessionImageSequence.toString(36)}`;
+    let previewUrl: string | null = null;
+    if (typeof globalThis.URL.createObjectURL === "function") {
+      try {
+        previewUrl = globalThis.URL.createObjectURL(file);
+      } catch {
+        // A filename/size tile remains available when a test DOM or older browser
+        // cannot create a local object URL for this clipboard File.
+      }
+    }
+    return {
+      id,
+      file,
+      path: `session-attachments/${id}.${extension}`,
+      previewUrl,
+    };
+  });
+  return [...current, ...additions];
+}
+
+function revokeSessionImagePreviewsV2(attachments: readonly SessionImageAttachmentV2[]): void {
+  if (typeof globalThis.URL.revokeObjectURL !== "function") return;
+  for (const attachment of attachments) {
+    if (attachment.previewUrl !== null) globalThis.URL.revokeObjectURL(attachment.previewUrl);
+  }
+}
+
+function withSessionImageReferencesV2(
+  task: ScienceProjectConfigV2["task"],
+  attachments: readonly SessionImageAttachmentV2[],
+): ScienceProjectConfigV2["task"] {
+  if (attachments.length === 0) return task;
+  const objective = task.objective.trim() || "Review the attached image evidence.";
+  const references = attachments.map((attachment) => `- ${attachment.path}`).join("\n");
+  return {
+    title: task.title,
+    objective: `${objective}\n\nAttached images are available in the project workspace:\n${references}`,
+  };
 }
 
 function browserFolderSelectionV2(files: readonly File[]): BrowserFolderSelectionV2 {
