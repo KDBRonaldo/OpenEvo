@@ -62,4 +62,12 @@ describe("Desktop product responsive CSS", () => {
     expect(styles).toMatch(/\.v2-agent-running-text\s*{[\s\S]*?background-clip:\s*text;[\s\S]*?agent-running-sheen/);
     expect(styles).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.v2-agent-running-text\s*{[\s\S]*?animation:\s*none;/);
   });
+
+  it("keeps the Project Head menu inside the Session workspace", () => {
+    const menuRule = styles.match(/\.session-head-picker \.soft-select-menu\s*{([^}]*)}/)?.[1];
+    expect(menuRule).toBeDefined();
+    expect(menuRule).toMatch(/right:\s*auto;/);
+    expect(menuRule).toMatch(/left:\s*0;/);
+    expect(menuRule).toMatch(/max-width:\s*min\(330px,\s*calc\(100vw - 32px\)\);/);
+  });
 });

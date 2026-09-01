@@ -1028,7 +1028,11 @@ pre.json {
 }
 
 .session-head-picker .soft-select-menu {
-  min-width: min(330px, 72vw);
+  right: auto;
+  left: 0;
+  width: 330px;
+  min-width: 100%;
+  max-width: min(330px, calc(100vw - 32px));
 }
 
 .next-task-fields:has(.soft-select.open) {
