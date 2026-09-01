@@ -1548,6 +1548,45 @@ describe("Desktop v2 product provider", () => {
     expect(native.journalValue()).toBeNull();
   });
 
+  it.each([
+    ["project_update", "project:project-active"],
+    ["project_validate", "project:project-active"],
+    ["task_submit", "project:project-active:task:new"],
+  ] as const)("releases a stale %s Session-start mutation after an authoritative refresh", async (
+    mutationKind,
+    resourceScope,
+  ) => {
+    const fixture = activeProjectFixture();
+    const native = nativeFixture(undefined, JSON.stringify({
+      schema_version: "2",
+      revision: 1,
+      entries: [{
+        action_id: `stale-${mutationKind}-0001`,
+        mutation_kind: mutationKind,
+        resource_scope: resourceScope,
+        request_sha256: "a".repeat(64),
+        authority_sha256: "b".repeat(64),
+        provider_stream_instance: "provider-instance-old",
+        provider_stream_epoch: 1,
+        chain_step: "single",
+        accepted_operation_id: null,
+        completed_operation_ids: [],
+        state: "reserved",
+        created_at: NOW,
+        updated_at: NOW,
+      }],
+    }));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client: fixture.client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-current",
+    });
+
+    await expect(provider.refresh()).resolves.toMatchObject({ status: "fresh" });
+    expect(native.journalValue()).toBeNull();
+  });
+
   it("recovers a lifecycle operation when its HTTP 202 response was lost", async () => {
     const connected = profile({ connection_state: "connected" });
     const native = nativeFixture();

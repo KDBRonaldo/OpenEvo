@@ -1335,10 +1335,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     for (const originalEntry of entries) {
       let entry = originalEntry;
       if (entry.accepted_operation_id === null) {
-        if (await this.reconcileReservedProjectUpdateV2(entry, snapshot)) {
+        if (await this.reconcileReservedTaskSubmissionV2(entry, snapshot)) {
           continue;
         }
-        if (await this.reconcileReservedTaskSubmissionV2(entry, snapshot)) {
+        if (await this.reconcileReservedSessionStartMutationV2(entry, snapshot)) {
           continue;
         }
         const recovered = await this.recoverReservedLifecycleOperationV2(entry);
@@ -1405,25 +1405,31 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     }
   }
 
-  private async reconcileReservedProjectUpdateV2(
+  private async reconcileReservedSessionStartMutationV2(
     entry: PendingMutationIntentV2,
     snapshot: DesktopProductSnapshotV2,
   ): Promise<boolean> {
     if (entry.state !== "reserved"
-      || entry.mutation_kind !== "project_update"
       || this.inFlightMutationActions.has(entry.action_id)
-      || !entry.resource_scope.startsWith("project:")) {
+      || !["project_update", "project_validate", "task_submit"].includes(entry.mutation_kind)) {
       return false;
     }
-    const projectId = entry.resource_scope.slice("project:".length);
+    const projectId = entry.mutation_kind === "task_submit"
+      && entry.resource_scope.startsWith("project:")
+      && entry.resource_scope.endsWith(":task:new")
+      ? entry.resource_scope.slice("project:".length, -":task:new".length)
+      : entry.resource_scope.startsWith("project:")
+        ? entry.resource_scope.slice("project:".length)
+        : null;
+    if (projectId === null || projectId.length === 0) return false;
     const authoritative = snapshot.projects.find((project) => project.project_id === projectId);
     if (authoritative === undefined) return false;
-    // A synchronous Project update has no operation resource to poll. Once a
-    // fresh Project collection has been loaded, its current state resolves the
-    // ambiguity left by a lost HTTP response and the user may safely retry.
+    // Session admission crosses three synchronous mutation boundaries. None
+    // exposes an operation resource to poll, so a fresh Project/Task collection
+    // resolves a lost-response ambiguity and must release the next retry.
     await this.mutationIntents.markDirectResponseObserved(
       entry.action_id,
-      sha256Utf8V2(canonicalJsonV2(authoritative)),
+      sha256Utf8V2(canonicalJsonV2({ mutation_kind: entry.mutation_kind, project: authoritative })),
     );
     return true;
   }
