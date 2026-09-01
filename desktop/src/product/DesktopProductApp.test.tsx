@@ -2224,6 +2224,15 @@ describe("Desktop v2 product renderer", () => {
     expect(sessionButtons().map((item) => item.title)).toEqual(["Newest running session"]);
   });
 
+  it("presents closed Sessions as completed with an English timestamp", async () => {
+    root = await render(providerFixture(authoritySnapshot()));
+
+    const session = document.querySelector<HTMLButtonElement>(".session-explorer-item-main")!;
+    expect(session.querySelector("em")?.textContent).toBe("Completed");
+    expect(session.querySelector("small")?.textContent).toMatch(/^Jul 23, \d{2}:\d{2}$/);
+    expect(session.querySelector("small")?.textContent).not.toMatch(/[\u6708\u65e5]/);
+  });
+
   it("renders a supported Core-owned selection resolver as the saved method", async () => {
     const snapshot = authoritySnapshot();
     const project = snapshot.projects[0]!;

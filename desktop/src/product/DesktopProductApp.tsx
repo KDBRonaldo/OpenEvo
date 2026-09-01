@@ -170,7 +170,7 @@ function taskStateLabelV2(state: TaskV2["state"]): string {
     completed: "Completed",
     failed: "Failed",
     cancelled: "Cancelled",
-    closed: "Closed",
+    closed: "Completed",
     waiting_for_successor: "Waiting for evolution",
   };
   return labels[state];
@@ -4083,5 +4083,11 @@ function formatBytes(bytes: number): string {
 
 function formatTimeV2(value: string): string {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
 }
