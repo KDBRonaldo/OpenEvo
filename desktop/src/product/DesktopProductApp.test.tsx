@@ -1567,6 +1567,44 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
+  it("shows live attachment upload progress while a Session is starting", async () => {
+    const snapshot = authoritySnapshot();
+    let finishUpload = (): void => undefined;
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      upload: WorkspaceFileUploadV2,
+    ) => {
+      upload.onProgress?.(37);
+      await new Promise<void>((resolve) => { finishUpload = resolve; });
+    });
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    setInput("Task title", "Inspect upload progress");
+    setTextarea("Task instructions", "Explain this image.");
+    const screenshot = new File(["png-image"], "progress.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", { value: { files: [screenshot] } });
+    await act(async () => {
+      textarea("Task instructions").dispatchEvent(paste);
+      await Promise.resolve();
+    });
+    await click("Start session");
+
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Uploading attachment 1 of 1"));
+    expect(document.body.textContent).toContain("37% uploaded");
+    expect(document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("37");
+
+    await act(async () => {
+      finishUpload();
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
+  });
+
   it("opens the attachment menu and uploads a selected file with the Session", async () => {
     const snapshot = authoritySnapshot();
     const uploadWorkspaceFile = vi.fn(async (
@@ -1611,6 +1649,37 @@ describe("Desktop v2 product renderer", () => {
       }),
       expect.anything(),
     );
+  });
+
+  it("refreshes remote authority once after uploading all Session attachments", async () => {
+    const snapshot = authoritySnapshot();
+    const uploadWorkspaceFile = vi.fn(async () => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+    const initialRefreshCount = provider.refresh.mock.calls.length;
+
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Add attachment"]')!.click());
+    await click("Upload files");
+    const inputElement = document.querySelector<HTMLInputElement>('[aria-label="Choose files for Session"]')!;
+    const first = new File(["one"], "one.txt", { type: "text/plain" });
+    const second = new File(["two"], "two.txt", { type: "text/plain" });
+    Object.defineProperty(inputElement, "files", { configurable: true, value: [first, second] });
+    await act(async () => {
+      inputElement.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+    setInput("Task title", "Review two files");
+    setTextarea("Task instructions", "Compare both attached files.");
+    await click("Start session");
+
+    await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
+    expect(uploadWorkspaceFile).toHaveBeenCalledTimes(2);
+    // Prepare, one post-upload rebase, post-update, post-validation, and
+    // post-admission refreshes. The attachment count no longer adds refreshes.
+    expect(provider.refresh).toHaveBeenCalledTimes(initialRefreshCount + 5);
   });
 
   it("hides internal attachment paths from the completed Session transcript", async () => {
@@ -1755,6 +1824,30 @@ describe("Desktop v2 product renderer", () => {
     expect(textarea("Task instructions").value).toBe("Keep this draft objective after the error.");
   });
 
+  it("turns an unresolved Session mutation into a clear recovery action", async () => {
+    const fixture = providerFixture(authoritySnapshot());
+    const provider = {
+      ...fixture,
+      validateProject: vi.fn(async () => {
+        throw new Error("An unresolved mutation for this resource has different request or authority");
+      }),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    setInput("Task title", "Retry this Session");
+    setTextarea("Task instructions", "Preserve this draft while refreshing state.");
+    await click("Start session");
+
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Previous action was not fully confirmed"));
+    expect(document.body.textContent).toContain("Refresh remote state, then submit the preserved draft again.");
+    expect(document.body.textContent).not.toContain("different request or authority");
+    const refreshCount = provider.refresh.mock.calls.length;
+    await click("Refresh state");
+    expect(provider.refresh).toHaveBeenCalledTimes(refreshCount + 1);
+    expect(input("Task title").value).toBe("Retry this Session");
+    expect(textarea("Task instructions").value).toBe("Preserve this draft while refreshing state.");
+  });
+
   it("opens the chat view while the remote Session is being admitted", async () => {
     const snapshot = authoritySnapshot();
     let releaseSubmission!: (task: DesktopProductSnapshotV2["tasks"][number]) => void;
@@ -1780,7 +1873,7 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector('[data-testid="starting-session-workspace"] .product-panel')).toBeNull();
     expect(document.querySelector('[data-testid="starting-session-workspace"] .v2-starting-session-card')).toBeTruthy();
     expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
-    expect(document.body.textContent).toContain("Starting Session");
+    expect(document.body.textContent).toContain("Creating Session");
 
     await vi.waitFor(() => expect(provider.submitTask).toHaveBeenCalledTimes(1));
     await act(async () => {

@@ -6086,6 +6086,27 @@ pre.json {
   font-size: 10px;
 }
 
+.session-attachment.is-uploading {
+  border-color: rgb(49 130 104 / 42%);
+  background: #f5faf7;
+}
+
+.session-attachment-progress {
+  width: 100%;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(49 130 104 / 12%);
+}
+
+.session-attachment-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
 .session-attachment > button,
 .session-chat-composer .session-attachment > button {
   position: absolute;

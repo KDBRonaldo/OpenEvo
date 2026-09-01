@@ -77,8 +77,39 @@ type StartingSessionV2 = {
   readonly projectId: string;
   readonly projectHeadGeneration: number;
   readonly task: ScienceProjectConfigV2["task"];
-  readonly phase: "validating" | "admitting";
+  readonly phase: "preparing" | "uploading" | "saving" | "validating" | "admitting" | "confirming";
+  readonly attachmentProgress: {
+    readonly attachmentId: string;
+    readonly current: number;
+    readonly total: number;
+    readonly percentage: number;
+  } | null;
 };
+
+function startingSessionPhaseCopyV2(session: StartingSessionV2): {
+  readonly title: string;
+  readonly detail: string;
+} {
+  switch (session.phase) {
+    case "preparing":
+      return { title: "Preparing Session", detail: "Refreshing the current Project state." };
+    case "uploading": {
+      const progress = session.attachmentProgress;
+      return {
+        title: progress === null ? "Uploading attachments" : `Uploading attachment ${progress.current} of ${progress.total}`,
+        detail: progress === null ? "Sending files to the project workspace." : `${progress.percentage}% uploaded.`,
+      };
+    }
+    case "saving":
+      return { title: "Saving Session task", detail: "Binding the instructions and attachments to the Project." };
+    case "validating":
+      return { title: "Validating Session", detail: "Checking the Project Head and remote execution authority." };
+    case "admitting":
+      return { title: "Creating Session", detail: "The daemon is admitting the Session and starting the remote Agent." };
+    case "confirming":
+      return { title: "Confirming Session", detail: "Loading the newly created Session from remote state." };
+  }
+}
 
 type BrowserWorkspaceUploadV2 = {
   readonly file: File;
@@ -558,12 +589,16 @@ export function DesktopProductApp({
     setWorkspace("research");
     setSelectedWorkspacePath(null);
     setSelectedTaskId(null);
-    setStartingSession({
+    const startingSessionBase = {
       projectId: project.project_id,
       projectHeadGeneration: selectedProjectHead.generation,
       task,
-      phase: "validating",
-    });
+    } as const;
+    const showStartingPhase = (
+      phase: StartingSessionV2["phase"],
+      attachmentProgress: StartingSessionV2["attachmentProgress"] = null,
+    ): void => setStartingSession({ ...startingSessionBase, phase, attachmentProgress });
+    showStartingPhase("preparing");
     setActionError(null);
     setActionStatus(null);
     try {
@@ -583,7 +618,13 @@ export function DesktopProductApp({
         if (!provider.uploadWorkspaceFile) {
           throw new Error("This backend does not support pasted image uploads.");
         }
-        for (const attachment of attachments) {
+        for (const [index, attachment] of attachments.entries()) {
+          showStartingPhase("uploading", {
+            attachmentId: attachment.id,
+            current: index + 1,
+            total: attachments.length,
+            percentage: 0,
+          });
           await provider.uploadWorkspaceFile(
             currentProject.project_id,
             {
@@ -591,25 +632,33 @@ export function DesktopProductApp({
               data: attachment.file,
               mediaType: attachment.file.type || "application/octet-stream",
               overwrite: true,
+              onProgress: (percentage) => showStartingPhase("uploading", {
+                attachmentId: attachment.id,
+                current: index + 1,
+                total: attachments.length,
+                percentage: Math.max(0, Math.min(100, Math.round(percentage))),
+              }),
             },
             intentFor(currentSnapshot, "upload-session-image"),
           );
-          const refreshed = await refresh();
-          if (refreshed === null) {
-            throw new Error("The pasted image was uploaded, but the current project state could not be reloaded.");
-          }
-          const refreshedProject = refreshed.projects.find((candidate) => candidate.project_id === project.project_id);
-          if (!refreshedProject || refreshedProject.state !== "ready") {
-            throw new Error("The project is not ready after uploading the pasted image.");
-          }
-          currentSnapshot = refreshed;
-          currentProject = refreshedProject;
         }
+        showStartingPhase("preparing");
+        const refreshed = await refresh();
+        if (refreshed === null) {
+          throw new Error("The attachments were uploaded, but the current project state could not be reloaded.");
+        }
+        const refreshedProject = refreshed.projects.find((candidate) => candidate.project_id === project.project_id);
+        if (!refreshedProject || refreshedProject.state !== "ready") {
+          throw new Error("The project is not ready after uploading the attachments.");
+        }
+        currentSnapshot = refreshed;
+        currentProject = refreshedProject;
       }
       const nextConfig = sessionEvolutionAvailable
         ? withSessionDocumentEvolution(currentProject.config, task, selectedEvolutionTargets)
         : { ...currentProject.config, task };
       if (JSON.stringify(nextConfig) !== JSON.stringify(currentProject.config)) {
+        showStartingPhase("saving");
         await provider.updateProject(
           currentProject.project_id,
           currentProject.display_name,
@@ -625,6 +674,7 @@ export function DesktopProductApp({
         currentSnapshot = refreshed;
         currentProject = updatedProject;
       }
+      showStartingPhase("validating");
       const validation = await provider.validateProject(
         currentProject.project_id,
         intentFor(currentSnapshot, "validate-project"),
@@ -650,17 +700,13 @@ export function DesktopProductApp({
       if (admissionHead === undefined) {
         throw new Error("The selected Project Head is no longer available for this Session.");
       }
-      setStartingSession({
-        projectId: currentProject.project_id,
-        projectHeadGeneration: admissionHead.generation,
-        task,
-        phase: "admitting",
-      });
+      showStartingPhase("admitting");
       const submittedTask = await provider.submitTask(
         currentProject.project_id,
         intentFor(currentSnapshot, "submit-task"),
         admissionHead,
       );
+      showStartingPhase("confirming");
       const submittedSnapshot = await refresh();
       if (submittedSnapshot === null || !submittedSnapshot.tasks.some((candidate) => candidate.task_id === submittedTask.task_id)) {
         throw new Error("The admitted Session was not visible in the refreshed remote state.");
@@ -980,7 +1026,11 @@ export function DesktopProductApp({
           {loadError || actionError || actionStatus || snapshot.stream.status !== "fresh" ? (
             <div className="product-feedback-stack" aria-label="Product status">
               {loadError ? <ErrorNoticeV2 context="refresh" error={loadError} onRetry={() => void refresh()} /> : null}
-              {actionError ? <ErrorNoticeV2 context="action" error={actionError} onDismiss={() => setActionError(null)} /> : null}
+              {actionError ? <ErrorNoticeV2 context="action" error={actionError} onRetry={() => {
+                void refresh().then((refreshed) => {
+                  if (refreshed !== null) setActionError(null);
+                });
+              }} onDismiss={() => setActionError(null)} /> : null}
               {actionStatus ? <Notice tone="success" title="Done" detail={actionStatus} compact onDismiss={() => setActionStatus(null)} /> : null}
               {snapshot.stream.status !== "fresh" ? (
                 <Notice tone="warning" title="Updating remote state" detail="Changes are briefly paused while EvoLab confirms the latest server state." compact />
@@ -2484,21 +2534,25 @@ function SessionAttachmentsV2({
   attachments,
   disabled,
   onRemove,
+  uploadProgress = null,
 }: {
   readonly attachments: readonly SessionAttachmentV2[];
   readonly disabled: boolean;
   readonly onRemove: (id: string) => void;
+  readonly uploadProgress?: StartingSessionV2["attachmentProgress"];
 }) {
   return (
     <div className="session-attachments" aria-label="Session attachments">
-      {attachments.map((attachment, index) => (
-        <figure key={attachment.id} className="session-attachment">
+      {attachments.map((attachment, index) => {
+        const upload = sessionAttachmentUploadStateV2(attachment, index, uploadProgress);
+        return <figure key={attachment.id} className={`session-attachment${upload ? " is-uploading" : ""}`}>
           {attachment.previewUrl
             ? <img src={attachment.previewUrl} alt={`Pasted image ${index + 1}`} />
             : <span className="session-attachment-placeholder">{attachment.kind === "image" ? <ImageIcon size={22} /> : <FileText size={22} />}</span>}
           <figcaption>
             <strong title={attachment.file.name}>{attachment.file.name || `Image ${index + 1}`}</strong>
-            <small>{formatBytes(attachment.file.size)}</small>
+            <small>{upload?.label ?? formatBytes(attachment.file.size)}</small>
+            {upload ? <span className="session-attachment-progress" role="progressbar" aria-label={`Uploading ${attachment.file.name || `attachment ${index + 1}`}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={upload.percentage}><span style={{ width: `${upload.percentage}%` }} /></span> : null}
           </figcaption>
           <button
             type="button"
@@ -2508,10 +2562,23 @@ function SessionAttachmentsV2({
           >
             <X size={13} />
           </button>
-        </figure>
-      ))}
+        </figure>;
+      })}
     </div>
   );
+}
+
+function sessionAttachmentUploadStateV2(
+  attachment: SessionAttachmentV2,
+  index: number,
+  progress: StartingSessionV2["attachmentProgress"],
+): { readonly label: string; readonly percentage: number } | null {
+  if (progress === null) return null;
+  if (index + 1 < progress.current) return { label: "Uploaded", percentage: 100 };
+  if (attachment.id === progress.attachmentId) {
+    return { label: `${progress.percentage}% uploaded`, percentage: progress.percentage };
+  }
+  return { label: "Waiting to upload", percentage: 0 };
 }
 
 function SessionAttachmentPickerV2({
@@ -2596,9 +2663,7 @@ function StartingSessionChatV2({
   readonly project: ProjectV2;
   readonly session: StartingSessionV2;
 }) {
-  const phaseDetail = session.phase === "validating"
-    ? "Checking the current Project Head and remote execution authority."
-    : "The daemon is admitting this Session and starting the remote Agent.";
+  const phaseCopy = startingSessionPhaseCopyV2(session);
   return (
     <div className="workspace-stack session-detail-workspace" data-testid="starting-session-workspace">
       <div className="session-detail-navigation">
@@ -2611,7 +2676,7 @@ function StartingSessionChatV2({
           </div>
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="starting-session-activity">
             <span className="v2-agent-running-dot" aria-hidden="true" />
-            <p className="v2-agent-running-text"><strong>Starting Session</strong><span>{phaseDetail}</span></p>
+            <p className="v2-agent-running-text"><strong>{phaseCopy.title}</strong><span>{phaseCopy.detail}</span></p>
           </div>
         </section>
         <div className="session-chat-composer" aria-label="Session is starting">
@@ -2783,7 +2848,8 @@ function ResearchWorkspaceV2({
       projectId: project.project_id,
       projectHeadGeneration: selectedProjectHead.generation,
       task: submittedTask,
-      phase: "validating" as const,
+      phase: "preparing" as const,
+      attachmentProgress: null,
     };
     setOptimisticStartingSession(optimistic);
     try {
@@ -2822,7 +2888,7 @@ function ResearchWorkspaceV2({
     }));
     setAttachmentError(null);
   };
-  if (visibleStartingSession?.phase === "admitting" && selectedTask === null) {
+  if (visibleStartingSession && ["admitting", "confirming"].includes(visibleStartingSession.phase) && selectedTask === null) {
     return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
   }
   if (selectedTask) {
@@ -2875,7 +2941,7 @@ function ResearchWorkspaceV2({
           {visibleStartingSession ? (
             <div className="session-submit-progress" role="status">
               <LoaderCircle className="spin" size={17} />
-              <div><strong>{visibleStartingSession.phase === "validating" ? "Validating Session" : "Starting Session"}</strong><span>Your draft is preserved while you continue browsing.</span></div>
+              <div><strong>{startingSessionPhaseCopyV2(visibleStartingSession).title}</strong><span>{startingSessionPhaseCopyV2(visibleStartingSession).detail}</span></div>
             </div>
           ) : null}
           {!ready ? (
@@ -2932,7 +2998,7 @@ function ResearchWorkspaceV2({
               />
             </label>
             {attachments.length > 0 ? (
-              <SessionAttachmentsV2 attachments={attachments} disabled={formBusy} onRemove={removeSessionAttachment} />
+              <SessionAttachmentsV2 attachments={attachments} disabled={formBusy} onRemove={removeSessionAttachment} uploadProgress={visibleStartingSession?.attachmentProgress ?? null} />
             ) : null}
             {attachmentError ? <p className="form-error" role="status">{attachmentError}</p> : null}
             {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
@@ -4014,6 +4080,7 @@ type ErrorNoticeCopyV2 = {
   readonly title: string;
   readonly detail: string;
   readonly guidance: string;
+  readonly actionLabel?: string;
 };
 
 function ErrorNoticeV2({ context, error, onRetry, onDismiss }: {
@@ -4028,7 +4095,7 @@ function ErrorNoticeV2({ context, error, onRetry, onDismiss }: {
     title={copy.title}
     detail={copy.detail}
     guidance={copy.guidance}
-    action={onRetry ? <button type="button" className="v2-notice-action" onClick={onRetry}><RefreshCw size={12} /> Retry</button> : undefined}
+    action={onRetry ? <button type="button" className="v2-notice-action" onClick={onRetry}><RefreshCw size={12} /> {copy.actionLabel ?? (context === "action" ? "Refresh state" : "Retry")}</button> : undefined}
     onDismiss={onDismiss}
   />;
 }
@@ -4155,6 +4222,14 @@ function errorNoticeCopyV2(error: string, context: ErrorNoticeContextV2): ErrorN
       title: "The server took too long to respond",
       detail: "EvoLab stopped waiting before the remote operation returned a valid response.",
       guidance: "Check the network and remote load. Retrying is safe because mutations use an idempotent action ID.",
+    };
+  }
+  if (searchable.includes("unresolved mutation") || searchable.includes("different request or authority")) {
+    return {
+      title: "Previous action was not fully confirmed",
+      detail: "EvoLab paused this request to avoid submitting the same Project or Session change twice.",
+      guidance: "Refresh remote state, then submit the preserved draft again.",
+      actionLabel: "Refresh state",
     };
   }
   if (searchable.includes("content-length is invalid")) {
