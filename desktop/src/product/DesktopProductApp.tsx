@@ -129,6 +129,7 @@ const SESSION_IMAGE_MEDIA_EXTENSIONS: Readonly<Record<string, string>> = {
   "image/webp": "webp",
   "image/gif": "gif",
 };
+const SESSION_ATTACHMENT_REFERENCE_MARKER = "\n\nAttached files are available in the project workspace:\n";
 const PROJECT_TASK_PLACEHOLDER = {
   title: "Untitled Session",
   objective: "Task details are provided when the Session starts.",
@@ -2606,7 +2607,7 @@ function StartingSessionChatV2({
       <article className="v2-starting-session-card">
         <section className="v2-conversation-section session-chat-canvas" aria-label="Starting Session conversation">
           <div className="v2-transcript">
-            <article className="user" aria-label="You"><span aria-hidden="true">You</span><p>{session.task.objective}</p></article>
+            <article className="user" aria-label="You"><span aria-hidden="true">You</span><p>{userVisibleSessionTextV2(session.task.objective)}</p></article>
           </div>
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="starting-session-activity">
             <span className="v2-agent-running-dot" aria-hidden="true" />
@@ -2767,7 +2768,9 @@ function ResearchWorkspaceV2({
   };
   const submittedTask = withSessionAttachmentReferencesV2(normalizedTask, attachments);
   const displayedTaskTitle = visibleStartingSession?.task.title ?? taskTitle;
-  const displayedTaskObjective = visibleStartingSession?.task.objective ?? taskObjective;
+  const displayedTaskObjective = visibleStartingSession === null
+    ? taskObjective
+    : userVisibleSessionTextV2(visibleStartingSession.task.objective);
   const taskValid = submittedTask.title.length > 0 && submittedTask.objective.length > 0;
   const canStartDraft = !formBusy
     && !sessionStartBlocked
@@ -3373,7 +3376,7 @@ function TaskAuthorityCardV2({
     >
       <div className="session-conversation-pane">
       <section className="v2-conversation-section session-chat-canvas" data-session-priority="conversation" aria-label="Session conversation">
-        {visibleTranscript.length ? <div className="v2-transcript">{visibleTranscript.map((entry, index) => <article key={`${entry.speaker}-${"sequence" in entry ? String(entry.sequence) : index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
+        {visibleTranscript.length ? <div className="v2-transcript">{visibleTranscript.map((entry, index) => <article key={`${entry.speaker}-${"sequence" in entry ? String(entry.sequence) : index}`} className={entry.speaker} aria-label={entry.speaker === "user" ? "You" : "Agent"}><span aria-hidden="true">{entry.speaker === "user" ? "You" : "Agent"}</span><p>{entry.speaker === "user" ? userVisibleSessionTextV2(entry.text) : entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="session-chat-empty">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
             <span className="v2-agent-running-dot" aria-hidden="true" />
@@ -4286,8 +4289,12 @@ function withSessionAttachmentReferencesV2(
   const references = attachments.map((attachment) => `- ${attachment.path}`).join("\n");
   return {
     title: task.title,
-    objective: `${objective}\n\nAttached files are available in the project workspace:\n${references}`,
+    objective: `${objective}${SESSION_ATTACHMENT_REFERENCE_MARKER}${references}`,
   };
+}
+
+function userVisibleSessionTextV2(value: string): string {
+  return value.split(SESSION_ATTACHMENT_REFERENCE_MARKER, 1)[0] ?? value;
 }
 
 function safeSessionAttachmentNameV2(value: string): string {

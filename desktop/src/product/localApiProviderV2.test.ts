@@ -210,6 +210,7 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     getDiagnostic: vi.fn(),
     createProfile: vi.fn(),
     createProject: vi.fn(),
+    updateProject: vi.fn(),
     connectProfile: vi.fn(),
     cancelLifecycleOperation: vi.fn(),
     getLifecycleOperationByAction: vi.fn().mockRejectedValue(new DesktopApiErrorV2(404, {
@@ -226,6 +227,63 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     eventStreamRequest: vi.fn(),
   } as unknown as DesktopApiClientV2;
   return client;
+}
+
+function activeProjectFixture() {
+  const connected = profile({
+    connection_state: "connected",
+    active_project_id: "project-active",
+    core_api_major: 2,
+    core_openapi_sha256: DIGEST,
+    core_event_schema_sha256: DIGEST,
+    core_registry_sha256: DIGEST,
+  });
+  const project = {
+    schema_version: "2" as const,
+    project_id: "project-active",
+    display_name: "Active project",
+    config: {
+      ...nativeProjectConfig(),
+      workspace: { kind: "scratch" as const, display_name: "Active workspace" },
+    },
+    project_config_sha256: "2".repeat(64),
+    active_project_head: null,
+    admission_etag: ETAG,
+    state: "ready" as const,
+    created_at: NOW,
+    updated_at: NOW,
+    etag: ETAG,
+  };
+  const client = clientFixture([connected]);
+  vi.mocked(client.state).mockResolvedValue({
+    ...state([connected]),
+    active_profile_id: connected.profile_id,
+    active_project_id: project.project_id,
+  });
+  vi.mocked(client.listProjects).mockResolvedValue({
+    schema_version: "2",
+    items: [project],
+    next_cursor: null,
+    has_more: false,
+  });
+  vi.mocked(client.listTasks).mockResolvedValue({
+    schema_version: "2",
+    items: [],
+    next_cursor: null,
+    has_more: false,
+  });
+  vi.mocked(client.listServices).mockResolvedValue({
+    schema_version: "2",
+    items: [],
+    next_cursor: null,
+    has_more: false,
+  });
+  vi.mocked(client.projectCapabilities).mockResolvedValue({
+    project_id: project.project_id,
+    execution_mode: "codex_subscription_transcript",
+    registry_sha256: DIGEST,
+  } as never);
+  return { client, connected, project };
 }
 
 function nativeFixture(
@@ -1106,7 +1164,7 @@ describe("Desktop v2 product provider", () => {
     expect(native.journalValue()).toBeNull();
   });
 
-  it("keeps a direct success retryable until its exact resource is authoritatively re-read", async () => {
+  it("settles a direct success even when its follow-up authority read is interrupted", async () => {
     const native = nativeFixture();
     const created = profile();
     const firstClient = clientFixture();
@@ -1125,28 +1183,6 @@ describe("Desktop v2 product provider", () => {
       actionId: "create-profile-verify-0001",
       streamEpoch: firstRefresh.snapshot.stream.epoch,
     })).rejects.toThrow(/authority refresh interrupted/i);
-    expect(native.journalValue()).toContain("create-profile-verify-0001");
-
-    const secondClient = clientFixture();
-    vi.mocked(secondClient.createProfile).mockResolvedValue(created);
-    vi.mocked(secondClient.getProfile).mockResolvedValue(created);
-    const relaunched = createLocalApiDesktopProductProviderV2({
-      client: secondClient,
-      native,
-      featureFlags: ["system_openssh_profiles"],
-      providerStreamInstance: "provider-instance-test",
-    });
-    const secondRefresh = await relaunched.refresh();
-    if (secondRefresh.status !== "fresh") throw new Error("fixture refresh failed");
-    await relaunched.createProfile("Lab GPU", "lab-gpu", {
-      actionId: "create-profile-new-click-0002",
-      streamEpoch: secondRefresh.snapshot.stream.epoch,
-    });
-
-    expect(secondClient.createProfile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      idempotencyKey: "create-profile-verify-0001",
-    }));
-    expect(secondClient.getProfile).toHaveBeenCalledWith(created.profile_id);
     expect(native.journalValue()).toBeNull();
   });
 
@@ -1435,6 +1471,81 @@ describe("Desktop v2 product provider", () => {
     })).resolves.toEqual(accepted);
     expect(client.getLifecycleOperation).not.toHaveBeenCalled();
     expect(client.listProjects).not.toHaveBeenCalled();
+  });
+
+  it("clears a confirmed Project update before its follow-up verification read", async () => {
+    const { client, project } = activeProjectFixture();
+    const native = nativeFixture();
+    const nextConfig = {
+      ...project.config,
+      task: { title: "Image review", objective: "Explain the attached image." },
+    };
+    const updated = {
+      ...project,
+      config: nextConfig,
+      project_config_sha256: "3".repeat(64),
+      updated_at: "2026-07-23T06:00:01Z",
+      etag: `"${"c".repeat(64)}"`,
+    };
+    vi.mocked(client.updateProject).mockResolvedValue(updated);
+    vi.mocked(client.getProject).mockRejectedValue(new TypeError("verification connection closed"));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(provider.updateProject(project.project_id, project.display_name, nextConfig, {
+      actionId: "project-update-confirmed-0001",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).rejects.toThrow(/verification connection closed/i);
+
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("releases an unresolved Project update after loading authoritative Project state", async () => {
+    const first = activeProjectFixture();
+    const native = nativeFixture();
+    const nextConfig = {
+      ...first.project.config,
+      task: { title: "Image review", objective: "Explain the attached image." },
+    };
+    vi.mocked(first.client.updateProject).mockRejectedValue(new TypeError("response connection closed"));
+    const firstProvider = createLocalApiDesktopProductProviderV2({
+      client: first.client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await firstProvider.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(firstProvider.updateProject(
+      first.project.project_id,
+      first.project.display_name,
+      nextConfig,
+      {
+        actionId: "project-update-lost-response-0001",
+        streamEpoch: firstRefresh.snapshot.stream.epoch,
+      },
+    )).rejects.toThrow(/response connection closed/i);
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{ mutation_kind: "project_update", state: "reserved" }],
+    });
+
+    const recovered = activeProjectFixture();
+    const recoveredProvider = createLocalApiDesktopProductProviderV2({
+      client: recovered.client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-recovered",
+    });
+
+    await expect(recoveredProvider.refresh()).resolves.toMatchObject({ status: "fresh" });
+    expect(native.journalValue()).toBeNull();
   });
 
   it("recovers a lifecycle operation when its HTTP 202 response was lost", async () => {

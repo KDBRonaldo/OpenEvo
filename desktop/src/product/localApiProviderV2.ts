@@ -154,6 +154,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
+  private readonly inFlightMutationActions = new Set<string>();
 
   constructor(options: LocalApiDesktopProductProviderOptionsV2) {
     this.client = options.client;
@@ -1334,6 +1335,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     for (const originalEntry of entries) {
       let entry = originalEntry;
       if (entry.accepted_operation_id === null) {
+        if (await this.reconcileReservedProjectUpdateV2(entry, snapshot)) {
+          continue;
+        }
         if (await this.reconcileReservedTaskSubmissionV2(entry, snapshot)) {
           continue;
         }
@@ -1399,6 +1403,29 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }
       await this.acknowledgeLifecycleTerminalV2(state.operation);
     }
+  }
+
+  private async reconcileReservedProjectUpdateV2(
+    entry: PendingMutationIntentV2,
+    snapshot: DesktopProductSnapshotV2,
+  ): Promise<boolean> {
+    if (entry.state !== "reserved"
+      || entry.mutation_kind !== "project_update"
+      || this.inFlightMutationActions.has(entry.action_id)
+      || !entry.resource_scope.startsWith("project:")) {
+      return false;
+    }
+    const projectId = entry.resource_scope.slice("project:".length);
+    const authoritative = snapshot.projects.find((project) => project.project_id === projectId);
+    if (authoritative === undefined) return false;
+    // A synchronous Project update has no operation resource to poll. Once a
+    // fresh Project collection has been loaded, its current state resolves the
+    // ambiguity left by a lost HTTP response and the user may safely retry.
+    await this.mutationIntents.markDirectResponseObserved(
+      entry.action_id,
+      sha256Utf8V2(canonicalJsonV2(authoritative)),
+    );
+    return true;
   }
 
   private async reconcileReservedTaskSubmissionV2(
@@ -1624,6 +1651,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       );
       throw new MutationIntentConflictV2("This exact mutation was deterministically rejected", entry);
     }
+    this.inFlightMutationActions.add(entry.action_id);
     try {
       const value = await input.send(entry.action_id);
       if (input.operationAuthority !== undefined) {
@@ -1634,6 +1662,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
           throw new DesktopContractErrorV2(`${input.operationAuthority} mutation did not return operation authority`);
         }
         await this.mutationIntents.bindAcceptedOperation(entry.action_id, operationId);
+        this.inFlightMutationActions.delete(entry.action_id);
       }
       return { entry, value };
     } catch (error) {
@@ -1644,6 +1673,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
           deterministicRejectionDigestV2(),
         );
       }
+      this.inFlightMutationActions.delete(entry.action_id);
       throw error;
     }
   }
@@ -1653,11 +1683,18 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     value: unknown,
     verify?: () => Promise<void>,
   ): Promise<void> {
-    await verify?.();
-    await this.mutationIntents.markDirectResponseObserved(
-      entry.action_id,
-      sha256Utf8V2(canonicalJsonV2(value)),
-    );
+    try {
+      // Receiving the direct response confirms the idempotent mutation. Clear
+      // its retry identity before the optional follow-up read so a transient
+      // verification outage cannot leave this resource permanently blocked.
+      await this.mutationIntents.markDirectResponseObserved(
+        entry.action_id,
+        sha256Utf8V2(canonicalJsonV2(value)),
+      );
+      await verify?.();
+    } finally {
+      this.inFlightMutationActions.delete(entry.action_id);
+    }
   }
 
   private async completeTerminalOperationV2(

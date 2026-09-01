@@ -1532,7 +1532,20 @@ describe("Desktop v2 product renderer", () => {
 
     expect(document.querySelector('[aria-label="Session attachments"]')).toBeTruthy();
     expect(document.body.textContent).toContain("screenshot.png");
+    let resumeRefresh = (): void => undefined;
+    provider.refresh.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { resumeRefresh = resolve; });
+      return { status: "fresh" as const, snapshot };
+    });
     await click("Start session");
+
+    expect(textarea("Task instructions").value).toBe("Explain what is visible in this screenshot.");
+    expect(document.body.textContent).not.toContain("Attached files are available in the project workspace");
+    expect(document.body.textContent).not.toContain("session-attachments/");
+    await act(async () => {
+      resumeRefresh();
+      await Promise.resolve();
+    });
 
     await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
     const upload = uploadWorkspaceFile.mock.calls[0]![1];
@@ -1598,6 +1611,36 @@ describe("Desktop v2 product renderer", () => {
       }),
       expect.anything(),
     );
+  });
+
+  it("hides internal attachment paths from the completed Session transcript", async () => {
+    const base = authoritySnapshot();
+    const taskPresentation = base.runtimePresentation!.tasks["task-1"]!;
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        tasks: {
+          ...base.runtimePresentation!.tasks,
+          "task-1": {
+            ...taskPresentation,
+            transcript: [
+              {
+                speaker: "user",
+                text: "Explain this screenshot.\n\nAttached files are available in the project workspace:\n- session-attachments/internal-image.png",
+              },
+              { speaker: "agent", text: "The screenshot shows a completed run." },
+            ],
+          },
+        },
+      },
+    };
+    root = await render(providerFixture(snapshot));
+
+    await click("Review evidence");
+    expect(document.querySelector('article[aria-label="You"]')?.textContent).toContain("Explain this screenshot.");
+    expect(document.body.textContent).not.toContain("Attached files are available in the project workspace");
+    expect(document.body.textContent).not.toContain("session-attachments/internal-image.png");
   });
 
   it("starts a session with the historical Project Head selected by the user", async () => {
