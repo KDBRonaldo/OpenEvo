@@ -85,10 +85,11 @@ type BrowserWorkspaceUploadV2 = {
   readonly path: string;
 };
 
-type SessionImageAttachmentV2 = {
+type SessionAttachmentV2 = {
   readonly id: string;
   readonly file: File;
   readonly path: string;
+  readonly kind: "image" | "file";
   readonly previewUrl: string | null;
 };
 
@@ -120,8 +121,8 @@ const BROWSER_FOLDER_SNAPSHOT_FEATURE = "browser_folder_snapshot";
 const BROWSER_FOLDER_MAX_FILES = 1_000;
 const BROWSER_FOLDER_MAX_FILE_BYTES = 32 * 1024 * 1024;
 const BROWSER_FOLDER_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
-const SESSION_IMAGE_MAX_COUNT = 8;
-const SESSION_IMAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const SESSION_ATTACHMENT_MAX_COUNT = 8;
+const SESSION_ATTACHMENT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
 const SESSION_IMAGE_MEDIA_EXTENSIONS: Readonly<Record<string, string>> = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -550,7 +551,7 @@ export function DesktopProductApp({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
     selectedProjectHead: ProjectHeadRefV2,
-    imageAttachments: readonly SessionImageAttachmentV2[] = [],
+    attachments: readonly SessionAttachmentV2[] = [],
   ): Promise<boolean> => {
     if (project.state !== "ready") return false;
     setWorkspace("research");
@@ -577,17 +578,17 @@ export function DesktopProductApp({
       }
       let currentSnapshot = startingSnapshot;
       let currentProject = startingProject;
-      if (imageAttachments.length > 0) {
+      if (attachments.length > 0) {
         if (!provider.uploadWorkspaceFile) {
           throw new Error("This backend does not support pasted image uploads.");
         }
-        for (const attachment of imageAttachments) {
+        for (const attachment of attachments) {
           await provider.uploadWorkspaceFile(
             currentProject.project_id,
             {
               path: attachment.path,
               data: attachment.file,
-              mediaType: attachment.file.type,
+              mediaType: attachment.file.type || "application/octet-stream",
               overwrite: true,
             },
             intentFor(currentSnapshot, "upload-session-image"),
@@ -1020,15 +1021,15 @@ export function DesktopProductApp({
               busy={busy || switchingProjectId !== null}
               sessionStartBlocked={developmentEvolutionActive}
               sessionEvolutionAvailable={sessionEvolutionAvailable}
-              sessionImageUploadAvailable={provider.uploadWorkspaceFile !== undefined}
+              sessionAttachmentUploadAvailable={provider.uploadWorkspaceFile !== undefined}
               onSelectTask={(taskId) => {
                 setSelectedTaskId(taskId);
                 if (taskId === null) setNewSessionDraftKey((current) => current + 1);
               }}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
-              onRun={(task, selectedEvolutionTargets, projectHead, imageAttachments) => (
-                runProject(displayedProject, task, selectedEvolutionTargets, projectHead, imageAttachments)
+              onRun={(task, selectedEvolutionTargets, projectHead, attachments) => (
+                runProject(displayedProject, task, selectedEvolutionTargets, projectHead, attachments)
               )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
@@ -2478,29 +2479,29 @@ function ProjectFileWorkspaceV2({
   );
 }
 
-function SessionImageAttachmentsV2({
+function SessionAttachmentsV2({
   attachments,
   disabled,
   onRemove,
 }: {
-  readonly attachments: readonly SessionImageAttachmentV2[];
+  readonly attachments: readonly SessionAttachmentV2[];
   readonly disabled: boolean;
   readonly onRemove: (id: string) => void;
 }) {
   return (
-    <div className="session-image-attachments" aria-label="Pasted images">
+    <div className="session-attachments" aria-label="Session attachments">
       {attachments.map((attachment, index) => (
-        <figure key={attachment.id} className="session-image-attachment">
+        <figure key={attachment.id} className="session-attachment">
           {attachment.previewUrl
             ? <img src={attachment.previewUrl} alt={`Pasted image ${index + 1}`} />
-            : <span className="session-image-placeholder"><ImageIcon size={22} /></span>}
+            : <span className="session-attachment-placeholder">{attachment.kind === "image" ? <ImageIcon size={22} /> : <FileText size={22} />}</span>}
           <figcaption>
-            <strong>Image {index + 1}</strong>
+            <strong title={attachment.file.name}>{attachment.file.name || `Image ${index + 1}`}</strong>
             <small>{formatBytes(attachment.file.size)}</small>
           </figcaption>
           <button
             type="button"
-            aria-label={`Remove pasted image ${index + 1}`}
+            aria-label={`Remove attachment ${index + 1}`}
             disabled={disabled}
             onClick={() => onRemove(attachment.id)}
           >
@@ -2508,6 +2509,81 @@ function SessionImageAttachmentsV2({
           </button>
         </figure>
       ))}
+    </div>
+  );
+}
+
+function SessionAttachmentPickerV2({
+  disabled,
+  onFiles,
+}: {
+  readonly disabled: boolean;
+  readonly onFiles: (files: readonly File[], imagesOnly: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const close = (event: PointerEvent): void => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    globalThis.document.addEventListener("pointerdown", close);
+    globalThis.document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      globalThis.document.removeEventListener("pointerdown", close);
+      globalThis.document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+  const selectFiles = (input: HTMLInputElement, imagesOnly: boolean): void => {
+    const files = [...(input.files ?? [])];
+    input.value = "";
+    if (files.length > 0) onFiles(files, imagesOnly);
+  };
+  return (
+    <div ref={pickerRef} className="session-attachment-picker">
+      <button
+        type="button"
+        className="session-attachment-trigger"
+        aria-label="Add attachment"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Plus size={18} />
+      </button>
+      {open ? (
+        <div className="session-attachment-menu" role="menu" aria-label="Add to Session">
+          <button type="button" role="menuitem" onClick={() => { setOpen(false); imageInputRef.current?.click(); }}>
+            <ImageIcon size={16} /><span><strong>Upload images</strong><small>PNG, JPEG, WebP, or GIF</small></span>
+          </button>
+          <button type="button" role="menuitem" onClick={() => { setOpen(false); fileInputRef.current?.click(); }}>
+            <FileText size={16} /><span><strong>Upload files</strong><small>Add documents, code, or data</small></span>
+          </button>
+        </div>
+      ) : null}
+      <input
+        ref={imageInputRef}
+        className="visually-hidden"
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        multiple
+        aria-label="Choose images for Session"
+        onChange={(event) => selectFiles(event.currentTarget, true)}
+      />
+      <input
+        ref={fileInputRef}
+        className="visually-hidden"
+        type="file"
+        multiple
+        aria-label="Choose files for Session"
+        onChange={(event) => selectFiles(event.currentTarget, false)}
+      />
     </div>
   );
 }
@@ -2562,7 +2638,7 @@ function ResearchWorkspaceV2({
   busy,
   sessionStartBlocked,
   sessionEvolutionAvailable,
-  sessionImageUploadAvailable,
+  sessionAttachmentUploadAvailable,
   onSelectTask,
   onOpenSettings,
   onRetryInitialization,
@@ -2586,7 +2662,7 @@ function ResearchWorkspaceV2({
   readonly busy: boolean;
   readonly sessionStartBlocked: boolean;
   readonly sessionEvolutionAvailable: boolean;
-  readonly sessionImageUploadAvailable: boolean;
+  readonly sessionAttachmentUploadAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
   readonly onOpenSettings: () => void;
   readonly onRetryInitialization: () => void;
@@ -2594,7 +2670,7 @@ function ResearchWorkspaceV2({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
     projectHead: ProjectHeadRefV2,
-    imageAttachments?: readonly SessionImageAttachmentV2[],
+    attachments?: readonly SessionAttachmentV2[],
   ) => Promise<boolean>;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
@@ -2629,8 +2705,8 @@ function ResearchWorkspaceV2({
   );
   const [taskTitle, setTaskTitle] = useState("");
   const [taskObjective, setTaskObjective] = useState("");
-  const [imageAttachments, setImageAttachments] = useState<readonly SessionImageAttachmentV2[]>([]);
-  const [imagePasteError, setImagePasteError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<readonly SessionAttachmentV2[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const sessionEvolutionCapabilities = useMemo(() => (
     capability?.project_id === project.project_id
       ? capability.capabilities.targets
@@ -2670,9 +2746,9 @@ function ResearchWorkspaceV2({
   useEffect(() => {
     setTaskTitle("");
     setTaskObjective("");
-    setImagePasteError(null);
-    setImageAttachments((current) => {
-      revokeSessionImagePreviewsV2(current);
+    setAttachmentError(null);
+    setAttachments((current) => {
+      revokeSessionAttachmentPreviewsV2(current);
       return [];
     });
   }, [newSessionDraftKey, project.project_id]);
@@ -2689,7 +2765,7 @@ function ResearchWorkspaceV2({
     title: taskTitle.trim(),
     objective: taskObjective.trim(),
   };
-  const submittedTask = withSessionImageReferencesV2(normalizedTask, imageAttachments);
+  const submittedTask = withSessionAttachmentReferencesV2(normalizedTask, attachments);
   const displayedTaskTitle = visibleStartingSession?.task.title ?? taskTitle;
   const displayedTaskObjective = visibleStartingSession?.task.objective ?? taskObjective;
   const taskValid = submittedTask.title.length > 0 && submittedTask.objective.length > 0;
@@ -2708,37 +2784,40 @@ function ResearchWorkspaceV2({
     };
     setOptimisticStartingSession(optimistic);
     try {
-      if (await onRun(submittedTask, selectedEvolutionTargets, selectedProjectHead, imageAttachments)) {
-        revokeSessionImagePreviewsV2(imageAttachments);
-        setImageAttachments([]);
-        setImagePasteError(null);
+      if (await onRun(submittedTask, selectedEvolutionTargets, selectedProjectHead, attachments)) {
+        revokeSessionAttachmentPreviewsV2(attachments);
+        setAttachments([]);
+        setAttachmentError(null);
       }
     } finally {
       setOptimisticStartingSession(null);
+    }
+  };
+  const addSessionFiles = (files: readonly File[], imagesOnly: boolean): void => {
+    if (!sessionAttachmentUploadAvailable) {
+      setAttachmentError("This backend does not support Session attachments.");
+      return;
+    }
+    try {
+      setAttachments(addSessionAttachmentsV2(attachments, files, imagesOnly));
+      setAttachmentError(null);
+    } catch (error) {
+      setAttachmentError(userMessageV2(error));
     }
   };
   const pasteSessionImages = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
     const pastedFiles = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
     if (pastedFiles.length === 0) return;
     event.preventDefault();
-    if (!sessionImageUploadAvailable) {
-      setImagePasteError("This backend does not support pasted image uploads.");
-      return;
-    }
-    try {
-      setImageAttachments(addPastedSessionImagesV2(imageAttachments, pastedFiles));
-      setImagePasteError(null);
-    } catch (error) {
-      setImagePasteError(userMessageV2(error));
-    }
+    addSessionFiles(pastedFiles, true);
   };
-  const removeSessionImage = (id: string): void => {
-    setImageAttachments((current) => current.filter((attachment) => {
+  const removeSessionAttachment = (id: string): void => {
+    setAttachments((current) => current.filter((attachment) => {
       if (attachment.id !== id) return true;
-      revokeSessionImagePreviewsV2([attachment]);
+      revokeSessionAttachmentPreviewsV2([attachment]);
       return false;
     }));
-    setImagePasteError(null);
+    setAttachmentError(null);
   };
   if (visibleStartingSession?.phase === "admitting" && selectedTask === null) {
     return <StartingSessionChatV2 project={project} session={visibleStartingSession} />;
@@ -2769,10 +2848,10 @@ function ResearchWorkspaceV2({
           logs={taskLogs[selectedTask.task_id] ?? []}
           busy={busy}
           canContinue={ready && activeTask === null && !sessionStartBlocked}
-          sessionImageUploadAvailable={sessionImageUploadAvailable}
-          onContinue={(task, imageAttachments) => selectedProjectHead === null
+          sessionAttachmentUploadAvailable={sessionAttachmentUploadAvailable}
+          onContinue={(task, attachments) => selectedProjectHead === null
             ? Promise.resolve(false)
-            : onRun(task, selectedEvolutionTargets, selectedProjectHead, imageAttachments)}
+            : onRun(task, selectedEvolutionTargets, selectedProjectHead, attachments)}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
           onRetryEvolutionJob={onRetryEvolutionJob}
@@ -2849,16 +2928,17 @@ function ResearchWorkspaceV2({
                 }}
               />
             </label>
-            {imageAttachments.length > 0 ? (
-              <SessionImageAttachmentsV2 attachments={imageAttachments} disabled={formBusy} onRemove={removeSessionImage} />
+            {attachments.length > 0 ? (
+              <SessionAttachmentsV2 attachments={attachments} disabled={formBusy} onRemove={removeSessionAttachment} />
             ) : null}
-            {imagePasteError ? <p className="form-error" role="status">{imagePasteError}</p> : null}
+            {attachmentError ? <p className="form-error" role="status">{attachmentError}</p> : null}
             {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={formBusy || sessionStartBlocked}>
               <legend>Evolution after this Session <span>{selectedEvolutionCount} selected</span></legend>
               <div className="session-evolution-options">{Object.entries(selectedEvolutionTargets).map(([targetId, selection]) => <article key={targetId} className={selection.enabled ? "selected" : ""}><label><input type="checkbox" checked={selection.enabled} onChange={(event) => setSelectedEvolutionTargets((current) => ({ ...current, [targetId]: { ...selection, enabled: event.target.checked } }))} /><span><strong>{targetId.replaceAll("_", " ")}</strong><small>{selection.method ?? "No method selected"}</small></span></label></article>)}</div>
             </fieldset> : null}
             {!taskValid && (taskTitle.trim().length > 0 || taskObjective.trim().length > 0) ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
             <div className="session-composer-footer">
+              <SessionAttachmentPickerV2 disabled={formBusy || sessionStartBlocked || !sessionAttachmentUploadAvailable} onFiles={addSessionFiles} />
               <div className="session-head-picker">
                 <Sparkles size={15} />
                 <span className="visually-hidden">Evolution context</span>
@@ -3141,7 +3221,7 @@ function TaskAuthorityCardV2({
   logs,
   busy,
   canContinue,
-  sessionImageUploadAvailable,
+  sessionAttachmentUploadAvailable,
   onContinue,
   onCancel,
   onRetry,
@@ -3158,10 +3238,10 @@ function TaskAuthorityCardV2({
   readonly logs: readonly LogEntryV2[];
   readonly busy: boolean;
   readonly canContinue: boolean;
-  readonly sessionImageUploadAvailable: boolean;
+  readonly sessionAttachmentUploadAvailable: boolean;
   readonly onContinue: (
     task: ScienceProjectConfigV2["task"],
-    imageAttachments?: readonly SessionImageAttachmentV2[],
+    attachments?: readonly SessionAttachmentV2[],
   ) => Promise<boolean>;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
@@ -3204,61 +3284,64 @@ function TaskAuthorityCardV2({
     | null
   >(null);
   const [followUp, setFollowUp] = useState("");
-  const [imageAttachments, setImageAttachments] = useState<readonly SessionImageAttachmentV2[]>([]);
-  const [imagePasteError, setImagePasteError] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<readonly SessionAttachmentV2[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [submittingFollowUp, setSubmittingFollowUp] = useState(false);
   useEffect(() => {
     setSelectedResult(null);
     setFollowUp("");
-    setImagePasteError(null);
-    setImageAttachments((current) => {
-      revokeSessionImagePreviewsV2(current);
+    setAttachmentError(null);
+    setAttachments((current) => {
+      revokeSessionAttachmentPreviewsV2(current);
       return [];
     });
   }, [task.task_id]);
   const submitFollowUp = async (): Promise<void> => {
     const objective = followUp.trim();
-    if ((!objective && imageAttachments.length === 0) || !canContinue || busy || submittingFollowUp) return;
-    const taskWithImages = withSessionImageReferencesV2({
+    if ((!objective && attachments.length === 0) || !canContinue || busy || submittingFollowUp) return;
+    const taskWithAttachments = withSessionAttachmentReferencesV2({
       title: "",
       objective,
-    }, imageAttachments);
-    const firstLine = taskWithImages.objective.split(/\r?\n/, 1)[0]!.trim();
+    }, attachments);
+    const firstLine = taskWithAttachments.objective.split(/\r?\n/, 1)[0]!.trim();
     const title = (firstLine || "Follow-up research task").slice(0, 256);
     setSubmittingFollowUp(true);
     try {
-      if (await onContinue({ title, objective: taskWithImages.objective }, imageAttachments)) {
+      if (await onContinue({ title, objective: taskWithAttachments.objective }, attachments)) {
         setFollowUp("");
-        revokeSessionImagePreviewsV2(imageAttachments);
-        setImageAttachments([]);
-        setImagePasteError(null);
+        revokeSessionAttachmentPreviewsV2(attachments);
+        setAttachments([]);
+        setAttachmentError(null);
       }
     } finally {
       setSubmittingFollowUp(false);
+    }
+  };
+  const addSessionFiles = (files: readonly File[], imagesOnly: boolean): void => {
+    if (!sessionAttachmentUploadAvailable) {
+      setAttachmentError("This backend does not support Session attachments.");
+      return;
+    }
+    try {
+      setAttachments(addSessionAttachmentsV2(attachments, files, imagesOnly));
+      setAttachmentError(null);
+    } catch (error) {
+      setAttachmentError(userMessageV2(error));
     }
   };
   const pasteSessionImages = (event: ReactClipboardEvent<HTMLTextAreaElement>): void => {
     const pastedFiles = [...event.clipboardData.files].filter((file) => file.type.startsWith("image/"));
     if (pastedFiles.length === 0) return;
     event.preventDefault();
-    if (!sessionImageUploadAvailable) {
-      setImagePasteError("This backend does not support pasted image uploads.");
-      return;
-    }
-    try {
-      setImageAttachments(addPastedSessionImagesV2(imageAttachments, pastedFiles));
-      setImagePasteError(null);
-    } catch (error) {
-      setImagePasteError(userMessageV2(error));
-    }
+    addSessionFiles(pastedFiles, true);
   };
-  const removeSessionImage = (id: string): void => {
-    setImageAttachments((current) => current.filter((attachment) => {
+  const removeSessionAttachment = (id: string): void => {
+    setAttachments((current) => current.filter((attachment) => {
       if (attachment.id !== id) return true;
-      revokeSessionImagePreviewsV2([attachment]);
+      revokeSessionAttachmentPreviewsV2([attachment]);
       return false;
     }));
-    setImagePasteError(null);
+    setAttachmentError(null);
   };
   const [inspectorWidth, setInspectorWidth] = usePersistedPaneWidth(
     SESSION_INSPECTOR_WIDTH_KEY,
@@ -3307,11 +3390,12 @@ function TaskAuthorityCardV2({
           void submitFollowUp();
         }}
       >
-        {imageAttachments.length > 0 ? (
-          <SessionImageAttachmentsV2 attachments={imageAttachments} disabled={busy || submittingFollowUp} onRemove={removeSessionImage} />
+        {attachments.length > 0 ? (
+          <SessionAttachmentsV2 attachments={attachments} disabled={busy || submittingFollowUp} onRemove={removeSessionAttachment} />
         ) : null}
-        {imagePasteError ? <p className="form-error" role="status">{imagePasteError}</p> : null}
+        {attachmentError ? <p className="form-error" role="status">{attachmentError}</p> : null}
         <div className="session-chat-composer-box">
+          <SessionAttachmentPickerV2 disabled={busy || submittingFollowUp || !canContinue || !sessionAttachmentUploadAvailable} onFiles={addSessionFiles} />
           <textarea
             aria-label="Message for the next Session"
             placeholder={canContinue
@@ -3333,7 +3417,7 @@ function TaskAuthorityCardV2({
           <button
             type="submit"
             aria-label="Start next Session"
-            disabled={(!followUp.trim() && imageAttachments.length === 0) || busy || submittingFollowUp || !canContinue}
+            disabled={(!followUp.trim() && attachments.length === 0) || busy || submittingFollowUp || !canContinue}
           >
             {submittingFollowUp || busy
               ? <LoaderCircle className="spin" size={18} />
@@ -4026,7 +4110,7 @@ function intentFor(snapshot: DesktopProductSnapshotV2, prefix: string): ProductM
 }
 
 let actionSequence = 0;
-let sessionImageSequence = 0;
+let sessionAttachmentSequence = 0;
 function actionIdV2(prefix: string): string {
   actionSequence += 1;
   return `${prefix}-${Date.now().toString(36)}-${actionSequence.toString(36).padStart(8, "0")}`;
@@ -4138,32 +4222,36 @@ function extractRemoteErrorDetailV2(message: string): string | null {
   }
 }
 
-function addPastedSessionImagesV2(
-  current: readonly SessionImageAttachmentV2[],
+function addSessionAttachmentsV2(
+  current: readonly SessionAttachmentV2[],
   files: readonly File[],
-): readonly SessionImageAttachmentV2[] {
-  if (current.length + files.length > SESSION_IMAGE_MAX_COUNT) {
-    throw new Error(`A Session can include up to ${SESSION_IMAGE_MAX_COUNT} pasted images.`);
+  imagesOnly: boolean,
+): readonly SessionAttachmentV2[] {
+  if (current.length + files.length > SESSION_ATTACHMENT_MAX_COUNT) {
+    throw new Error(`A Session can include up to ${SESSION_ATTACHMENT_MAX_COUNT} attachments.`);
   }
   const totalBytes = [...current.map((attachment) => attachment.file.size), ...files.map((file) => file.size)]
     .reduce((total, size) => total + size, 0);
-  if (totalBytes > SESSION_IMAGE_MAX_TOTAL_BYTES) {
-    throw new Error("Pasted images exceed the 64 MiB Session limit.");
+  if (totalBytes > SESSION_ATTACHMENT_MAX_TOTAL_BYTES) {
+    throw new Error("Attachments exceed the 64 MiB Session limit.");
   }
   for (const file of files) {
-    if (SESSION_IMAGE_MEDIA_EXTENSIONS[file.type] === undefined) {
-      throw new Error("Pasted images must be PNG, JPEG, WebP, or GIF files.");
+    if (imagesOnly && SESSION_IMAGE_MEDIA_EXTENSIONS[file.type] === undefined) {
+      throw new Error("Images must be PNG, JPEG, WebP, or GIF files.");
     }
     if (file.size > BROWSER_FOLDER_MAX_FILE_BYTES) {
-      throw new Error("A pasted image exceeds the 32 MiB per-file upload limit.");
+      throw new Error("An attachment exceeds the 32 MiB per-file upload limit.");
     }
   }
-  const additions = files.map((file): SessionImageAttachmentV2 => {
-    const extension = SESSION_IMAGE_MEDIA_EXTENSIONS[file.type]!;
-    sessionImageSequence += 1;
-    const id = `pasted-image-${Date.now().toString(36)}-${sessionImageSequence.toString(36)}`;
+  const additions = files.map((file): SessionAttachmentV2 => {
+    const imageExtension = SESSION_IMAGE_MEDIA_EXTENSIONS[file.type];
+    const fileName = imagesOnly
+      ? `image.${imageExtension!}`
+      : safeSessionAttachmentNameV2(file.name);
+    sessionAttachmentSequence += 1;
+    const id = `attachment-${Date.now().toString(36)}-${sessionAttachmentSequence.toString(36)}`;
     let previewUrl: string | null = null;
-    if (typeof globalThis.URL.createObjectURL === "function") {
+    if (imageExtension !== undefined && typeof globalThis.URL.createObjectURL === "function") {
       try {
         previewUrl = globalThis.URL.createObjectURL(file);
       } catch {
@@ -4174,31 +4262,38 @@ function addPastedSessionImagesV2(
     return {
       id,
       file,
-      path: `session-attachments/${id}.${extension}`,
+      path: `session-attachments/${id}-${fileName}`,
+      kind: imageExtension === undefined ? "file" : "image",
       previewUrl,
     };
   });
   return [...current, ...additions];
 }
 
-function revokeSessionImagePreviewsV2(attachments: readonly SessionImageAttachmentV2[]): void {
+function revokeSessionAttachmentPreviewsV2(attachments: readonly SessionAttachmentV2[]): void {
   if (typeof globalThis.URL.revokeObjectURL !== "function") return;
   for (const attachment of attachments) {
     if (attachment.previewUrl !== null) globalThis.URL.revokeObjectURL(attachment.previewUrl);
   }
 }
 
-function withSessionImageReferencesV2(
+function withSessionAttachmentReferencesV2(
   task: ScienceProjectConfigV2["task"],
-  attachments: readonly SessionImageAttachmentV2[],
+  attachments: readonly SessionAttachmentV2[],
 ): ScienceProjectConfigV2["task"] {
   if (attachments.length === 0) return task;
-  const objective = task.objective.trim() || "Review the attached image evidence.";
+  const objective = task.objective.trim() || "Review the attached files.";
   const references = attachments.map((attachment) => `- ${attachment.path}`).join("\n");
   return {
     title: task.title,
-    objective: `${objective}\n\nAttached images are available in the project workspace:\n${references}`,
+    objective: `${objective}\n\nAttached files are available in the project workspace:\n${references}`,
   };
+}
+
+function safeSessionAttachmentNameV2(value: string): string {
+  const normalized = value.normalize("NFKC").replaceAll("\\", "/").split("/").at(-1) ?? "attachment";
+  const safe = normalized.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 96);
+  return safe && safe !== "." && safe !== ".." ? safe : "attachment";
 }
 
 function browserFolderSelectionV2(files: readonly File[]): BrowserFolderSelectionV2 {

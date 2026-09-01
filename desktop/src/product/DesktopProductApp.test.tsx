@@ -1530,8 +1530,8 @@ describe("Desktop v2 product renderer", () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector('[aria-label="Pasted images"]')).toBeTruthy();
-    expect(document.body.textContent).toContain("Image 1");
+    expect(document.querySelector('[aria-label="Session attachments"]')).toBeTruthy();
+    expect(document.body.textContent).toContain("screenshot.png");
     await click("Start session");
 
     await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
@@ -1541,7 +1541,7 @@ describe("Desktop v2 product renderer", () => {
       mediaType: "image/png",
       overwrite: true,
     });
-    expect(upload.path).toMatch(/^session-attachments\/pasted-image-[a-z0-9-]+\.png$/);
+    expect(upload.path).toMatch(/^session-attachments\/attachment-[a-z0-9-]+-image\.png$/);
     expect(provider.updateProject).toHaveBeenCalledWith(
       "project-1",
       "Protein study",
@@ -1549,6 +1549,52 @@ describe("Desktop v2 product renderer", () => {
         task: expect.objectContaining({
           objective: expect.stringContaining(upload.path),
         }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it("opens the attachment menu and uploads a selected file with the Session", async () => {
+    const snapshot = authoritySnapshot();
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      _upload: WorkspaceFileUploadV2,
+    ) => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    const trigger = document.querySelector<HTMLButtonElement>('[aria-label="Add attachment"]')!;
+    await act(async () => trigger.click());
+    const menu = document.querySelector('[role="menu"][aria-label="Add to Session"]');
+    expect(menu?.textContent).toContain("Upload images");
+    expect(menu?.textContent).toContain("Upload files");
+    await click("Upload files");
+
+    const input = document.querySelector<HTMLInputElement>('[aria-label="Choose files for Session"]')!;
+    const report = new File(["finding,value\nanswer,42\n"], "evidence.csv", { type: "text/csv" });
+    Object.defineProperty(input, "files", { configurable: true, value: [report] });
+    await act(async () => {
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      await Promise.resolve();
+    });
+    expect(document.querySelector('[aria-label="Session attachments"]')?.textContent).toContain("evidence.csv");
+
+    setInput("Task title", "Review uploaded evidence");
+    setTextarea("Task instructions", "Summarize the attached table.");
+    await click("Start session");
+
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
+    const upload = uploadWorkspaceFile.mock.calls[0]![1];
+    expect(upload).toMatchObject({ data: report, mediaType: "text/csv", overwrite: true });
+    expect(upload.path).toMatch(/^session-attachments\/attachment-[a-z0-9-]+-evidence\.csv$/);
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      expect.objectContaining({
+        task: expect.objectContaining({ objective: expect.stringContaining(upload.path) }),
       }),
       expect.anything(),
     );
@@ -1865,7 +1911,7 @@ describe("Desktop v2 product renderer", () => {
     });
     setAriaTextarea("Message for the next Session", "Inspect this screenshot for errors.");
 
-    expect(document.querySelector('[aria-label="Pasted images"]')).toBeTruthy();
+    expect(document.querySelector('[aria-label="Session attachments"]')).toBeTruthy();
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Start next Session"]')?.disabled).toBe(false);
     await act(async () => {
       document.querySelector<HTMLButtonElement>('[aria-label="Start next Session"]')!.click();
@@ -1874,7 +1920,7 @@ describe("Desktop v2 product renderer", () => {
 
     await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledTimes(1));
     const upload = uploadWorkspaceFile.mock.calls[0]![1];
-    expect(upload.path).toMatch(/^session-attachments\/pasted-image-[a-z0-9-]+\.png$/);
+    expect(upload.path).toMatch(/^session-attachments\/attachment-[a-z0-9-]+-image\.png$/);
     await vi.waitFor(() => expect(provider.updateProject).toHaveBeenCalledWith(
       "project-1",
       "Protein study",
