@@ -64,6 +64,7 @@ import {
   type DesktopProductSnapshotV2,
   type DevelopmentModelResourceV2,
   type ProductMutationIntentV2,
+  type WorkspaceFileDownloadV2,
 } from "./providerV2";
 
 type Workspace = "research" | "evolution";
@@ -143,6 +144,15 @@ const SESSION_PANE_WIDTH_KEY = "openevo.desktop.layout.session-pane-width";
 const SESSION_INSPECTOR_WIDTH_KEY = "openevo.desktop.layout.session-inspector-width-v2";
 const PROJECT_SESSION_SCROLLS_KEY = "openevo.desktop.navigation.project-session-scrolls";
 const WORKSPACE_UPLOAD_MINIMUM_VISIBLE_MS = 1_400;
+const WORKSPACE_IMAGE_PREVIEW_MAX_BYTES = 16 * 1024 * 1024;
+const WORKSPACE_IMAGE_PREVIEW_MEDIA_TYPES = new Set([
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
 const BROWSER_FOLDER_SNAPSHOT_FEATURE = "browser_folder_snapshot";
 const BROWSER_FOLDER_MAX_FILES = 1_000;
 const BROWSER_FOLDER_MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -445,6 +455,13 @@ export function DesktopProductApp({
     refreshInFlight.current = worker;
     return worker;
   }, [onInitialSnapshotFailed, onReady, provider]);
+
+  const loadWorkspaceFile = useCallback((projectId: string, path: string) => {
+    if (!provider.downloadWorkspaceFile) {
+      return Promise.reject(new Error("This backend does not support workspace downloads."));
+    }
+    return provider.downloadWorkspaceFile(projectId, path);
+  }, [provider]);
 
   useEffect(() => {
     void refresh();
@@ -1041,6 +1058,7 @@ export function DesktopProductApp({
               entry={selectedWorkspaceEntry}
               fileTransferAvailable={provider.downloadWorkspaceFile !== undefined}
               busy={busy || switchingProjectId !== null}
+              loadWorkspaceFile={loadWorkspaceFile}
               onBack={() => {
                 setSelectedWorkspacePath(null);
                 setSelectedTaskId(null);
@@ -2662,11 +2680,25 @@ function SessionExplorerV2({
   );
 }
 
+function workspaceImagePreviewAvailableV2(
+  entry: ProjectWorkspacePresentationV2["entries"][number],
+): boolean {
+  return entry.kind === "file"
+    && entry.mediaType !== null
+    && WORKSPACE_IMAGE_PREVIEW_MEDIA_TYPES.has(entry.mediaType.toLocaleLowerCase().split(";", 1)[0]!);
+}
+
+type WorkspaceImagePreviewV2 =
+  | { readonly path: string; readonly status: "loading" }
+  | { readonly path: string; readonly status: "ready"; readonly url: string }
+  | { readonly path: string; readonly status: "error"; readonly message: string };
+
 function ProjectFileWorkspaceV2({
   project,
   entry,
   fileTransferAvailable,
   busy,
+  loadWorkspaceFile,
   onBack,
   onDownload,
 }: {
@@ -2674,9 +2706,43 @@ function ProjectFileWorkspaceV2({
   readonly entry: ProjectWorkspacePresentationV2["entries"][number];
   readonly fileTransferAvailable: boolean;
   readonly busy: boolean;
+  readonly loadWorkspaceFile: (projectId: string, path: string) => Promise<WorkspaceFileDownloadV2>;
   readonly onBack: () => void;
   readonly onDownload: () => void;
 }) {
+  const imagePreviewAvailable = workspaceImagePreviewAvailableV2(entry);
+  const imagePreviewWithinLimit = entry.byteSize <= WORKSPACE_IMAGE_PREVIEW_MAX_BYTES;
+  const [imagePreview, setImagePreview] = useState<WorkspaceImagePreviewV2 | null>(null);
+  useEffect(() => {
+    if (!imagePreviewAvailable || !imagePreviewWithinLimit) {
+      setImagePreview(null);
+      return undefined;
+    }
+    let retained = true;
+    let objectUrl: string | null = null;
+    setImagePreview({ path: entry.path, status: "loading" });
+    void loadWorkspaceFile(project.project_id, entry.path).then((download) => {
+      if (!retained) return;
+      const mediaType = (download.data.type || download.mediaType).toLocaleLowerCase().split(";", 1)[0]!;
+      if (!WORKSPACE_IMAGE_PREVIEW_MEDIA_TYPES.has(mediaType)) {
+        throw new Error("The downloaded file is not a supported browser image.");
+      }
+      if (typeof globalThis.URL.createObjectURL !== "function") {
+        throw new Error("This browser cannot create a local image preview.");
+      }
+      objectUrl = globalThis.URL.createObjectURL(download.data);
+      setImagePreview({ path: entry.path, status: "ready", url: objectUrl });
+    }).catch((error: unknown) => {
+      if (retained) setImagePreview({ path: entry.path, status: "error", message: userMessageV2(error) });
+    });
+    return () => {
+      retained = false;
+      if (objectUrl !== null && typeof globalThis.URL.revokeObjectURL === "function") {
+        globalThis.URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [entry.byteSize, entry.contentSha256, entry.path, imagePreviewAvailable, imagePreviewWithinLimit, loadWorkspaceFile, project.project_id]);
+  const activeImagePreview = imagePreview?.path === entry.path ? imagePreview : null;
   return (
     <div className="workspace-stack project-file-workspace" data-testid="project-file-workspace">
       <div className="session-detail-navigation">
@@ -2685,7 +2751,15 @@ function ProjectFileWorkspaceV2({
         </button>
       </div>
       <div className="workspace-heading"><div><p className="eyebrow">{project.display_name} / File</p><h1>{entry.path}</h1><p>{entry.mediaType ?? "unknown format"} · {formatBytes(entry.byteSize)}</p></div>{fileTransferAvailable ? <button type="button" className="secondary-button" disabled={busy} onClick={onDownload}><Download size={15} /> Download</button> : null}</div>
-      <section className="product-panel project-file-editor"><header><FileText size={16} /><strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header>{entry.content !== null ? <pre>{entry.content}</pre> : <div className="quiet-empty"><FileText size={24} /><p>This file is available to the remote Agent, but its format or size is outside the bounded browser preview.</p></div>}</section>
+      <section className={`product-panel project-file-editor${imagePreviewAvailable ? " image" : ""}`}><header>{imagePreviewAvailable ? <ImageIcon size={16} /> : <FileText size={16} />}<strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header>{imagePreviewAvailable ? (
+        !imagePreviewWithinLimit
+          ? <div className="quiet-empty"><ImageIcon size={24} /><p>This image is larger than the {formatBytes(WORKSPACE_IMAGE_PREVIEW_MAX_BYTES)} browser preview limit. Download it to view the original.</p></div>
+          : activeImagePreview?.status === "ready"
+            ? <figure className="workspace-image-preview"><img src={activeImagePreview.url} alt={`Preview of ${entry.path}`} onError={() => setImagePreview({ path: entry.path, status: "error", message: "The browser could not decode this image." })} /><figcaption>{entry.path} · {formatBytes(entry.byteSize)}</figcaption></figure>
+            : activeImagePreview?.status === "error"
+              ? <div className="quiet-empty"><AlertCircle size={24} /><p>Image preview could not be loaded. {activeImagePreview.message}</p></div>
+              : <div className="workspace-image-loading" role="status"><LoaderCircle className="spin" size={22} /><span>Loading image preview…</span></div>
+      ) : entry.content !== null ? <pre>{entry.content}</pre> : <div className="quiet-empty"><FileText size={24} /><p>This file is available to the remote Agent, but its format or size is outside the bounded browser preview.</p></div>}</section>
     </div>
   );
 }

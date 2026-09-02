@@ -861,6 +861,57 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".session-explorer")).toBeTruthy();
   });
 
+  it("loads supported workspace images on demand and releases their browser URL", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        workspaces: {
+          "project-1": {
+            entries: [{
+              path: "session-attachments/microscope.png",
+              kind: "file",
+              byteSize: 4,
+              contentSha256: DIGEST,
+              mediaType: "image/png",
+              content: null,
+              modifiedAt: NOW,
+            }],
+            truncated: false,
+          },
+        },
+      },
+    };
+    const image = new Blob([new Uint8Array([137, 80, 78, 71])], { type: "image/png" });
+    const downloadWorkspaceFile = vi.fn(async () => ({
+      fileName: "microscope.png",
+      mediaType: "image/png",
+      data: image,
+    }));
+    const createObjectURL = vi.fn(() => "blob:workspace-image-preview");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", Object.assign(class extends globalThis.URL {}, {
+      createObjectURL,
+      revokeObjectURL,
+    }));
+    root = await render({
+      ...providerFixture(snapshot),
+      downloadWorkspaceFile,
+    });
+
+    await click("microscope.png");
+    await vi.waitFor(() => expect(document.querySelector<HTMLImageElement>('[alt="Preview of session-attachments/microscope.png"]')?.src).toBe("blob:workspace-image-preview"));
+    expect(downloadWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      "session-attachments/microscope.png",
+    );
+    expect(createObjectURL).toHaveBeenCalledWith(image);
+
+    await act(async () => document.querySelector<HTMLButtonElement>(".session-back-button")?.click());
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-preview");
+  });
+
   it("offers confirmed deletion actions for Projects, terminal Sessions, and workspace files", async () => {
     const base = authoritySnapshot();
     const snapshot: DesktopProductSnapshotV2 = {
