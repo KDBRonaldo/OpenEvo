@@ -2814,7 +2814,7 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
-  it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {
+  it("keeps Core-owned background operations out of the ordinary workspace", async () => {
     const operation: OperationV2 = {
       schema_version: "2",
       operation_id: "core-service-restart-1",
@@ -2827,134 +2827,17 @@ describe("Desktop v2 product renderer", () => {
       updated_at: NOW,
       etag: ETAG,
     };
-    const cancelCoreOperation = vi.fn(async () => ({
-      ...operation,
-      status: "cancelled" as const,
-      updated_at: "2026-07-23T06:00:01Z",
-    }));
     const provider = {
       ...providerFixture(authoritySnapshot()),
       listCoreOperations: () => [operation],
-      cancelCoreOperation,
     } satisfies DesktopProductProviderV2;
 
     root = await render(provider);
 
-    expect(document.body.textContent).toContain("Restart remote service");
-    expect(document.body.textContent).toContain("Core status: running");
-    expect(document.body.textContent).toContain("2 of 4 items");
-    await click("Cancel operation");
-    expect(cancelCoreOperation).toHaveBeenCalledWith(
-      operation.operation_id,
-      expect.objectContaining({ streamEpoch: 1 }),
-    );
-  });
-
-  it("offers reconciliation for a reserved lifecycle cancellation", async () => {
-    const operation = {
-      schema_version: "2" as const,
-      operation_id: "lifecycle-cancel-ambiguous-1",
-      kind: "profile_connect" as const,
-      resource: {
-        resource_kind: "profile" as const,
-        resource_id: "profile-gpu",
-      },
-      request_sha256: DIGEST,
-      status: "running" as const,
-      phase: "connecting" as const,
-      phase_index: 3,
-      phase_total: 17,
-      progress: { kind: "indeterminate" as const },
-      cancellable: false,
-      result: null,
-      failure: null,
-      log_sequence_high_watermark: 0,
-      created_at: NOW,
-      started_at: NOW,
-      updated_at: NOW,
-      finished_at: null,
-      etag: ETAG,
-    };
-    const resumeMutationIntent = vi.fn(async () => {});
-    const provider = {
-      ...providerFixture(baseSnapshot()),
-      listLifecycleOperations: () => [
-        {
-          operation,
-          logs: [],
-          droppedBeforeSequence: 0,
-          hasOlderLogs: false,
-          hasNewerLogs: false,
-        },
-      ],
-      listMutationIntents: () => [
-        {
-          action_id: "connect-lifecycle-original-ui-0001",
-          mutation_kind: "profile_connect" as const,
-          resource_scope: "profile:profile-gpu",
-          request_sha256: DIGEST,
-          authority_sha256: DIGEST,
-          provider_stream_instance: "provider-instance-test",
-          provider_stream_epoch: 1,
-          chain_step: "single" as const,
-          accepted_operation_id: operation.operation_id,
-          completed_operation_ids: [],
-          state: "accepted" as const,
-          created_at: NOW,
-          updated_at: NOW,
-        },
-        {
-          action_id: "cancel-lifecycle-ambiguous-ui-0001",
-          mutation_kind: "lifecycle_cancel" as const,
-          resource_scope: `lifecycle_operation:${operation.operation_id}`,
-          request_sha256: DIGEST,
-          authority_sha256: DIGEST,
-          provider_stream_instance: "provider-instance-test",
-          provider_stream_epoch: 1,
-          chain_step: "single" as const,
-          accepted_operation_id: null,
-          completed_operation_ids: [],
-          state: "reserved" as const,
-          created_at: NOW,
-          updated_at: NOW,
-        },
-      ],
-      resumeMutationIntent,
-    } satisfies DesktopProductProviderV2;
-
-    root = await render(provider);
-
-    await click("Resume / reconcile");
-    expect(resumeMutationIntent).toHaveBeenCalledWith(
-      "cancel-lifecycle-ambiguous-ui-0001",
-    );
-  });
-
-  it("keeps existing diagnostics observable without a System workspace", async () => {
-    const snapshot = authoritySnapshot();
-    const diagnostic = {
-      schema_version: "2" as const,
-      diagnostic_id: "diagnostic-system-1",
-      scope: "system" as const,
-      resource_id: null,
-      status: "running" as const,
-      artifact_id: null,
-      created_at: NOW,
-      updated_at: NOW,
-      etag: ETAG,
-    };
-    const provider = {
-      ...providerFixture(snapshot),
-      listDiagnostics: () => [diagnostic],
-    } satisfies DesktopProductProviderV2;
-
-    root = await render(provider);
-
-    expect(
-      [...document.querySelectorAll<HTMLButtonElement>(".product-nav-item")]
-        .map((candidate) => candidate.textContent?.trim()),
-    ).toEqual(["Research", "Evolution"]);
-    expect(document.body.textContent).toContain("Diagnostic status: running");
+    expect(document.querySelector('[aria-label="Active operations"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Operation progress");
+    expect(document.body.textContent).not.toContain("Restart remote service");
+    expect(document.body.textContent).not.toContain("Process log");
   });
 
   it("only offers the supported Codex Subscription execution profile", async () => {
@@ -3093,7 +2976,7 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
-  it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
+  it("closes project setup after HTTP 202 while work continues silently", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));
     const connected = systemProfile({
@@ -3207,20 +3090,20 @@ describe("Desktop v2 product renderer", () => {
     await act(async () => vi.advanceTimersByTime(16_000));
 
     expect(createProject).toHaveBeenCalledTimes(1);
-    expect(document.body.textContent).toContain(
+    expect(document.body.textContent).not.toContain(
       "Creating or loading the remote project",
     );
-    expect(document.body.textContent).toContain(
+    expect(document.body.textContent).not.toContain(
       "Remote project request accepted",
     );
-    expect(document.body.textContent).toContain(
+    expect(document.body.textContent).not.toContain(
       "Materializing workspace snapshot",
     );
-    expect(document.body.textContent).toContain("Elapsed 16s");
+    expect(document.body.textContent).not.toContain("Elapsed 16s");
     expect(document.body.textContent).not.toContain(
       "Desktop Local API request timed out",
     );
-    expect(document.body.textContent).not.toContain("Project creation started");
+    expect(document.querySelector('[aria-label="Active operations"]')).toBeNull();
     expect(
       Array.from(document.querySelectorAll("button")).some(
         (candidate) => candidate.textContent?.trim() === "Create project",

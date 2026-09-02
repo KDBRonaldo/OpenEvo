@@ -9936,45 +9936,6 @@ pre.json {
   box-shadow: 0 8px 28px rgb(25 43 34 / 7%);
 }
 
-.v2-global-operations {
-  position: fixed;
-  z-index: 70;
-  right: 18px;
-  bottom: 18px;
-  display: grid;
-  width: min(440px, calc(100vw - 36px));
-  max-height: min(720px, calc(100vh - 36px));
-  overflow: hidden;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: var(--surface-soft);
-  box-shadow: 0 22px 70px rgb(20 28 23 / 24%);
-}
-
-.v2-global-operations-heading {
-  display: grid;
-  gap: 2px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface);
-}
-
-.v2-global-operations-heading strong {
-  font-size: 11px;
-}
-
-.v2-global-operations-heading span {
-  color: var(--muted);
-  font-size: 9px;
-}
-
-.v2-global-operation-list {
-  display: grid;
-  gap: 10px;
-  padding: 10px;
-  overflow: auto;
-}
-
 .lifecycle-operation-panel.status-succeeded {
   border-left-color: var(--accent);
 }
@@ -10269,10 +10230,4 @@ pre.json {
     grid-column: 3;
   }
 
-  .v2-global-operations {
-    right: 10px;
-    bottom: 10px;
-    width: calc(100vw - 20px);
-    max-height: calc(100vh - 20px);
-  }
 }

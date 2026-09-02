@@ -56,12 +56,6 @@ import type {
   TaskV2,
 } from "../api/v2/schemas";
 import {
-  LifecycleOperationPanelV2,
-  coreOperationPanelModelV2,
-  diagnosticPanelModelV2,
-  lifecycleOperationPanelModelV2,
-} from "./LifecycleOperationPanelV2";
-import {
   unavailableDesktopProductProviderV2,
   withoutProjectV2,
   withoutTaskV2,
@@ -569,11 +563,6 @@ export function DesktopProductApp({
   const selectedWorkspaceEntry = displayedWorkspace?.entries.find(
     (entry) => entry.kind === "file" && entry.path === selectedWorkspacePath,
   ) ?? null;
-  const lifecycleStates = provider.listLifecycleOperations();
-  const coreOperations = provider.listCoreOperations();
-  const diagnostics = provider.listDiagnostics();
-  const mutationIntents = provider.listMutationIntents();
-  const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
   const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
   const developmentEvolutionActive = developmentAgentBridge && evolutionIsActiveV2(snapshot);
   const sessionEvolutionAvailable = !developmentAgentBridge && (
@@ -1150,81 +1139,6 @@ export function DesktopProductApp({
         </main>
       </div>
 
-      {visibleOperationCount > 0 ? (
-        <aside className="v2-global-operations" aria-label="Active operations">
-          <div className="v2-global-operations-heading">
-            <strong>{visibleOperationCount} operation{visibleOperationCount === 1 ? "" : "s"}</strong>
-            <span>Work continues safely if this panel or Desktop is closed.</span>
-          </div>
-          <div className="v2-global-operation-list">
-            {lifecycleStates.map((state) => {
-              const cancellationIntent = mutationIntents.find((candidate) => candidate.state === "reserved"
-                && candidate.mutation_kind === "lifecycle_cancel"
-                && candidate.resource_scope === `lifecycle_operation:${state.operation.operation_id}`);
-              const intent = cancellationIntent ?? mutationIntents.find(
-                (candidate) => candidate.accepted_operation_id === state.operation.operation_id
-                  || candidate.completed_operation_ids.includes(state.operation.operation_id),
-              );
-              return (
-                <LifecycleOperationPanelV2
-                  key={state.operation.operation_id}
-                  model={lifecycleOperationPanelModelV2(state, undefined, { unresolvedMutation: intent !== undefined })}
-                  onCancel={state.operation.cancellable ? () => act(
-                    () => provider.cancelLifecycleOperation(
-                      state.operation.operation_id,
-                      intentFor(snapshot, "cancel-lifecycle"),
-                    ),
-                    "Lifecycle cancellation requested.",
-                  ).then(() => undefined) : undefined}
-                  onLoadOlder={() => provider.loadOlderLifecycleLogs(state.operation.operation_id).then(() => {
-                    setSnapshot((current) => current === null ? null : { ...current });
-                  })}
-                  onLoadLatest={() => provider.loadLatestLifecycleLogs(state.operation.operation_id).then(() => {
-                    setSnapshot((current) => current === null ? null : { ...current });
-                  })}
-                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
-                />
-              );
-            })}
-            {coreOperations.map((operation) => {
-              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === operation.operation_id
-                || candidate.completed_operation_ids.includes(operation.operation_id));
-              return (
-                <LifecycleOperationPanelV2
-                  key={operation.operation_id}
-                  model={{
-                    ...coreOperationPanelModelV2(operation),
-                    unresolvedMutation: intent !== undefined,
-                  }}
-                  onCancel={["queued", "running"].includes(operation.status) ? () => act(
-                    () => provider.cancelCoreOperation(
-                      operation.operation_id,
-                      intentFor(snapshot, "cancel-core-operation"),
-                    ),
-                    "Core operation cancellation requested.",
-                  ).then(() => undefined) : undefined}
-                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
-                />
-              );
-            })}
-            {diagnostics.map((diagnostic) => {
-              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === diagnostic.diagnostic_id
-                || candidate.completed_operation_ids.includes(diagnostic.diagnostic_id));
-              return (
-                <LifecycleOperationPanelV2
-                  key={diagnostic.diagnostic_id}
-                  model={{
-                    ...diagnosticPanelModelV2(diagnostic),
-                    unresolvedMutation: intent !== undefined,
-                  }}
-                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
-                />
-              );
-            })}
-          </div>
-        </aside>
-      ) : null}
-
       {connectionOpen ? (
         <RemoteWorkspaceSetupV2
           snapshot={snapshot}
@@ -1260,7 +1174,7 @@ export function DesktopProductApp({
             setProjectEditing(false);
             setActionStatus(developmentAgentBridge
               ? "Project created in local development state. Start a session to call the remote Codex CLI."
-              : "Project creation started. Progress and process logs remain available in Operations.");
+              : "Project creation started. It will continue in the background.");
           }}
           onError={(error) => setActionError(userMessageV2(error))}
         />
