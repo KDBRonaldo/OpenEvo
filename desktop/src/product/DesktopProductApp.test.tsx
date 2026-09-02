@@ -960,7 +960,10 @@ describe("Desktop v2 product renderer", () => {
   });
 
   it("uploads a selected folder while preserving its relative file paths", async () => {
-    const uploadWorkspaceFile = vi.fn(async () => undefined);
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      _upload: WorkspaceFileUploadV2,
+    ) => undefined);
     const provider = {
       ...providerFixture(authoritySnapshot()),
       uploadWorkspaceFile,
@@ -1007,6 +1010,127 @@ describe("Desktop v2 product renderer", () => {
       expect.objectContaining({ path: "research/docs/notes.md", data: markdownFile, overwrite: false }),
       expect.anything(),
     );
+  });
+
+  it("provides VS Code-style workspace tree controls for create, refresh, collapse, and keyboard expansion", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        workspaces: {
+          "project-1": {
+            entries: [
+              {
+                path: "results",
+                kind: "directory",
+                byteSize: 0,
+                contentSha256: null,
+                mediaType: null,
+                content: null,
+                modifiedAt: NOW,
+              },
+              {
+                path: "results/report.md",
+                kind: "file",
+                byteSize: 8,
+                contentSha256: DIGEST,
+                mediaType: "text/markdown",
+                content: "# Report",
+                modifiedAt: NOW,
+              },
+            ],
+            truncated: false,
+          },
+        },
+      },
+    };
+    const uploadWorkspaceFile = vi.fn(async (
+      _projectId: string,
+      _upload: WorkspaceFileUploadV2,
+    ) => undefined);
+    const provider = {
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+      downloadWorkspaceFile: vi.fn(async () => ({ fileName: "unused", mediaType: "text/plain", data: new Blob() })),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+    const clickExplorerAction = async (label: string): Promise<void> => {
+      const action = document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+      if (!action) throw new Error(`explorer action not found: ${label}`);
+      await act(async () => action.click());
+    };
+
+    const initialRefreshes = provider.refresh.mock.calls.length;
+    await clickExplorerAction("Refresh workspace files");
+    await vi.waitFor(() => expect(provider.refresh).toHaveBeenCalledTimes(initialRefreshes + 1));
+
+    await clickExplorerAction("Collapse all folders");
+    const results = document.querySelector<HTMLButtonElement>('[role="treeitem"][title="results"]')!;
+    expect(results.getAttribute("aria-expanded")).toBe("false");
+    expect(document.querySelector('[role="treeitem"][title="results/report.md"]')).toBeNull();
+    await act(async () => results.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true })));
+    expect(results.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector('[role="treeitem"][title="results/report.md"]')).toBeTruthy();
+
+    await clickExplorerAction("New workspace file");
+    const newFilePath = document.querySelector<HTMLInputElement>('[aria-label="New workspace file path"]')!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(newFilePath, "notes/todo.md");
+      newFilePath.dispatchEvent(new Event("input", { bubbles: true }));
+      newFilePath.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click("Create");
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ path: "notes/todo.md", overwrite: false }),
+      expect.anything(),
+    ));
+    const uploaded = uploadWorkspaceFile.mock.calls.at(-1)?.[1];
+    expect(uploaded?.data.size).toBe(0);
+  });
+
+  it("uploads dropped files into the targeted remote workspace folder", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        workspaces: {
+          "project-1": {
+            entries: [{
+              path: "datasets",
+              kind: "directory",
+              byteSize: 0,
+              contentSha256: null,
+              mediaType: null,
+              content: null,
+              modifiedAt: NOW,
+            }],
+            truncated: false,
+          },
+        },
+      },
+    };
+    const uploadWorkspaceFile = vi.fn(async () => undefined);
+    root = await render({
+      ...providerFixture(snapshot),
+      uploadWorkspaceFile,
+      downloadWorkspaceFile: vi.fn(async () => ({ fileName: "unused", mediaType: "text/plain", data: new Blob() })),
+    });
+    const target = document.querySelector<HTMLButtonElement>('[role="treeitem"][title="datasets"]')!;
+    const file = new File(["value\n"], "sample.csv", { type: "text/csv" });
+    const drop = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", { value: { files: [file] } });
+    await act(async () => {
+      target.dispatchEvent(drop);
+      await Promise.resolve();
+    });
+    await vi.waitFor(() => expect(uploadWorkspaceFile).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ path: "datasets/sample.csv", data: file, overwrite: false }),
+      expect.anything(),
+    ));
   });
 
   it("shows a selected file in the Workspace tree with live upload progress", async () => {

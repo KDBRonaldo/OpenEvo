@@ -2251,7 +2251,7 @@ pre.json {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 2px;
+  gap: 0;
 }
 
 .explorer-upload-menu {
@@ -2261,7 +2261,7 @@ pre.json {
 
 .explorer-files-actions button {
   display: inline-flex;
-  width: 30px;
+  width: 27px;
   height: 30px;
   align-items: center;
   justify-content: center;
@@ -2270,6 +2270,43 @@ pre.json {
   color: #65716a;
   background: transparent;
   cursor: pointer;
+}
+
+.explorer-new-file-icon {
+  position: relative;
+  display: inline-flex;
+}
+
+.explorer-new-file-icon > svg:last-child {
+  position: absolute;
+  right: -5px;
+  bottom: -3px;
+  padding: 1px;
+  border-radius: 50%;
+  stroke-width: 3;
+  background: #fff;
+}
+
+.explorer-collapse-icon {
+  position: relative;
+  display: inline-flex;
+  width: 16px;
+  height: 17px;
+  align-items: center;
+  justify-content: center;
+  transform: rotate(-90deg);
+}
+
+.explorer-collapse-icon > svg {
+  position: absolute;
+}
+
+.explorer-collapse-icon > svg:first-child {
+  transform: translateX(-3px);
+}
+
+.explorer-collapse-icon > svg:last-child {
+  transform: translateX(3px);
 }
 
 .explorer-files-actions button:hover,
@@ -2352,6 +2389,46 @@ pre.json {
   cursor: pointer;
 }
 
+.explorer-new-file {
+  display: grid;
+  height: 35px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 8px 2px;
+  padding: 0 5px 0 8px;
+  border: 1px solid #91b9aa;
+  border-radius: 7px;
+  color: var(--accent);
+  background: #fff;
+  box-shadow: 0 0 0 2px rgba(23, 107, 90, .08);
+}
+
+.explorer-new-file input {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font-size: 11px;
+}
+
+.explorer-new-file button {
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  color: #fff;
+  background: var(--accent);
+  font-size: 9px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.explorer-new-file button:disabled {
+  opacity: .45;
+  cursor: default;
+}
+
 .explorer-file-tree,
 .session-explorer-list {
   min-height: 0;
@@ -2362,10 +2439,28 @@ pre.json {
 }
 
 .explorer-file-tree {
+  position: relative;
   padding: 8px 7px 14px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe WPC", "Segoe UI", "Microsoft YaHei UI", sans-serif;
   font-feature-settings: "liga" 0;
   text-rendering: optimizeLegibility;
+}
+
+.explorer-file-tree.root-drop-target::after {
+  position: absolute;
+  z-index: 5;
+  inset: 4px;
+  border: 2px dashed #76a995;
+  border-radius: 8px;
+  background: rgba(232, 241, 236, .48);
+  content: "Drop into workspace";
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #2d735f;
+  font-size: 11px;
+  font-weight: 650;
+  pointer-events: none;
 }
 
 .explorer-tree-node {
@@ -2400,6 +2495,12 @@ pre.json {
   color: #173d34;
   background: #e8efeb;
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.explorer-tree-node > button.drop-target {
+  color: #174f43;
+  background: #dfeee7;
+  box-shadow: inset 0 0 0 1px #77aa96;
 }
 
 .explorer-tree-node > button.unavailable {

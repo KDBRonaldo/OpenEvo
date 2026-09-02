@@ -983,6 +983,7 @@ export function DesktopProductApp({
         onSelectFile={(path) => { setWorkspace("research"); setSelectedTaskId(null); setSelectedWorkspacePath(path); }}
         onDeleteFile={deleteWorkspaceFile}
         onUpload={uploadWorkspaceFiles}
+        onRefresh={() => { void refresh(); }}
         generation={generation}
         paneWidth={projectPaneWidth}
         onResizePane={setProjectPaneWidth}
@@ -2014,6 +2015,16 @@ function filterProjectFileTreeV2(
   });
 }
 
+function projectFileTreePathsV2(
+  nodes: readonly ProjectFileTreeNodeV2[],
+  kind: ProjectFileTreeNodeV2["kind"],
+): string[] {
+  return nodes.flatMap((node) => [
+    ...(node.kind === kind ? [node.path] : []),
+    ...projectFileTreePathsV2(node.children, kind),
+  ]);
+}
+
 type ProjectFileVisualV2 = {
   kind: string;
   label: string | null;
@@ -2235,6 +2246,7 @@ function ProjectExplorerV2({
   onSelectFile,
   onDeleteFile,
   onUpload,
+  onRefresh,
   generation,
   paneWidth,
   onResizePane,
@@ -2255,6 +2267,7 @@ function ProjectExplorerV2({
   readonly onSelectFile: (path: string) => void;
   readonly onDeleteFile: (path: string) => void;
   readonly onUpload: (uploads: readonly BrowserWorkspaceUploadV2[], overwrite: boolean) => void;
+  readonly onRefresh: () => void;
   readonly generation: number;
   readonly paneWidth: number;
   readonly onResizePane: (width: number) => void;
@@ -2266,9 +2279,14 @@ function ProjectExplorerV2({
   const [fileQuery, setFileQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [uploadMenuOpen, setUploadMenuOpen] = useState(false);
+  const [creatingFile, setCreatingFile] = useState(false);
+  const [newFilePath, setNewFilePath] = useState("");
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
   const folderUploadInputRef = useRef<HTMLInputElement>(null);
   const uploadMenuRef = useRef<HTMLDivElement>(null);
+  const treeRef = useRef<HTMLDivElement>(null);
+  const newFileInputRef = useRef<HTMLInputElement>(null);
   const fileTree = useMemo(() => buildProjectFileTreeV2(entries, uploads), [entries, uploads]);
   const normalizedFileQuery = fileQuery.trim().toLocaleLowerCase();
   const visibleFileTree = useMemo(
@@ -2280,7 +2298,13 @@ function ProjectExplorerV2({
     setFileQuery("");
     setSearchOpen(false);
     setUploadMenuOpen(false);
+    setCreatingFile(false);
+    setNewFilePath("");
+    setDropTargetPath(null);
   }, [activeProject?.project_id]);
+  useEffect(() => {
+    if (creatingFile) newFileInputRef.current?.focus();
+  }, [creatingFile]);
   useEffect(() => {
     folderUploadInputRef.current?.setAttribute("webkitdirectory", "");
     folderUploadInputRef.current?.setAttribute("directory", "");
@@ -2300,17 +2324,42 @@ function ProjectExplorerV2({
       globalThis.document.removeEventListener("keydown", closeOnEscape);
     };
   }, [uploadMenuOpen]);
-  const submitUploadSelection = (selectedFiles: readonly File[], preserveHierarchy: boolean): void => {
+  const submitUploadSelection = (
+    selectedFiles: readonly File[],
+    preserveHierarchy: boolean,
+    targetDirectory = "",
+  ): void => {
     const uploads = selectedFiles.map((file) => {
       const browserPath = preserveHierarchy && file.webkitRelativePath ? file.webkitRelativePath : file.name;
-      const path = browserPath.replaceAll("\\", "/").split("/").filter((part) => part !== "" && part !== ".").join("/");
+      const normalizedBrowserPath = browserPath.replaceAll("\\", "/").split("/").filter((part) => part !== "" && part !== ".").join("/");
+      const path = [targetDirectory, normalizedBrowserPath].filter(Boolean).join("/");
       return { file, path };
-    }).filter((upload) => upload.path !== "");
+    }).filter((upload) => upload.path !== "" && !upload.path.split("/").includes(".."));
     if (uploads.length === 0) return;
     const existingPaths = new Set(files.map((file) => file.path));
     const collisionCount = uploads.filter((upload) => existingPaths.has(upload.path)).length;
     if (collisionCount > 0 && !globalThis.confirm(`${collisionCount} selected workspace ${collisionCount === 1 ? "file already exists" : "files already exist"}. Replace ${collisionCount === 1 ? "it" : "them"}?`)) return;
     onUpload(uploads, collisionCount > 0);
+  };
+  const createEmptyFile = (): void => {
+    const path = newFilePath.replaceAll("\\", "/").split("/").filter((part) => part !== "" && part !== ".").join("/");
+    if (path === "" || path.split("/").includes("..")) return;
+    const collision = files.some((file) => file.path === path);
+    if (collision && !globalThis.confirm(`${path} already exists. Replace it with an empty file?`)) return;
+    const name = path.split("/").at(-1) ?? "untitled.txt";
+    onUpload([{ path, file: new File([], name, { type: "text/plain" }) }], collision);
+    setCreatingFile(false);
+    setNewFilePath("");
+  };
+  const focusRelativeTreeItem = (current: HTMLButtonElement, offset: number): void => {
+    const items = [...(treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? [])];
+    const index = items.indexOf(current);
+    items[Math.min(items.length - 1, Math.max(0, index + offset))]?.focus();
+  };
+  const focusTreePath = (path: string): void => {
+    const item = [...(treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? [])]
+      .find((candidate) => candidate.dataset.path === path);
+    item?.focus();
   };
   const renderTreeNodes = (nodes: readonly ProjectFileTreeNodeV2[], level = 1): ReactNode => nodes.map((node) => {
     const directory = node.kind === "directory";
@@ -2339,8 +2388,60 @@ function ProjectExplorerV2({
           aria-expanded={directory ? expanded : undefined}
           aria-disabled={unavailable || upload !== null || undefined}
           aria-busy={uploadPending || undefined}
-          className={`${selected ? "selected" : ""}${unavailable || upload ? " unavailable" : ""}`}
+          className={`${selected ? "selected" : ""}${unavailable || upload ? " unavailable" : ""}${dropTargetPath === node.path ? " drop-target" : ""}`}
           title={upload?.error ? `${node.path}: ${upload.error}` : node.path}
+          data-path={node.path}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              focusRelativeTreeItem(event.currentTarget, 1);
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault();
+              focusRelativeTreeItem(event.currentTarget, -1);
+            } else if (event.key === "Home") {
+              event.preventDefault();
+              treeRef.current?.querySelector<HTMLButtonElement>('[role="treeitem"]')?.focus();
+            } else if (event.key === "End") {
+              event.preventDefault();
+              [...(treeRef.current?.querySelectorAll<HTMLButtonElement>('[role="treeitem"]') ?? [])].at(-1)?.focus();
+            } else if (directory && event.key === "ArrowRight") {
+              event.preventDefault();
+              if (!expanded) {
+                setCollapsedDirectories((current) => {
+                  const next = new Set(current);
+                  next.delete(node.path);
+                  return next;
+                });
+              } else {
+                globalThis.requestAnimationFrame(() => focusTreePath(node.children[0]?.path ?? node.path));
+              }
+            } else if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              if (directory && expanded) {
+                setCollapsedDirectories((current) => new Set(current).add(node.path));
+              } else {
+                const parentPath = node.path.split("/").slice(0, -1).join("/");
+                if (parentPath) focusTreePath(parentPath);
+              }
+            }
+          }}
+          onDragOver={(event) => {
+            if (!directory || !fileTransferAvailable || busy) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setDropTargetPath(node.path);
+          }}
+          onDragLeave={(event) => {
+            if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+            setDropTargetPath((current) => current === node.path ? null : current);
+          }}
+          onDrop={(event) => {
+            if (!directory || !fileTransferAvailable || busy) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setDropTargetPath(null);
+            submitUploadSelection(Array.from(event.dataTransfer.files), false, node.path);
+          }}
           onClick={() => {
             if (directory) {
               setCollapsedDirectories((current) => {
@@ -2422,7 +2523,12 @@ function ProjectExplorerV2({
       </div>
       <div className="explorer-files-header">
         <div className="explorer-files-title"><span className="explorer-files-mark"><FolderTree size={17} /></span><span><strong>Workspace</strong><small>{displayedFileCount} {displayedFileCount === 1 ? "file" : "files"}</small></span></div>
-        <div className="explorer-files-actions"><button type="button" className={searchOpen ? "active" : ""} aria-label="Search files" title="Search files" aria-pressed={searchOpen} onClick={() => { setSearchOpen((current) => !current); if (searchOpen) setFileQuery(""); }}><Search size={15} /></button>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
+        <div className="explorer-files-actions">
+          {fileTransferAvailable ? <button type="button" aria-label="New workspace file" title="New file" disabled={busy || activeProject === null} onClick={() => { setCreatingFile(true); setNewFilePath(""); }}><span className="explorer-new-file-icon"><FileText size={15} /><Plus size={9} /></span></button> : null}
+          <button type="button" className={searchOpen ? "active" : ""} aria-label="Search files" title="Search files" aria-pressed={searchOpen} onClick={() => { setSearchOpen((current) => !current); if (searchOpen) setFileQuery(""); }}><Search size={15} /></button>
+          <button type="button" aria-label="Refresh workspace files" title="Refresh" disabled={busy || activeProject === null} onClick={onRefresh}><RefreshCw size={15} /></button>
+          <button type="button" aria-label="Collapse all folders" title="Collapse all" disabled={fileTree.every((node) => node.kind !== "directory")} onClick={() => setCollapsedDirectories(new Set(projectFileTreePathsV2(fileTree, "directory")))}><span className="explorer-collapse-icon"><ChevronRight size={14} /><ChevronRight size={14} /></span></button>
+          {fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
         const selectedFiles = Array.from(event.currentTarget.files ?? []);
         event.currentTarget.value = "";
         submitUploadSelection(selectedFiles, false);
@@ -2433,7 +2539,8 @@ function ProjectExplorerV2({
       }} /><div className="explorer-upload-menu" ref={uploadMenuRef}><button type="button" className={uploadMenuOpen ? "active" : ""} aria-label="Upload to workspace" title="Upload" aria-haspopup="menu" aria-expanded={uploadMenuOpen} disabled={busy || activeProject === null} onClick={() => setUploadMenuOpen((current) => !current)}><Upload size={15} /></button>{uploadMenuOpen ? <div className="explorer-upload-popover" role="menu"><button type="button" role="menuitem" onClick={() => { setUploadMenuOpen(false); uploadInputRef.current?.click(); }}><Upload size={14} /><span>Upload files</span></button><button type="button" role="menuitem" onClick={() => { setUploadMenuOpen(false); folderUploadInputRef.current?.click(); }}><FolderUp size={14} /><span>Upload folder</span></button></div> : null}</div></> : null}</div>
       </div>
       {searchOpen ? <label className="explorer-file-search"><Search size={14} /><input autoFocus type="search" aria-label="Filter workspace files" placeholder="Filter files" value={fileQuery} onChange={(event) => setFileQuery(event.target.value)} />{fileQuery ? <button type="button" aria-label="Clear file search" onClick={() => setFileQuery("")}><X size={13} /></button> : null}</label> : null}
-      <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
+      {creatingFile ? <form className="explorer-new-file" onSubmit={(event) => { event.preventDefault(); createEmptyFile(); }}><FileText size={14} /><input ref={newFileInputRef} aria-label="New workspace file path" placeholder="path/to/file.txt" value={newFilePath} onChange={(event) => setNewFilePath(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") { setCreatingFile(false); setNewFilePath(""); } }} /><button type="submit" disabled={newFilePath.trim() === ""}>Create</button></form> : null}
+      <div ref={treeRef} className={`explorer-file-tree${dropTargetPath === "" ? " root-drop-target" : ""}`} role="tree" aria-label="Project workspace files" onDragOver={(event) => { if (!fileTransferAvailable || busy) return; event.preventDefault(); setDropTargetPath(""); }} onDragLeave={(event) => { if (event.currentTarget.contains(event.relatedTarget as Node | null)) return; setDropTargetPath(null); }} onDrop={(event) => { if (!fileTransferAvailable || busy) return; event.preventDefault(); setDropTargetPath(null); submitUploadSelection(Array.from(event.dataTransfer.files), false); }}>
         {visibleFileTree.length ? renderTreeNodes(visibleFileTree) : <div className="explorer-empty">{entries.length || uploads.length ? "No matching files" : "No files yet"}</div>}
       </div>
       {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
