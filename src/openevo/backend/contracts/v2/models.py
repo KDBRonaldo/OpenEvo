@@ -467,24 +467,54 @@ class CodexSubscriptionExecutionSettingsV2(ContractModel):
 
 
 class SelfDeployedExecutionSettingsV2(ContractModel):
-    """Closed selection of one release-owned Self-Deployed model profile."""
+    """A release profile or an immutable daemon-managed Hugging Face model."""
 
     mode: Literal["self-deployed"]
     capture_mode: Literal["transcript"]
     token_level_metrics_available: Literal[False]
     harness_id: Literal["codex"]
-    model_profile_id: Literal["qwen3-0.6b-v1"]
+    model_profile_id: Literal["qwen3-0.6b-v1"] | None = None
+    model_resource_id: OpaqueId | None = None
+    repository_id: Annotated[str, StringConstraints(min_length=3, max_length=193)] | None = None
+    model_revision: Annotated[
+        str, StringConstraints(pattern=r"^[0-9a-f]{40}$")
+    ] | None = None
     token_limit: int = Field(ge=1, le=8_192)
     task_network_allow_internet: bool
 
+    @model_validator(mode="after")
+    def _one_model_authority(self) -> "SelfDeployedExecutionSettingsV2":
+        legacy = self.model_profile_id is not None
+        managed = all(
+            value is not None
+            for value in (self.model_resource_id, self.repository_id, self.model_revision)
+        )
+        if legacy == managed:
+            raise ValueError("self-deployed execution must select exactly one model authority")
+        if not legacy and any(
+            value is None
+            for value in (self.model_resource_id, self.repository_id, self.model_revision)
+        ):
+            raise ValueError("daemon-managed model identity is incomplete")
+        if self.repository_id is not None and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}",
+            self.repository_id,
+        ) is None:
+            raise ValueError("execution.repository_id must use owner/repository")
+        return self
+
     @property
     def codex_model(self) -> str:
-        """Core-owned concrete model derived from the closed release profile."""
+        """Concrete served-model identity without exposing its host path."""
+
+        if self.repository_id is not None:
+            return self.repository_id
 
         from openevo.runtime.self_deployed import (
             require_release_self_deployed_model_profile,
         )
 
+        assert self.model_profile_id is not None
         return require_release_self_deployed_model_profile(self.model_profile_id).model_id
 
     @property

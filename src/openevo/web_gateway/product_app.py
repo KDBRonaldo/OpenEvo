@@ -56,6 +56,10 @@ from openevo.daemon.contracts import (
     DevelopmentEvolutionRunCreateV2,
     DevelopmentEvolutionRunPageV2,
     DevelopmentEvolutionRunV2,
+    DevelopmentModelListV2,
+    DevelopmentModelRegisterV2,
+    DevelopmentModelRetryV2,
+    DevelopmentModelV2,
     DevelopmentTaskObservationPageV2,
     DevelopmentTaskObservationV2,
     DevelopmentTaskCancelV2,
@@ -81,6 +85,7 @@ RELEASE_VERSION = "0.2.0-web-v1"
 FEATURES = [
     "development_agent_bridge_v2",
     "event_replay_v2",
+    "huggingface_model_management_v2",
     "mutation_idempotency_v2",
 ]
 PROFILE_ID = "development-agent-profile"
@@ -1734,6 +1739,112 @@ def create_development_agent_web_app(
                 ) from exc
             provider._invalidate_state()
             payload = receipt.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/models",
+        include_in_schema=False,
+    )
+    async def development_models() -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            "development/models",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentModelListV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid model inventory",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.post(
+        "/desktop/v2/development/models",
+        include_in_schema=False,
+    )
+    async def register_development_model(request: Request) -> Response:
+        try:
+            registration = DevelopmentModelRegisterV2.model_validate(await request.json())
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid model registration") from exc
+        status, payload, headers = provider._client.proxy_v2(
+            "development/models",
+            query="",
+            method="POST",
+            body=registration.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.ACCEPTED:
+            try:
+                validated = DevelopmentModelV2.model_validate_json(payload)
+                if validated.repository_id != registration.repository_id:
+                    raise ValueError("model registration crossed repository authority")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned an invalid model registration",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/models/{model_resource_id}",
+        include_in_schema=False,
+    )
+    async def development_model_detail(model_resource_id: str) -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/models/{quote(model_resource_id, safe='')}",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentModelV2.model_validate_json(payload)
+                if validated.model_resource_id != model_resource_id:
+                    raise ValueError("model detail crossed resource authority")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid model detail",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.post(
+        "/desktop/v2/development/models/{model_resource_id}/retry",
+        include_in_schema=False,
+    )
+    async def retry_development_model(model_resource_id: str, request: Request) -> Response:
+        try:
+            retry = DevelopmentModelRetryV2.model_validate(await request.json())
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid model retry") from exc
+        status, payload, headers = provider._client.proxy_v2(
+            f"development/models/{quote(model_resource_id, safe='')}/retry",
+            query="",
+            method="POST",
+            body=retry.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.ACCEPTED:
+            try:
+                validated = DevelopmentModelV2.model_validate_json(payload)
+                if validated.model_resource_id != model_resource_id:
+                    raise ValueError("model retry crossed resource authority")
+            except (ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid model retry state",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
 
     @app.get(

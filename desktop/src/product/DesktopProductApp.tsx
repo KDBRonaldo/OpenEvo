@@ -68,6 +68,7 @@ import {
   withoutWorkspaceFileV2,
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
+  type DevelopmentModelResourceV2,
   type ProductMutationIntentV2,
 } from "./providerV2";
 
@@ -1661,18 +1662,125 @@ function NewProjectDialogV2({
   const [browserFolderUploads, setBrowserFolderUploads] = useState<readonly BrowserWorkspaceUploadV2[]>([]);
   const [folderImportProgress, setFolderImportProgress] = useState<number | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
+  const [executionMode, setExecutionMode] = useState<"subscription" | "huggingface">(
+    project?.config.execution.mode === "self-deployed" ? "huggingface" : "subscription",
+  );
+  const [models, setModels] = useState<readonly DevelopmentModelResourceV2[]>([]);
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(
+    project?.config.execution.mode === "self-deployed"
+      ? project.config.execution.model_resource_id ?? null
+      : null,
+  );
+  const [repositoryId, setRepositoryId] = useState("");
+  const [modelRevision, setModelRevision] = useState("main");
+  const [modelMutationBusy, setModelMutationBusy] = useState(false);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const closedRef = useRef(false);
+  const onErrorRef = useRef(onError);
   const dialogRef = useDialogBoundary(onClose);
   const projectTask = project?.config.task ?? PROJECT_TASK_PLACEHOLDER;
   const browserFolderAvailable = project === null
     && provider.featureFlags.includes(BROWSER_FOLDER_SNAPSHOT_FEATURE)
     && provider.uploadWorkspaceFile !== undefined;
+  const modelManagementAvailable = provider.featureFlags.includes("huggingface_model_management_v2")
+    && provider.listModelResources !== undefined;
   const browserFolderBytes = browserFolderUploads.reduce((total, upload) => total + upload.file.size, 0);
   const baseDraftValid = displayName.trim() !== "";
-  const valid = baseDraftValid
+  const selectedModel = models.find((model) => model.model_resource_id === selectedModelId) ?? null;
+  const executionValid = executionMode === "subscription" || selectedModel?.state === "ready";
+  const valid = baseDraftValid && executionValid
     && (workspaceKind === "scratch" || sourceActionId !== null || browserFolderUploads.length > 0 || project !== null);
-  const supportedExecution = project?.config.execution.mode !== "self-deployed";
+
+  const executionSettings = (): ScienceProjectConfigV2["execution"] => {
+    if (executionMode === "subscription") {
+      return project?.config.execution.mode === "codex_subscription_transcript"
+        ? project.config.execution
+        : {
+          mode: "codex_subscription_transcript",
+          capture_mode: "transcript",
+          token_level_metrics_available: false,
+          harness_id: "codex",
+          codex_model: "gpt-5.3-codex-spark",
+          reasoning_effort: "high",
+          token_limit: 32_000,
+          task_network_allow_internet: true,
+        };
+    }
+    if (selectedModel?.state !== "ready" || selectedModel.resolved_revision === null) {
+      throw new Error("Wait for the selected Hugging Face model to finish downloading.");
+    }
+    return {
+      mode: "self-deployed",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      harness_id: "codex",
+      model_profile_id: null,
+      model_resource_id: selectedModel.model_resource_id,
+      repository_id: selectedModel.repository_id,
+      model_revision: selectedModel.resolved_revision,
+      token_limit: 8_192,
+      task_network_allow_internet: true,
+    };
+  };
+
+  useEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+
+  useEffect(() => {
+    if (!modelManagementAvailable || !provider.listModelResources) return;
+    let stopped = false;
+    let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const load = async () => {
+      try {
+        const next = await provider.listModelResources!();
+        if (stopped) return;
+        setModels(next);
+        timer = globalThis.setTimeout(() => void load(), 1_500);
+      } catch (error) {
+        if (!stopped) onErrorRef.current(error);
+      }
+    };
+    void load();
+    return () => {
+      stopped = true;
+      if (timer !== null) globalThis.clearTimeout(timer);
+    };
+  }, [modelManagementAvailable, provider]);
+
+  const registerModel = async (): Promise<void> => {
+    if (!provider.registerModelResource || repositoryId.trim() === "") return;
+    setModelMutationBusy(true);
+    try {
+      const model = await provider.registerModelResource(
+        repositoryId.trim(), modelRevision.trim() || "main",
+        intentFor(snapshot, "register-model"),
+      );
+      setModels((current) => [...current.filter((item) => item.model_resource_id !== model.model_resource_id), model]);
+      setSelectedModelId(model.model_resource_id);
+      setExecutionMode("huggingface");
+    } catch (error) {
+      onError(error);
+    } finally {
+      setModelMutationBusy(false);
+    }
+  };
+
+  const retryModel = async (modelResourceId: string): Promise<void> => {
+    if (!provider.retryModelResource) return;
+    setModelMutationBusy(true);
+    try {
+      const model = await provider.retryModelResource(
+        modelResourceId, intentFor(snapshot, "retry-model"),
+      );
+      setModels((current) => [...current.filter((item) => item.model_resource_id !== model.model_resource_id), model]);
+      setSelectedModelId(model.model_resource_id);
+    } catch (error) {
+      onError(error);
+    } finally {
+      setModelMutationBusy(false);
+    }
+  };
 
   useEffect(() => {
     folderInputRef.current?.setAttribute("webkitdirectory", "");
@@ -1704,7 +1812,7 @@ function NewProjectDialogV2({
         projectTask.objective,
         "native_folder_snapshot",
         workspaceDisplayName,
-        project?.config.execution,
+        executionSettings(),
       );
       const source = await provider.selectNativeWorkspace({
         kind: "native_folder_snapshot",
@@ -1746,7 +1854,7 @@ function NewProjectDialogV2({
       projectTask.objective,
       workspaceKind,
       workspaceDisplayName,
-      project?.config.execution,
+      executionSettings(),
     );
     onBusy(true);
     let browserCreatedProjectId: string | null = null;
@@ -1883,7 +1991,38 @@ function NewProjectDialogV2({
             {!project && workspaceKind === "native_folder_snapshot" ? <div className="project-workspace-selection" role="status"><FolderOpen size={14} /><span>{browserFolderUploads.length > 0 ? <><strong>{selectedSourceDisplayName}</strong> · {browserFolderUploads.length} file{browserFolderUploads.length === 1 ? "" : "s"} · {formatBytes(browserFolderBytes)}</> : selectedSourceDisplayName ?? "Preparing selected workspace…"}</span></div> : null}
             {folderImportProgress !== null ? <div className="folder-snapshot-progress" role="progressbar" aria-label="Uploading folder snapshot" aria-valuemin={0} aria-valuemax={100} aria-valuenow={folderImportProgress}><span style={{ width: `${folderImportProgress}%` }} /><small>{folderImportProgress}% uploaded</small></div> : null}
           </section>
-          <div className="project-execution-summary"><span><ShieldCheck size={16} /></span><div><small>Execution</small><strong>{supportedExecution ? "Codex Subscription" : "Existing project profile"}</strong></div><p>{supportedExecution ? "Transcript capture · high effort" : "Preserved until a supported migration is available"}</p></div>
+          <section className="project-setup-section project-model-section">
+            <div className="project-setup-section-heading"><div><h3>Execution model</h3><p>Use your Codex subscription or a public vLLM-compatible Hugging Face model hosted by this server.</p></div></div>
+            <div className="project-model-mode" role="radiogroup" aria-label="Execution model source">
+              <button type="button" role="radio" aria-checked={executionMode === "subscription"} className={executionMode === "subscription" ? "selected" : ""} onClick={() => setExecutionMode("subscription")}><ShieldCheck size={16} /><span><strong>Codex Subscription</strong><small>No local GPU model required</small></span></button>
+              {modelManagementAvailable ? <button type="button" role="radio" aria-checked={executionMode === "huggingface"} className={executionMode === "huggingface" ? "selected" : ""} onClick={() => setExecutionMode("huggingface")}><Server size={16} /><span><strong>Hugging Face</strong><small>Downloaded and served on this server</small></span></button> : null}
+            </div>
+            {executionMode === "huggingface" ? (
+              <div className="project-model-manager">
+                <div className="project-model-register">
+                  <input aria-label="Hugging Face repository" placeholder="owner/model" value={repositoryId} onChange={(event) => setRepositoryId(event.target.value)} />
+                  <input aria-label="Hugging Face revision" placeholder="main" value={modelRevision} onChange={(event) => setModelRevision(event.target.value)} />
+                  <button type="button" className="secondary-button" disabled={modelMutationBusy || repositoryId.trim() === ""} onClick={() => void registerModel()}>{modelMutationBusy ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />} Download</button>
+                </div>
+                <div className="project-model-list" role="radiogroup" aria-label="Downloaded models">
+                  {models.length === 0 ? <p>No models registered yet.</p> : models.map((model) => {
+                    const progress = model.total_bytes && model.total_bytes > 0
+                      ? Math.min(100, Math.round(model.downloaded_bytes / model.total_bytes * 100))
+                      : null;
+                    return <div key={model.model_resource_id} className="project-model-entry">
+                      <button type="button" role="radio" aria-checked={selectedModelId === model.model_resource_id} className={`project-model-option ${selectedModelId === model.model_resource_id ? "selected" : ""}`} onClick={() => setSelectedModelId(model.model_resource_id)}>
+                        <span><strong>{model.repository_id}</strong><small>{model.resolved_revision?.slice(0, 10) ?? model.requested_revision}</small></span>
+                        <em className={`model-state ${model.state}`}>{model.state === "downloading" && progress !== null ? `${progress}%` : model.state}</em>
+                        {model.error ? <small className="model-error">{model.error}</small> : null}
+                      </button>
+                      {model.state === "failed" ? <button type="button" className="text-button project-model-retry" disabled={modelMutationBusy} onClick={() => void retryModel(model.model_resource_id)}>Retry</button> : null}
+                    </div>;
+                  })}
+                </div>
+                {selectedModel !== null && selectedModel.state !== "ready" ? <p className="project-model-guidance">The project can be saved after this model reaches Ready.</p> : null}
+              </div>
+            ) : null}
+          </section>
         </div>
         <div className="project-setup-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : project ? <Settings size={15} /> : <Plus size={15} />} {project ? "Save changes" : "Create project"}</button></div>
       </section>

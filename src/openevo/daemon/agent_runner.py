@@ -136,10 +136,12 @@ class AgentSessionExecutor:
         store: AgentSessionStore,
         runner: AgentHarness,
         evidence_sealer: EvidenceSealer | None = None,
+        execution_preparer: Callable[[dict[str, Any]], dict[str, str] | None] | None = None,
     ) -> None:
         self._store = store
         self._runner = runner
         self._evidence_sealer = evidence_sealer
+        self._execution_preparer = execution_preparer
 
     def execute(
         self,
@@ -174,6 +176,18 @@ class AgentSessionExecutor:
                 "workspace_snapshot": workspace_before,
                 "evolved_contexts": evolved_contexts,
             }
+            if self._execution_preparer is not None:
+                if (
+                    isinstance(request.get("execution"), dict)
+                    and request["execution"].get("mode") == "self-deployed"
+                ):
+                    self._store.append_session_log(
+                        session_id,
+                        "Preparing the Project's self-deployed model runtime.",
+                    )
+                inference = self._execution_preparer(request)
+                if inference is not None:
+                    execution_request["inference"] = inference
             result = self._runner.run(
                 execution_request,
                 cancellation=cancellation,

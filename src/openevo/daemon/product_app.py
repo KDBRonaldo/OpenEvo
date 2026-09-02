@@ -1,8 +1,8 @@
 """Authoritative loopback OpenEvo product daemon.
 
 This is the formal composition root for Project, Session, workspace, artifact,
-Agent Runner, and Evolution services.  It must never be exposed directly to a
-network: bind it to loopback and reach it only through an SSH tunnel.
+Agent Runner, model, and Evolution services.  It must never be exposed directly
+to a network: bind it to loopback and reach it only through the Web Layer.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ from openevo.daemon.evolution_orchestrator import (
     EvolutionOrchestrator,
     development_registry_snapshot,
 )
+from openevo.daemon.model_manager import HuggingFaceModelManager
 from openevo.daemon.project_catalog import (
     ProjectCatalogConflictError,
     SqliteProjectCatalog,
@@ -87,6 +88,10 @@ from openevo.daemon.contracts import (
     DevelopmentEvolutionRunCreateV2,
     DevelopmentEvolutionRunPageV2,
     DevelopmentEvolutionRunV2,
+    DevelopmentModelListV2,
+    DevelopmentModelRegisterV2,
+    DevelopmentModelRetryV2,
+    DevelopmentModelV2,
     DevelopmentProjectActivateV2,
     DevelopmentProjectAuthorityV2,
     DevelopmentProjectCreateV2,
@@ -154,6 +159,13 @@ DAEMON_V2_DEVELOPMENT_TASK_CANCEL_PATH_PATTERN = re.compile(
 DAEMON_V2_DEVELOPMENT_STATE_PATH = "/v2/development/state"
 DAEMON_V2_DEVELOPMENT_CAPABILITIES_PATH = "/v2/development/capabilities"
 DAEMON_V2_DEVELOPMENT_PROJECTS_PATH = "/v2/development/projects"
+DAEMON_V2_DEVELOPMENT_MODELS_PATH = "/v2/development/models"
+DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN = re.compile(
+    r"^/v2/development/models/([^/]+)$"
+)
+DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN = re.compile(
+    r"^/v2/development/models/([^/]+)/retry$"
+)
 DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN = re.compile(r"^/v2/development/projects/([^/]+)$")
 DAEMON_V2_DEVELOPMENT_PROJECT_ACTIVATE_PATH_PATTERN = re.compile(
     r"^/v2/development/projects/([^/]+)/activate$"
@@ -3338,9 +3350,11 @@ class DevelopmentSessionCoordinator:
         runner: CodexRunner,
         store: DevelopmentStateStore,
         evolution_runner: DocumentEvolutionRunner | None,
+        model_manager: HuggingFaceModelManager | None = None,
     ) -> None:
         self._store = store
         self._evolution_runner = evolution_runner
+        self._model_manager = model_manager
         self._turn_lock = threading.Lock()
         self._agent_executor = AgentSessionExecutor(
             store=store,
@@ -3348,6 +3362,7 @@ class DevelopmentSessionCoordinator:
             evidence_sealer=(
                 self._seal_session_evidence if evolution_runner is not None else None
             ),
+            execution_preparer=self._prepare_execution,
         )
         self._session_runtime = SessionExecutionManager(
             store=store,
@@ -3359,9 +3374,36 @@ class DevelopmentSessionCoordinator:
 
     def submit(self, request: dict[str, str], *, session_id: str | None = None) -> str:
         try:
-            return self._session_runtime.submit(request, session_id=session_id)
+            project_config = self._store.project_config(request["project_id"])
+            return self._session_runtime.submit(
+                {**request, "execution": project_config.get("execution", {})},
+                session_id=session_id,
+            )
         except SessionExecutionConflictError as exc:
             raise StateConflictError(str(exc)) from exc
+
+    def _prepare_execution(self, request: dict[str, Any]) -> dict[str, str] | None:
+        execution = request.get("execution")
+        if not isinstance(execution, dict) or execution.get("mode") != "self-deployed":
+            return None
+        model_resource_id = execution.get("model_resource_id")
+        repository_id = execution.get("repository_id")
+        model_revision = execution.get("model_revision")
+        if not all(isinstance(value, str) and value for value in (
+            model_resource_id, repository_id, model_revision
+        )):
+            raise AgentRunError(
+                "This legacy self-deployed profile is not available through model management"
+            )
+        if self._model_manager is None:
+            raise AgentRunError("Hugging Face model management is unavailable")
+        model = self._model_manager.get(model_resource_id)
+        if (
+            model["repository_id"] != repository_id
+            or model["resolved_revision"] != model_revision
+        ):
+            raise AgentRunError("Project model identity no longer matches daemon authority")
+        return self._model_manager.prepare_inference(model_resource_id)
 
     def cancel(self, session_id: str) -> dict[str, Any]:
         return self._session_runtime.cancel(session_id)
@@ -3637,17 +3679,28 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
         runner: CodexRunner,
         store: DevelopmentStateStore,
         evolution_runner: DocumentEvolutionRunner | None = None,
+        model_manager: HuggingFaceModelManager | None = None,
     ) -> None:
         super().__init__(address, DevelopmentAgentHandler)
         self.token = token
         self.runner = runner
         self.store = store
         self.evolution_runner = evolution_runner
+        self.model_manager = model_manager
         self.sessions = DevelopmentSessionCoordinator(
             runner=runner,
             store=store,
             evolution_runner=evolution_runner,
+            model_manager=model_manager,
         )
+
+    def server_close(self) -> None:
+        try:
+            close_models = getattr(self.model_manager, "close", None)
+            if callable(close_models):
+                close_models()
+        finally:
+            super().server_close()
 
 
 class DevelopmentAgentHandler(BaseHTTPRequestHandler):
@@ -4126,6 +4179,46 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_MODELS_PATH:
+            if self.server.model_manager is None:
+                self._json_error_v2(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "models_unavailable",
+                    "development model manager is unavailable",
+                )
+            else:
+                response = DevelopmentModelListV2(
+                    items=[
+                        DevelopmentModelV2.model_validate(model)
+                        for model in self.server.model_manager.list()
+                    ]
+                )
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
+        model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        )
+        if model_v2_match:
+            model_resource_id = model_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(model_resource_id):
+                    raise RequestError("model_resource_id is invalid")
+                if self.server.model_manager is None:
+                    raise StateConflictError("development model manager is unavailable")
+                response = DevelopmentModelV2.model_validate(
+                    self.server.model_manager.get(model_resource_id)
+                )
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "model not found")
+            except StateConflictError as exc:
+                self._json_error_v2(
+                    HTTPStatus.SERVICE_UNAVAILABLE, "models_unavailable", str(exc)
+                )
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
         if parsed_path.path == DAEMON_V2_DEVELOPMENT_PROJECTS_PATH:
             state = self.server.store.state_v2()
             self._json(
@@ -4240,6 +4333,55 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
+            return
+        if self.path == DAEMON_V2_DEVELOPMENT_MODELS_PATH:
+            try:
+                request = DevelopmentModelRegisterV2.model_validate(self._read_json())
+                if self.server.model_manager is None:
+                    raise StateConflictError("development model manager is unavailable")
+                response = DevelopmentModelV2.model_validate(
+                    self.server.model_manager.register(
+                        action_id=request.action_id,
+                        repository_id=request.repository_id,
+                        revision=request.revision,
+                    )
+                )
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
+            return
+        retry_model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN.fullmatch(
+            self.path
+        )
+        if retry_model_v2_match:
+            model_resource_id = retry_model_v2_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(model_resource_id):
+                    raise RequestError("model_resource_id is invalid")
+                request = DevelopmentModelRetryV2.model_validate(self._read_json())
+                if self.server.model_manager is None:
+                    raise StateConflictError("development model manager is unavailable")
+                response = DevelopmentModelV2.model_validate(
+                    self.server.model_manager.retry(
+                        model_resource_id,
+                        action_id=request.action_id,
+                    )
+                )
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "model not found")
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
             return
         if self.path == DAEMON_V2_DEVELOPMENT_PROJECTS_PATH:
             try:
@@ -4910,12 +5052,38 @@ def create_product_daemon(
     runner.check_ready()
     resolved_state_path = state_path.expanduser().resolve()
     store = DevelopmentStateStore(resolved_state_path)
+    model_manager = HuggingFaceModelManager(
+        state_path=resolved_state_path,
+        root=resolved_state_path.parent / "models",
+    )
+
+    def prepare_project_inference(project_id: str) -> dict[str, str] | None:
+        execution = store.project_config(project_id).get("execution", {})
+        if not isinstance(execution, dict) or execution.get("mode") != "self-deployed":
+            return None
+        model_resource_id = execution.get("model_resource_id")
+        repository_id = execution.get("repository_id")
+        model_revision = execution.get("model_revision")
+        if not all(isinstance(value, str) and value for value in (
+            model_resource_id, repository_id, model_revision
+        )):
+            raise EvolutionRunError(
+                "This legacy self-deployed profile is not available through model management"
+            )
+        managed = model_manager.get(model_resource_id)
+        if (
+            managed["repository_id"] != repository_id
+            or managed["resolved_revision"] != model_revision
+        ):
+            raise EvolutionRunError("Project model identity no longer matches daemon authority")
+        return model_manager.prepare_inference(model_resource_id)
     resolved_evolution_model = evolution_model or model or "gpt-5.5"
     evolution_runner = DocumentEvolutionRunner(
         state_root=resolved_state_path.parent,
         codex_binary=resolved_codex_binary,
         model=resolved_evolution_model,
         timeout_seconds=timeout_seconds,
+        inference_preparer=prepare_project_inference,
     )
     evolution_runner.check_ready()
     evidence_failures = tuple(evolution_runner.seal_completed_session_datasets(store))
@@ -4925,6 +5093,7 @@ def create_product_daemon(
         runner,
         store,
         evolution_runner,
+        model_manager,
     )
     return ProductDaemonComposition(
         server=server,
@@ -4934,7 +5103,10 @@ def create_product_daemon(
     )
 
 
-def serve_product_daemon(composition: ProductDaemonComposition) -> None:
+def serve_product_daemon(
+    composition: ProductDaemonComposition,
+    access_hint: str = "connect through an SSH local-forward tunnel",
+) -> None:
     """Serve a composed daemon until the process receives an interrupt."""
 
     for failure in composition.evidence_failures:
@@ -4947,7 +5119,7 @@ def serve_product_daemon(composition: ProductDaemonComposition) -> None:
         f"and executed with model {composition.evolution_model}.",
         flush=True,
     )
-    print("It is loopback-only; connect through an SSH local-forward tunnel.", flush=True)
+    print(f"It is loopback-only; {access_hint}.", flush=True)
     try:
         composition.server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

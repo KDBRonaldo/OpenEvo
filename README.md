@@ -109,6 +109,37 @@ workflow. Source delivery requires a local commit, but it does not require a
 push. SSH connection, source transfer, remote command, dependency bootstrap,
 and health checks are bounded so a failed network phase reports an error.
 
+## Run the WebUI on one computer
+
+When the browser, Web Layer, daemon, and GPU are on the same computer, skip SSH
+entirely:
+
+```bash
+uv run openevo webui --local
+```
+
+The command starts the same formal loopback Web Layer and daemon composition
+used by the remote product path. State is persisted under
+`~/.openevo/dev-agent`; use `--state-root <directory>` to choose another local
+state root. `--local-port` selects the browser port and `--daemon-port` selects
+the private daemon port. No SSH profile, source delivery, or tunnel is created.
+
+## Use a Hugging Face model
+
+In **New project → Execution model**, select **Hugging Face**, enter a public
+`owner/repository` and revision, and choose **Download**. EvoLab resolves the
+revision to an immutable commit, verifies content-addressed safetensors, and
+stores the model in the daemon's private model cache. Projects pin the managed
+model resource and commit rather than a mutable branch name.
+
+Serving requires Docker and an NVIDIA GPU on the daemon computer. The first
+Session pulls the release-pinned vLLM image, starts it on daemon loopback, and
+uses the selected model for both Sessions and supported Evolution reflectors.
+Only one managed model server is kept active at a time. The server must be able
+to reach Hugging Face; administrators in mirrored environments can set the
+standard `HF_ENDPOINT` variable before launching EvoLab. Private, gated,
+PyTorch pickle, and remote-code-only repositories are rejected.
+
 ## Build and install a release bundle
 
 The Git-bundle path above remains the development workflow. A versioned server

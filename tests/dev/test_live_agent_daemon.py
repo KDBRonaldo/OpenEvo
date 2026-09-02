@@ -302,6 +302,10 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
             "instruction": "Answer the next question.",
             "workspace_path": workspace,
             "workspace_snapshot": {"entries": []},
+            "inference": {
+                "model": "OpenEvo/Fixture-0.1B",
+                "base_url": "http://127.0.0.1:18432/v1",
+            },
             "evolved_contexts": [
                 {
                     "artifact_id": "memory-artifact-1",
@@ -361,6 +365,11 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert "daemon-extracted document projections" in captured["prompt"]
     assert "--ignore-rules" not in captured["args"]
     assert "--output-schema" in captured["args"]
+    assert captured["args"][captured["args"].index("--model") + 1] == "OpenEvo/Fixture-0.1B"
+    assert 'model_provider="openevo_self_deployed"' in captured["args"]
+    assert any("http://127.0.0.1:18432/v1" in value for value in captured["args"])
+    assert captured["env"]["OPENAI_API_KEY"] == "openevo-local"
+    assert result["model"] == "OpenEvo/Fixture-0.1B"
     assert Path(captured["args"][captured["args"].index("--cd") + 1]) != workspace
     assert captured["env"]["OPENEVO_MEMORY_FILE"].endswith("/memory.md")
     assert captured["env"]["OPENEVO_SKILLS_DIR"].endswith("/.agents/skills")
@@ -1312,6 +1321,110 @@ def test_http_workspace_file_upload_and_download_round_trip(tmp_path: Path) -> N
     assert created["entry"]["path"] == "data/实验.csv"
     assert downloaded == payload
     assert content_type == "text/csv"
+
+
+def test_daemon_v2_model_routes_keep_download_authority_server_side(
+    tmp_path: Path,
+) -> None:
+    token = "m" * 32
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    now = "2026-09-02T00:00:00Z"
+
+    class Models:
+        def __init__(self) -> None:
+            self.record = {
+                "model_resource_id": "model-fixture",
+                "repository_id": "OpenEvo/Fixture-0.1B",
+                "requested_revision": "main",
+                "resolved_revision": None,
+                "manifest_sha256": None,
+                "state": "downloading",
+                "downloaded_bytes": 32,
+                "total_bytes": 128,
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.calls: list[tuple[object, ...]] = []
+
+        def list(self) -> list[dict[str, object]]:
+            return [self.record]
+
+        def get(self, model_resource_id: str) -> dict[str, object]:
+            if model_resource_id != "model-fixture":
+                raise KeyError(model_resource_id)
+            return self.record
+
+        def register(self, **kwargs: object) -> dict[str, object]:
+            self.calls.append(("register", kwargs))
+            return self.record
+
+        def retry(self, model_resource_id: str, *, action_id: str) -> dict[str, object]:
+            self.calls.append(("retry", model_resource_id, action_id))
+            return self.record
+
+    models = Models()
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0), token, object(), store, None, models
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/v2/development/models"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        register = urllib.request.Request(
+            base,
+            data=json.dumps(
+                {
+                    "schema_version": "2",
+                    "action_id": "register-model",
+                    "repository_id": "OpenEvo/Fixture-0.1B",
+                    "revision": "main",
+                }
+            ).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(register, timeout=5) as response:
+            assert response.status == 202
+            registered = json.loads(response.read())
+        with urllib.request.urlopen(
+            urllib.request.Request(base, headers=headers), timeout=5
+        ) as response:
+            inventory = json.loads(response.read())
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{base}/model-fixture", headers=headers), timeout=5
+        ) as response:
+            detail = json.loads(response.read())
+        retry = urllib.request.Request(
+            f"{base}/model-fixture/retry",
+            data=json.dumps(
+                {"schema_version": "2", "action_id": "retry-model"}
+            ).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(retry, timeout=5) as response:
+            assert response.status == 202
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert registered["model_resource_id"] == "model-fixture"
+    assert registered["downloaded_bytes"] == 32
+    assert inventory["items"] == [detail]
+    assert models.calls == [
+        (
+            "register",
+            {
+                "action_id": "register-model",
+                "repository_id": "OpenEvo/Fixture-0.1B",
+                "revision": "main",
+            },
+        ),
+        ("retry", "model-fixture", "retry-model"),
+    ]
 
 
 def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(

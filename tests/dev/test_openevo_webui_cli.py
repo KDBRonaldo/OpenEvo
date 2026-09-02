@@ -74,6 +74,14 @@ def test_cli_dispatches_webui_to_formal_launcher(monkeypatch: pytest.MonkeyPatch
     ]
 
 
+def test_cli_dispatches_local_webui_without_ssh(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[str] = []
+    monkeypatch.setattr(cli, "launcher_main", lambda args: captured.extend(args) or 0)
+
+    assert cli.main(["webui", "--local", "--no-open"]) == 0
+    assert captured == ["--self-hosted-webui", "--local", "--no-open"]
+
+
 def test_wsl_browser_open_uses_the_windows_url_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

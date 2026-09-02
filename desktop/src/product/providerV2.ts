@@ -34,6 +34,20 @@ import type { PendingMutationIntentV2 } from "./mutationIntentJournalV2";
 
 export type ProductOperationV2 = LocalOperationV2 | LifecycleOperationV2 | OperationV2;
 
+export interface DevelopmentModelResourceV2 {
+  readonly model_resource_id: string;
+  readonly repository_id: string;
+  readonly requested_revision: string;
+  readonly resolved_revision: string | null;
+  readonly manifest_sha256: string | null;
+  readonly state: "queued" | "resolving" | "downloading" | "ready" | "failed";
+  readonly downloaded_bytes: number;
+  readonly total_bytes: number | null;
+  readonly error: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
 export type ProductStreamStateV2 =
   | { readonly status: "fresh"; readonly epoch: number; readonly lastEventId: string | null }
   | { readonly status: "stale"; readonly epoch: number; readonly reason: "event_gap" | "refresh_pending" }
@@ -364,6 +378,16 @@ export interface DesktopProductProviderV2 {
     path: string,
     intent: ProductMutationIntentV2,
   ): Promise<void>;
+  listModelResources?(): Promise<readonly DevelopmentModelResourceV2[]>;
+  registerModelResource?(
+    repositoryId: string,
+    revision: string,
+    intent: ProductMutationIntentV2,
+  ): Promise<DevelopmentModelResourceV2>;
+  retryModelResource?(
+    modelResourceId: string,
+    intent: ProductMutationIntentV2,
+  ): Promise<DevelopmentModelResourceV2>;
   loadTaskLogs(taskId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;

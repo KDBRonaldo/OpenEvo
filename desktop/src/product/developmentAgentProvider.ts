@@ -7,6 +7,26 @@ import {
 } from "./developmentAgentDesktopProvider";
 import type { DesktopProductProviderV2 } from "./providerV2";
 
+const modelResourceV2Schema = z.object({
+  schema_version: z.literal("2"),
+  model_resource_id: z.string().min(1),
+  repository_id: z.string().min(3),
+  requested_revision: z.string().min(1),
+  resolved_revision: z.string().regex(/^[0-9a-f]{40}$/).nullable(),
+  manifest_sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  state: z.enum(["queued", "resolving", "downloading", "ready", "failed"]),
+  downloaded_bytes: z.number().int().nonnegative(),
+  total_bytes: z.number().int().nonnegative().nullable(),
+  error: z.string().nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const modelResourcePageV2Schema = z.object({
+  schema_version: z.literal("2"),
+  items: z.array(modelResourceV2Schema).max(100),
+}).strict();
+
 const artifactSchema = z.object({
   artifact_id: z.string().min(1),
   project_id: z.string().min(1),
@@ -1050,6 +1070,24 @@ export function createDevelopmentAgentProvider(
         jsonRequest("POST", { schema_version: "1" }),
       );
     },
+    listModelResources: async () => {
+      const page = modelResourcePageV2Schema.parse(await requestPresentationV2("/models"));
+      return page.items;
+    },
+    registerModelResource: async (repositoryId, revision, actionId) => modelResourceV2Schema.parse(
+      await requestPresentationV2("/models", jsonRequest("POST", {
+        schema_version: "2",
+        action_id: actionId,
+        repository_id: repositoryId,
+        revision,
+      })),
+    ),
+    retryModelResource: async (modelResourceId, actionId) => modelResourceV2Schema.parse(
+      await requestPresentationV2(
+        `/models/${encodeURIComponent(modelResourceId)}/retry`,
+        jsonRequest("POST", { schema_version: "2", action_id: actionId }),
+      ),
+    ),
     retryEvolutionJob: async (jobId) => {
       if (evolutionJobV2BaseUrl !== undefined) {
         const actionId = globalThis.crypto.randomUUID();

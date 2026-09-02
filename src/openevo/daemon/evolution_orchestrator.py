@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from openevo.backend.harness_adapter import HarnessCancellation, HarnessRunCancelled
 from openevo.daemon.errors import EvolutionRunError
@@ -110,12 +110,14 @@ class EvolutionOrchestrator:
         codex_binary: str,
         model: str,
         timeout_seconds: int,
+        inference_preparer: Callable[[str], dict[str, str] | None] | None = None,
     ) -> None:
         self._artifact_root = state_root / "evolution-artifacts"
         self._artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._codex_binary = codex_binary
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self._inference_preparer = inference_preparer
         self._registry: Any | None = None
         self._capabilities: dict[str, Any] | None = None
 
@@ -195,17 +197,33 @@ class EvolutionOrchestrator:
             )
         return target, method, handler
 
-    def _method_config(self, method: Any, requested: dict[str, Any]) -> dict[str, Any]:
+    def _method_config(
+        self, method: Any, requested: dict[str, Any], *, project_id: str
+    ) -> dict[str, Any]:
         if self._registry is None:
             raise EvolutionRunError("evolution catalog is unavailable")
         config = dict(requested)
         for injection in method.project_config_injections:
             if injection.source.value == "reflector_llm":
-                config[injection.field_name] = {
-                    "provider": "codex_cli",
-                    "model": self._model,
-                    "timeout_seconds": self._timeout_seconds,
-                }
+                inference = (
+                    None
+                    if self._inference_preparer is None
+                    else self._inference_preparer(project_id)
+                )
+                config[injection.field_name] = (
+                    {
+                        "provider": "codex_cli",
+                        "model": self._model,
+                        "timeout_seconds": self._timeout_seconds,
+                    }
+                    if inference is None
+                    else {
+                        "provider": "openai_chat",
+                        "model": inference["model"],
+                        "base_url": inference["base_url"],
+                        "timeout_seconds": self._timeout_seconds,
+                    }
+                )
             else:
                 raise EvolutionRunError(
                     f"development bridge cannot provide {injection.source.value}"
@@ -519,7 +537,7 @@ class EvolutionOrchestrator:
             current_session_id=current_session_id,
             prior_dataset_ids=[f"dataset-{session_id}" for session_id in session_ids[:-1]],
             selections=run["selections"],
-            base_project_head_id=run["base_project_head_id"],
+            base_project_head_id=run.get("base_project_head_id"),
             store=store,
             cancellation=None,
             promote_outputs=False,
@@ -657,7 +675,9 @@ class EvolutionOrchestrator:
             if cancellation is not None:
                 cancellation.raise_if_requested()
             target, method, handler = self._descriptor(target_id, method_id)
-            method_config = self._method_config(method, job["config"])
+            method_config = self._method_config(
+                method, job["config"], project_id=request["project_id"]
+            )
             current_record = store.dataset_artifact(f"dataset-{job['session_id']}")
             current_dataset = WorkerClaimInputArtifact(
                 artifact_id=current_record["artifact_id"],

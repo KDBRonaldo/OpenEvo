@@ -56,6 +56,7 @@ LOCAL_WEB_LAYER_PATHS = frozenset(
     }
 )
 REMOTE_DEVELOPMENT_STATE_ROOT = "$HOME/.openevo/dev-agent"
+LOCAL_DEVELOPMENT_STATE_ROOT = Path("~/.openevo/dev-agent").expanduser()
 REMOTE_LIFECYCLE_ACTIONS = frozenset({"status", "logs", "stop"})
 SOURCE_ACTIONS = frozenset({"auto", "install", "update", "start"})
 SSH_CONNECT_TIMEOUT_SECONDS = 15
@@ -1540,7 +1541,7 @@ def _wait_for_local_health(local_port: int, token: str) -> None:
         except (OSError, ValueError, urllib.error.URLError) as exc:
             last_error = str(exc)
         time.sleep(0.2)
-    raise LauncherError(f"local SSH tunnel health check failed: {last_error}")
+    raise LauncherError(f"local daemon health check failed: {last_error}")
 
 
 def _wait_for_local_webui(local_port: int) -> None:
@@ -1580,6 +1581,132 @@ def open_browser(url: str) -> bool:
         return False
 
 
+def _run_local_self_hosted_webui(
+    args: argparse.Namespace,
+    *,
+    source_commit: str,
+) -> int:
+    """Run the formal Web Layer and daemon on one machine without SSH."""
+
+    from openevo.daemon.product_app import create_product_daemon, serve_product_daemon
+    from openevo.web_gateway.product_app import create_web_gateway_app
+
+    try:
+        import uvicorn
+    except ImportError as exc:  # pragma: no cover - installation validation
+        raise LauncherError("uvicorn is required for local EvoLab WebUI mode") from exc
+
+    codex_binary = shutil.which("codex")
+    if not codex_binary:
+        raise LauncherError("Codex CLI was not found for local EvoLab WebUI mode")
+    static_root = Path(__file__).resolve().parent / "web_gateway" / "static"
+    if not (static_root / "index.html").is_file():
+        raise LauncherError(
+            "the packaged EvoLab WebUI is missing; run `cd desktop && npm run "
+            "build:webui-gateway`"
+        )
+
+    state_root = Path(args.state_root).expanduser().resolve(strict=False)
+    state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    daemon_token = secrets.token_urlsafe(32)
+    web_session_token = secrets.token_hex(32)
+    web_bootstrap_token = secrets.token_hex(32)
+    daemon_composition = create_product_daemon(
+        host="127.0.0.1",
+        port=args.remote_port,
+        token=daemon_token,
+        codex_binary=codex_binary,
+        timeout_seconds=300,
+        state_path=state_root / "state.sqlite3",
+        evolution_model=args.evolution_model,
+    )
+    daemon_thread = threading.Thread(
+        target=serve_product_daemon,
+        args=(daemon_composition, "the local Web Layer is its only browser entry point"),
+        name="openevo-local-daemon",
+        daemon=True,
+    )
+    web_server = None
+    web_thread: threading.Thread | None = None
+    try:
+        daemon_thread.start()
+        _wait_for_local_health(args.remote_port, daemon_token)
+        browser_endpoint = f"http://127.0.0.1:{args.local_port}"
+        app = create_web_gateway_app(
+            daemon_endpoint=f"http://127.0.0.1:{args.remote_port}",
+            daemon_token=daemon_token,
+            session_token=web_session_token,
+            bootstrap_token=web_bootstrap_token,
+            browser_endpoint=browser_endpoint,
+            source_commit=source_commit,
+            static_root=static_root,
+        )
+        web_server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=args.local_port,
+                log_level="info",
+            )
+        )
+        web_thread = threading.Thread(
+            target=web_server.run,
+            name="openevo-local-web-layer",
+            daemon=True,
+        )
+        web_thread.start()
+        _wait_for_local_webui(args.local_port)
+        browser_url = (
+            f"{browser_endpoint}/openevo"
+            f"#browser-bootstrap={web_bootstrap_token}"
+        )
+        print("Local daemon, Web Layer, and WebUI are ready.")
+        print(f"EvoLab WebUI URL: {browser_url}")
+        if args.browser_e2e:
+            npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
+            if not npm_binary:
+                raise LauncherError("npm was not found for the browser acceptance test")
+            environment = os.environ.copy()
+            environment["OPENEVO_E2E_BASE_URL"] = browser_url
+            command = [npm_binary, "run", "test:webui:e2e"]
+            if os.name != "nt" and npm_binary.lower().endswith((".cmd", ".bat")):
+                command_interpreter = shutil.which("cmd.exe")
+                if not command_interpreter:
+                    raise LauncherError(
+                        "Windows npm was found from WSL, but cmd.exe was unavailable"
+                    )
+                command = [
+                    command_interpreter,
+                    "/d",
+                    "/c",
+                    "npm.cmd",
+                    "run",
+                    "test:webui:e2e",
+                ]
+            return subprocess.run(
+                command,
+                cwd=DESKTOP_ROOT,
+                env=environment,
+                check=False,
+            ).returncode
+        if not args.no_open and not open_browser(browser_url):
+            print("The browser could not be opened automatically; use the URL above.")
+        print("Keep this launcher running; press Ctrl+C to stop the local services.")
+        try:
+            while daemon_thread.is_alive() and web_thread.is_alive():
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            return 0
+        raise LauncherError("a local EvoLab service stopped unexpectedly")
+    finally:
+        if web_server is not None:
+            web_server.should_exit = True
+        if web_thread is not None:
+            web_thread.join(timeout=10)
+        daemon_composition.server.shutdown()
+        daemon_thread.join(timeout=10)
+
+
 def _stop_process(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -1597,6 +1724,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Install or update self-hosted EvoLab through system OpenSSH, "
             "open a private local tunnel, and launch the WebUI"
         )
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="run the formal daemon, Web Layer, and WebUI on this machine without SSH",
     )
     parser.add_argument(
         "--ssh-alias",
@@ -1652,7 +1784,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--local-port", type=_checked_port, default=8765)
-    parser.add_argument("--remote-port", type=_checked_port, default=8787)
+    parser.add_argument(
+        "--remote-port",
+        "--daemon-port",
+        dest="remote_port",
+        type=_checked_port,
+        default=8787,
+        help="daemon loopback port (remote by default, local with --local)",
+    )
     parser.add_argument("--web-port", type=_checked_port, default=8766)
     parser.add_argument("--remote-web-port", type=_checked_port, default=8788)
     parser.add_argument(
@@ -1669,6 +1808,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--evolution-model", default="gpt-5.5")
+    parser.add_argument(
+        "--state-root",
+        type=Path,
+        default=LOCAL_DEVELOPMENT_STATE_ROOT,
+        help="persistent daemon state root used with --local",
+    )
     parser.add_argument(
         "--deploy-only",
         action="store_true",
@@ -1709,18 +1854,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=200,
         help="number of lines per process for --logs (1-2000)",
     )
-    return parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parsed = parser.parse_args(arguments)
+    explicit_ssh_alias = any(
+        argument == "--ssh-alias" or argument.startswith("--ssh-alias=")
+        for argument in arguments
+    )
+    if parsed.local and not explicit_ssh_alias:
+        # A remembered remote default must not make the explicit local mode
+        # depend on or conflict with the user's SSH environment.
+        parsed.ssh_alias = None
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     source_only = args.source_action in {"install", "update"}
-    if args.web_layer and args.self_hosted_webui:
+    if not args.local and args.web_layer and args.self_hosted_webui:
         raise LauncherError("--web-layer and --self-hosted-webui are mutually exclusive")
     if args.browser_e2e and not args.self_hosted_webui:
         raise LauncherError("--browser-e2e requires --self-hosted-webui")
     if args.browser_e2e and args.deploy_only:
         raise LauncherError("--browser-e2e cannot be combined with --deploy-only")
+    if args.local and (
+        args.ssh_alias is not None
+        or args.host is not None
+        or args.user is not None
+        or args.ssh_port != 22
+        or args.ssh_config is not None
+    ):
+        raise LauncherError("--local cannot be combined with SSH connection options")
+    if args.local and (
+        args.web_layer
+        or args.deploy_only
+        or args.release_bundle is not None
+        or args.source_action != "auto"
+    ):
+        raise LauncherError(
+            "--local cannot be combined with deployment, release, or legacy Web Layer options"
+        )
     if source_only and (args.browser_e2e or args.deploy_only):
         raise LauncherError(
             f"--source-action {args.source_action} cannot be combined with startup options"
@@ -1729,6 +1901,14 @@ def main(argv: list[str] | None = None) -> int:
         (name for name in ("status", "logs", "stop") if getattr(args, name)),
         None,
     )
+    if args.local and lifecycle_action is not None:
+        raise LauncherError("--local lifecycle is owned by the foreground launcher")
+    if args.local:
+        ensure_local_ports_available([args.local_port, args.remote_port])
+        return _run_local_self_hosted_webui(
+            args,
+            source_commit=_git_output("rev-parse", "HEAD"),
+        )
     if lifecycle_action is not None:
         if args.browser_e2e or args.deploy_only or args.source_action != "auto":
             raise LauncherError(

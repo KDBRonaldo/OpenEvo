@@ -3033,6 +3033,66 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
+  it("pins a ready Hugging Face model when creating a project", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const createProject = vi.fn(async () => ({ status: "queued" } as never));
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles", "huggingface_model_management_v2"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      createProject,
+      listModelResources: vi.fn(async () => [{
+        model_resource_id: "model-ready",
+        repository_id: "OpenEvo/Fixture-0.1B",
+        requested_revision: "main",
+        resolved_revision: "a".repeat(40),
+        manifest_sha256: DIGEST,
+        state: "ready" as const,
+        downloaded_bytes: 128,
+        total_bytes: 128,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      }]),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    await act(async () => Promise.resolve());
+    await click("Hugging FaceDownloaded and served on this server");
+    await click("OpenEvo/Fixture-0.1Baaaaaaaaaa");
+    await click("Create project");
+
+    expect(createProject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          execution: expect.objectContaining({
+            mode: "self-deployed",
+            model_profile_id: null,
+            model_resource_id: "model-ready",
+            repository_id: "OpenEvo/Fixture-0.1B",
+            model_revision: "a".repeat(40),
+          }),
+        }),
+      }),
+      expect.anything(),
+    );
+  });
+
   it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));

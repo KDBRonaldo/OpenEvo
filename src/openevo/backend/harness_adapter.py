@@ -267,6 +267,7 @@ class CodexHarnessAdapter:
         schema_path: Path,
         output_path: Path,
         image_paths: list[Path] | None = None,
+        inference: Mapping[str, str] | None = None,
     ) -> list[str]:
         argv = [
             self._codex_binary,
@@ -288,8 +289,19 @@ class CodexHarnessAdapter:
         ]
         for image_path in image_paths or []:
             argv.extend(("--image", os.fspath(image_path)))
-        if self._model:
-            argv.extend(("--model", self._model))
+        effective_model = self._model
+        if inference is not None:
+            effective_model = inference["model"]
+            provider_id = "openevo_self_deployed"
+            argv.extend((
+                "-c", f'model_provider="{provider_id}"',
+                "-c", f'model_providers.{provider_id}.name="OpenEvo Self-Deployed"',
+                "-c", f'model_providers.{provider_id}.base_url={json.dumps(inference["base_url"])}',
+                "-c", f'model_providers.{provider_id}.env_key="OPENAI_API_KEY"',
+                "-c", f'model_providers.{provider_id}.wire_api="responses"',
+            ))
+        if effective_model:
+            argv.extend(("--model", effective_model))
         argv.append("-")
         return argv
 
@@ -417,9 +429,13 @@ class CodexHarnessAdapter:
                 schema_path=schema_path,
                 output_path=output_path,
                 image_paths=image_paths,
+                inference=request.get("inference"),
             )
             environment = os.environ.copy()
             environment.update(runtime_context["environment"])
+            inference = request.get("inference")
+            if isinstance(inference, Mapping):
+                environment["OPENAI_API_KEY"] = "openevo-local"
             emit("Starting the Codex harness process.")
             if not cancellable_process:
                 try:
@@ -464,7 +480,11 @@ class CodexHarnessAdapter:
             "schema_version": "1",
             "response": plan["answer"],
             "file_mutations": plan["mutations"],
-            "model": self._model,
+            "model": (
+                request["inference"]["model"]
+                if isinstance(request.get("inference"), Mapping)
+                else self._model
+            ),
             "duration_ms": duration_ms,
             "runtime_activation": runtime_activation.to_dict(),
             "logs": [

@@ -36,14 +36,19 @@ def test_product_composition_initializes_all_authoritative_services(
             observed["sealed_store"] = store
             return ["legacy evidence fixture"]
 
+    class Models:
+        def __init__(self, **kwargs: object) -> None:
+            observed["models"] = kwargs
+
     class Server:
-        def __init__(self, address, token, runner, store, evolution) -> None:
-            observed["server"] = (address, token, runner, store, evolution)
+        def __init__(self, address, token, runner, store, evolution, models) -> None:
+            observed["server"] = (address, token, runner, store, evolution, models)
 
     monkeypatch.setattr(product_app.shutil, "which", lambda _: "/usr/bin/codex")
     monkeypatch.setattr(product_app, "CodexRunner", Runner)
     monkeypatch.setattr(product_app, "DevelopmentStateStore", Store)
     monkeypatch.setattr(product_app, "DocumentEvolutionRunner", Evolution)
+    monkeypatch.setattr(product_app, "HuggingFaceModelManager", Models)
     monkeypatch.setattr(product_app, "DevelopmentAgentServer", Server)
 
     composition = product_app.create_product_daemon(
@@ -60,6 +65,10 @@ def test_product_composition_initializes_all_authoritative_services(
     assert observed["runner_ready"] is True
     assert observed["evolution_ready"] is True
     assert observed["state_path"] == (tmp_path / "state.sqlite3").resolve()
+    assert observed["models"] == {
+        "state_path": (tmp_path / "state.sqlite3").resolve(),
+        "root": tmp_path / "models",
+    }
     assert composition.evolution_model == "evolution-model"
     assert composition.evidence_failures == ("legacy evidence fixture",)
 

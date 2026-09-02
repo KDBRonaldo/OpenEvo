@@ -283,12 +283,22 @@ export const selfDeployedExecutionSettingsV2Schema = z.object({
   capture_mode: z.literal("transcript"),
   token_level_metrics_available: z.literal(false),
   harness_id: z.literal("codex"),
-  model_profile_id: z.literal("qwen3-0.6b-v1"),
+  model_profile_id: z.literal("qwen3-0.6b-v1").nullable().optional(),
+  model_resource_id: opaqueIdV2Schema.nullable().optional(),
+  repository_id: z.string().min(3).max(193).regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).nullable().optional(),
+  model_revision: z.string().regex(/^[0-9a-f]{40}$/).nullable().optional(),
   token_limit: positiveSafeIntegerV2Schema.max(8_192),
   task_network_allow_internet: z.boolean(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const legacy = value.model_profile_id != null;
+  const managedFields = [value.model_resource_id, value.repository_id, value.model_revision];
+  const managed = managedFields.every((field) => field != null);
+  if (legacy === managed || (!legacy && managedFields.some((field) => field == null))) {
+    issue(context, [], "self-deployed execution must select exactly one complete model authority");
+  }
+});
 
-export const scienceExecutionSettingsV2Schema = z.discriminatedUnion("mode", [
+export const scienceExecutionSettingsV2Schema = z.union([
   codexSubscriptionExecutionSettingsV2Schema,
   selfDeployedExecutionSettingsV2Schema,
 ]);

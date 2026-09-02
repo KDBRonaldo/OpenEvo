@@ -84,6 +84,13 @@ codex login status
 Logging in as another server user does not authenticate the account EvoLab
 will invoke.
 
+Public Hugging Face models can be registered from a Project's **Execution
+model** settings. Self-deployed execution additionally requires Docker, an
+NVIDIA GPU, enough disk/VRAM for the selected vLLM-compatible safetensors
+model, and server access to Hugging Face (or an administrator-configured
+`HF_ENDPOINT` mirror). Model files remain in the daemon's private state root;
+the browser receives only model identity and progress records.
+
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,
 or required packages are not cached. Network-sensitive launcher phases have

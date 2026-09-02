@@ -311,8 +311,9 @@ def _reflector_llm_schema() -> dict[str, Any]:
             "model": _string(),
             "provider": {
                 "type": "string",
-                "enum": ["codex_cli"],
+                "enum": ["codex_cli", "openai_chat"],
             },
+            "base_url": _string(),
             "temperature": {
                 "type": "number",
                 "minimum": 0.0,
@@ -358,8 +359,9 @@ def _memevolve_schema() -> dict[str, Any]:
                     "model": _string(),
                     "provider": {
                         "type": "string",
-                        "enum": ["codex_cli"],
+                        "enum": ["codex_cli", "openai_chat"],
                     },
+                    "base_url": _string(),
                     "timeout_seconds": {
                         "type": "number",
                         "exclusiveMinimum": 0.0,

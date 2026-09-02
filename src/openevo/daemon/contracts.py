@@ -194,6 +194,61 @@ class DevelopmentCapabilitiesV2(StrictDevelopmentModelV2):
         return self
 
 
+class DevelopmentModelV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    model_resource_id: core.OpaqueId
+    repository_id: str = Field(
+        min_length=3,
+        max_length=193,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+    )
+    requested_revision: str = Field(min_length=1, max_length=128)
+    resolved_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    manifest_sha256: core.Sha256Digest | None = None
+    state: Literal["queued", "resolving", "downloading", "ready", "failed"]
+    downloaded_bytes: int = Field(ge=0, le=256 * 1024**3)
+    total_bytes: int | None = Field(default=None, ge=0, le=256 * 1024**3)
+    error: str | None = Field(default=None, max_length=4_000)
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+    @model_validator(mode="after")
+    def _validate_progress(self) -> "DevelopmentModelV2":
+        if self.total_bytes is not None and self.downloaded_bytes > self.total_bytes:
+            raise ValueError("model download progress exceeds its declared size")
+        if self.state == "ready" and (
+            self.resolved_revision is None
+            or self.manifest_sha256 is None
+            or self.total_bytes is None
+            or self.downloaded_bytes != self.total_bytes
+        ):
+            raise ValueError("ready model is missing immutable snapshot authority")
+        if self.state == "failed" and not self.error:
+            raise ValueError("failed model must include an error")
+        return self
+
+
+class DevelopmentModelListV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    items: list[DevelopmentModelV2] = Field(max_length=256)
+
+
+class DevelopmentModelRegisterV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+    repository_id: str = Field(
+        min_length=3,
+        max_length=193,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$",
+    )
+    revision: str = Field(default="main", min_length=1, max_length=128)
+
+
+class DevelopmentModelRetryV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
+
+
 class DevelopmentTaskTimelineEventBaseV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     event_id: core.OpaqueId
@@ -525,6 +580,10 @@ __all__ = [
     "DevelopmentEvolutionJobPageV2",
     "DevelopmentEvolutionJobRetryV2",
     "DevelopmentEvolutionJobV2",
+    "DevelopmentModelListV2",
+    "DevelopmentModelRegisterV2",
+    "DevelopmentModelRetryV2",
+    "DevelopmentModelV2",
     "DevelopmentDatasetSealedObservationV2",
     "DevelopmentTaskAdmittedObservationV2",
     "DevelopmentProjectActivateV2",

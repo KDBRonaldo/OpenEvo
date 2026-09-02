@@ -150,3 +150,34 @@ def test_artifact_document_reading_ignores_binary_and_preserves_relative_paths(
         ("memory.md", "# Memory"),
         ("nested/notes.txt", "Notes"),
     ]
+
+
+def test_project_managed_model_is_injected_into_reflector_execution(tmp_path: Path) -> None:
+    prepared: list[str] = []
+
+    def prepare(project_id: str) -> dict[str, str]:
+        prepared.append(project_id)
+        return {
+            "model": "OpenEvo/Fixture-0.1B",
+            "base_url": "http://127.0.0.1:18432/v1",
+        }
+
+    orchestrator = EvolutionOrchestrator(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="subscription-model",
+        timeout_seconds=30,
+        inference_preparer=prepare,
+    )
+    orchestrator._load_catalog()
+    method = orchestrator._registry.methods["text_memory_reflector"]
+
+    config = orchestrator._method_config(method, {}, project_id="project-model")
+
+    assert prepared == ["project-model"]
+    assert config["reflector_llm"] == {
+        "provider": "openai_chat",
+        "model": "OpenEvo/Fixture-0.1B",
+        "base_url": "http://127.0.0.1:18432/v1",
+        "timeout_seconds": 30,
+    }

@@ -14,6 +14,7 @@ import {
   withoutWorkspaceFileV2,
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
+  type DevelopmentModelResourceV2,
   type ProductSubscriptionSignalV2,
 } from "./providerV2";
 
@@ -216,6 +217,9 @@ export interface DevelopmentAgentBackend {
     path: string,
   ): Promise<{ readonly fileName: string; readonly mediaType: string; readonly data: Blob }>;
   deleteWorkspaceFile(projectId: string, path: string): Promise<void>;
+  listModelResources?(): Promise<readonly DevelopmentModelResourceV2[]>;
+  registerModelResource?(repositoryId: string, revision: string, actionId: string): Promise<DevelopmentModelResourceV2>;
+  retryModelResource?(modelResourceId: string, actionId: string): Promise<DevelopmentModelResourceV2>;
 }
 
 interface DevelopmentProviderOptions {
@@ -306,6 +310,15 @@ function createRemoteBackedDesktopProductProvider(
     subscribe: (listener) => {
       subscribers.add(listener);
       return () => subscribers.delete(listener);
+    },
+    listModelResources: async () => options.developmentBackend.listModelResources?.() ?? [],
+    registerModelResource: async (repositoryId, revision, intent) => {
+      if (!options.developmentBackend.registerModelResource) throw new Error("Model management is unavailable.");
+      return options.developmentBackend.registerModelResource(repositoryId, revision, intent.actionId);
+    },
+    retryModelResource: async (modelResourceId, intent) => {
+      if (!options.developmentBackend.retryModelResource) throw new Error("Model management is unavailable.");
+      return options.developmentBackend.retryModelResource(modelResourceId, intent.actionId);
     },
     createProject: async (draft) => {
       await ensureDevelopmentState();

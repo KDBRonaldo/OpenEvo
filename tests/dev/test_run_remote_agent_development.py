@@ -5,6 +5,8 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,166 @@ def test_self_hosted_webui_is_an_explicit_opt_in() -> None:
 
     assert args.self_hosted_webui is True
     assert args.remote_web_port == 8788
+
+
+def test_local_webui_is_an_explicit_ssh_free_mode() -> None:
+    args = remote_launcher.parse_args(
+        ["--local", "--self-hosted-webui", "--daemon-port", "8899"]
+    )
+
+    assert args.local is True
+    assert args.remote_port == 8899
+    assert args.state_root == remote_launcher.LOCAL_DEVELOPMENT_STATE_ROOT
+
+
+def test_local_webui_ignores_the_remote_alias_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENEVO_DEV_SSH_ALIAS", "gpu-lab")
+
+    args = remote_launcher.parse_args(["--local", "--self-hosted-webui"])
+
+    assert args.ssh_alias is None
+
+
+def test_local_webui_dispatches_without_resolving_ssh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[object, str]] = []
+    monkeypatch.setattr(remote_launcher, "ensure_local_ports_available", lambda _: None)
+    monkeypatch.setattr(
+        remote_launcher,
+        "resolve_launcher_connection",
+        lambda _: pytest.fail("local mode must not resolve an SSH connection"),
+    )
+    monkeypatch.setattr(
+        remote_launcher,
+        "_git_output",
+        lambda *args: "a" * 40 if args == ("rev-parse", "HEAD") else "",
+    )
+    monkeypatch.setattr(
+        remote_launcher,
+        "_run_local_self_hosted_webui",
+        lambda args, *, source_commit: captured.append((args, source_commit)) or 0,
+    )
+
+    result = remote_launcher.main(["--local", "--self-hosted-webui", "--no-open"])
+
+    assert result == 0
+    assert len(captured) == 1
+    assert captured[0][1] == "a" * 40
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--ssh-alias", "gpu-lab"],
+        ["--host", "example.com", "--user", "root"],
+        ["--release-bundle", "release.oevobundle"],
+        ["--source-action", "install"],
+        ["--web-layer"],
+        ["--status"],
+    ],
+)
+def test_local_webui_rejects_remote_only_options(options: list[str]) -> None:
+    with pytest.raises(remote_launcher.LauncherError, match="--local"):
+        remote_launcher.main(["--local", "--self-hosted-webui", *options])
+
+
+def test_local_webui_composes_the_formal_daemon_and_web_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from openevo.daemon import product_app as daemon_product
+    from openevo.web_gateway import product_app as web_product
+    import uvicorn
+
+    observed: dict[str, object] = {}
+    daemon_stop = threading.Event()
+
+    class LocalDaemonServer:
+        def shutdown(self) -> None:
+            observed["daemon_shutdown"] = True
+            daemon_stop.set()
+
+    composition = SimpleNamespace(server=LocalDaemonServer())
+
+    def create_daemon(**kwargs: object) -> object:
+        observed["daemon"] = kwargs
+        return composition
+
+    def serve_daemon(received: object, access_hint: str) -> None:
+        observed["served_daemon"] = received
+        observed["daemon_access_hint"] = access_hint
+        daemon_stop.wait(5)
+
+    def create_web(**kwargs: object) -> object:
+        observed["web"] = kwargs
+        return object()
+
+    class LocalWebServer:
+        def __init__(self, config: object) -> None:
+            observed["web_config"] = config
+            self.should_exit = False
+
+        def run(self) -> None:
+            while not self.should_exit:
+                time.sleep(0.001)
+
+    monkeypatch.setattr(daemon_product, "create_product_daemon", create_daemon)
+    monkeypatch.setattr(daemon_product, "serve_product_daemon", serve_daemon)
+    monkeypatch.setattr(web_product, "create_web_gateway_app", create_web)
+    monkeypatch.setattr(uvicorn, "Server", LocalWebServer)
+    monkeypatch.setattr(
+        remote_launcher.shutil,
+        "which",
+        lambda executable: f"/{executable}",
+    )
+    monkeypatch.setattr(remote_launcher, "_wait_for_local_health", lambda *_: None)
+    monkeypatch.setattr(remote_launcher, "_wait_for_local_webui", lambda *_: None)
+    monkeypatch.setattr(
+        remote_launcher.subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(returncode=0),
+    )
+    args = remote_launcher.parse_args(
+        [
+            "--local",
+            "--self-hosted-webui",
+            "--browser-e2e",
+            "--state-root",
+            str(tmp_path),
+            "--local-port",
+            "18765",
+            "--daemon-port",
+            "18787",
+        ]
+    )
+
+    result = remote_launcher._run_local_self_hosted_webui(
+        args,
+        source_commit="a" * 40,
+    )
+
+    assert result == 0
+    assert observed["served_daemon"] is composition
+    assert observed["daemon_access_hint"] == (
+        "the local Web Layer is its only browser entry point"
+    )
+    assert observed["daemon_shutdown"] is True
+    daemon = observed["daemon"]
+    assert isinstance(daemon, dict)
+    assert daemon["host"] == "127.0.0.1"
+    assert daemon["port"] == 18787
+    assert daemon["state_path"] == tmp_path / "state.sqlite3"
+    web = observed["web"]
+    assert isinstance(web, dict)
+    assert web["daemon_endpoint"] == "http://127.0.0.1:18787"
+    assert web["browser_endpoint"] == "http://127.0.0.1:18765"
+    assert web["source_commit"] == "a" * 40
+    assert web["static_root"] == (
+        Path(remote_launcher.__file__).resolve().parent / "web_gateway" / "static"
+    )
 
 
 def test_release_bundle_is_an_explicit_delivery_input() -> None:

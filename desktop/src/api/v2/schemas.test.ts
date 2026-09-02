@@ -389,7 +389,7 @@ describe("Desktop Local API v2 schemas", () => {
     })).toThrow();
   });
 
-  it("accepts only the release-owned Self-Deployed model profile", () => {
+  it("accepts a release profile or one complete daemon-managed model identity", () => {
     const config = {
       schema_version: "2",
       task: { title: "Local inference", objective: "Solve the task through Core Gateway." },
@@ -414,6 +414,25 @@ describe("Desktop Local API v2 schemas", () => {
     expect(() => scienceProjectConfigV2Schema.parse({
       ...config,
       execution: { ...config.execution, hf_model: "Qwen/Qwen3-0.6B" },
+    })).toThrow();
+    expect(scienceProjectConfigV2Schema.parse({
+      ...config,
+      execution: {
+        ...config.execution,
+        model_profile_id: null,
+        model_resource_id: "model-ready",
+        repository_id: "OpenEvo/Fixture-0.1B",
+        model_revision: "a".repeat(40),
+      },
+    }).execution.mode).toBe("self-deployed");
+    expect(() => scienceProjectConfigV2Schema.parse({
+      ...config,
+      execution: {
+        ...config.execution,
+        model_profile_id: null,
+        model_resource_id: "model-ready",
+        repository_id: "OpenEvo/Fixture-0.1B",
+      },
     })).toThrow();
   });
 });

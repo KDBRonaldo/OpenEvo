@@ -47,6 +47,7 @@ class FakeDaemonClient:
         self.workspace_files: dict[str, bytes] = {}
         self.evolution_action_ids: dict[str, str] = {}
         self.evolution_retry_action_ids: dict[str, str] = {}
+        self.models: list[dict[str, object]] = []
 
     def emit_event(self, project_id: str) -> None:
         sequence = len(self.events) + 1
@@ -430,6 +431,42 @@ class FakeDaemonClient:
     ) -> tuple[int, bytes, dict[str, str]]:
         del content_type
         parameters = parse_qs(query)
+        if path == "development/models" and method == "GET":
+            return 200, json.dumps(
+                {"schema_version": "2", "items": self.models}
+            ).encode(), {"Content-Type": "application/json"}
+        if path == "development/models" and method == "POST":
+            registration = json.loads(body)
+            model = {
+                "schema_version": "2",
+                "model_resource_id": "model-fixture",
+                "repository_id": registration["repository_id"],
+                "requested_revision": registration["revision"],
+                "resolved_revision": None,
+                "manifest_sha256": None,
+                "state": "downloading",
+                "downloaded_bytes": 0,
+                "total_bytes": 128,
+                "error": None,
+                "created_at": "2026-09-02T00:00:00Z",
+                "updated_at": "2026-09-02T00:00:00Z",
+            }
+            self.models[:] = [model]
+            return 202, json.dumps(model).encode(), {"Content-Type": "application/json"}
+        model_detail = re.fullmatch(r"development/models/([^/]+)", path)
+        if model_detail and method == "GET":
+            model = next(
+                item for item in self.models
+                if item["model_resource_id"] == model_detail.group(1)
+            )
+            return 200, json.dumps(model).encode(), {"Content-Type": "application/json"}
+        model_retry = re.fullmatch(r"development/models/([^/]+)/retry", path)
+        if model_retry and method == "POST":
+            model = next(
+                item for item in self.models
+                if item["model_resource_id"] == model_retry.group(1)
+            )
+            return 202, json.dumps(model).encode(), {"Content-Type": "application/json"}
         if path == "development/tasks" and method == "GET":
             project_id = parameters["project_id"][0]
             payload = {
@@ -803,6 +840,7 @@ def test_provider_exposes_only_honest_development_features() -> None:
     assert version.feature_flags == [
         "development_agent_bridge_v2",
         "event_replay_v2",
+        "huggingface_model_management_v2",
         "mutation_idempotency_v2",
     ]
     assert "daemon_bundle_v2" not in version.feature_flags
@@ -1105,6 +1143,54 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
         )
         assert deleted.status_code == 200
         assert deleted.json()["deleted_path"] == "notes/answer.txt"
+
+
+def test_http_layer_proxies_server_owned_model_downloads() -> None:
+    import openevo.web_gateway.product_app as web
+
+    fake = FakeDaemonClient()
+    original = web.DevelopmentDaemonClient
+    web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
+    try:
+        app = create_development_agent_web_app(
+            daemon_endpoint="http://127.0.0.1:8787",
+            daemon_token="daemon-secret",
+            session_token="desktop-secret",
+            bootstrap_token="c" * 64,
+            browser_endpoint="http://127.0.0.1:8765",
+            source_commit="a" * 40,
+        )
+    finally:
+        web.DevelopmentDaemonClient = original
+
+    headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
+    root = "/desktop/v2/development/models"
+    with TestClient(app) as client:
+        assert client.get(root).status_code == 401
+        registered = client.post(
+            root,
+            headers=headers,
+            json={
+                "schema_version": "2",
+                "action_id": "register-model",
+                "repository_id": "OpenEvo/Fixture-0.1B",
+                "revision": "main",
+            },
+        )
+        assert registered.status_code == 202
+        assert registered.json()["repository_id"] == "OpenEvo/Fixture-0.1B"
+        inventory = client.get(root, headers=headers)
+        assert inventory.status_code == 200
+        assert inventory.json()["items"] == [registered.json()]
+        detail = client.get(f"{root}/model-fixture", headers=headers)
+        assert detail.json() == registered.json()
+        retry = client.post(
+            f"{root}/model-fixture/retry",
+            headers=headers,
+            json={"schema_version": "2", "action_id": "retry-model"},
+        )
+        assert retry.status_code == 202
+        assert retry.json()["model_resource_id"] == "model-fixture"
 
 
 def test_http_layer_proxies_authenticated_project_and_task_deletions() -> None:
