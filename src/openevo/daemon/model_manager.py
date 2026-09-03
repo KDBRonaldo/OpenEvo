@@ -40,7 +40,7 @@ _SAFE_MODEL_SUFFIXES = (
 _REQUIRED_MODEL_FILES = frozenset({"config.json"})
 VLLM_IMAGE = (
     "docker.io/vllm/vllm-openai@"
-    "sha256:c48cf118e1e6e39d7790e174d6014f7af5d06f79c2d29d984d11cbe2e8d414e7"
+    "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14"
 )
 VLLM_IMAGE_PULL_TIMEOUT_SECONDS = 1_800
 VLLM_GPU_MEMORY_UTILIZATION = 0.85
