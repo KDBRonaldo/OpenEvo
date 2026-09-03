@@ -146,6 +146,7 @@ class ManagedModelProxy:
                 streaming = bool(chat_request.pop("stream", False))
                 chat_request.pop("stream_options", None)
                 chat_request["stream"] = False
+                chat_request.setdefault("temperature", 0.0)
                 try:
                     status, payload = proxy._upstream(
                         "POST", "/chat/completions", chat_request

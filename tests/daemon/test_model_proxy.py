@@ -110,4 +110,5 @@ def test_managed_model_proxy_translates_responses_and_streams() -> None:
         "model": "fixture/model",
         "max_tokens": 20,
         "stream": False,
+        "temperature": 0.0,
     }

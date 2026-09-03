@@ -213,7 +213,7 @@ class CodexHarnessAdapter:
             raise HarnessRunError("Codex returned an invalid structured workspace response")
         answer = plan.get("answer")
         if not isinstance(answer, str) or not answer.strip():
-            raise HarnessRunError("Codex returned an empty answer")
+            raise HarnessRunError("Harness model returned an empty answer")
         mutations = {"file_writes": plan.get("file_writes"), "delete_paths": plan.get("delete_paths")}
         if not isinstance(mutations["file_writes"], list) or not isinstance(
             mutations["delete_paths"], list
@@ -384,13 +384,23 @@ class CodexHarnessAdapter:
             self.apply_agent_system(runtime_context)
             workspace_context = self._workspace_context(request.get("workspace_snapshot"))
             image_paths = self._image_attachments(runtime_context)
+            inference = request.get("inference")
+            model_identity = ""
+            if isinstance(inference, Mapping):
+                model_identity = (
+                    f"The trusted runtime model identifier is {inference['model']}. "
+                    "Use that exact identifier if the user asks which model is serving this "
+                    "session. "
+                )
             prompt = (
                 "You are planning changes for a persistent OpenEvo project workspace. "
                 "The trusted daemon, not you, applies file mutations after validating them. "
                 "Do not call shell, patch, or filesystem tools. The supplied workspace JSON is a "
                 "bounded index containing text and daemon-extracted document projections. Attached "
                 "workspace images are available as visual inputs. Solve the user's task and return "
-                "only the requested structured result. "
+                "only the requested structured result. The answer field must contain a direct, "
+                "non-empty answer to the user's message. "
+                f"{model_identity}"
                 "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
                 "changed in file_writes. Put only regular files that must be removed in delete_paths. "
                 "Do not include unchanged files and do not use absolute paths or '..'. "
@@ -408,7 +418,11 @@ class CodexHarnessAdapter:
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "answer": {"type": "string"},
+                        "answer": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "A direct, non-empty answer to the user's message.",
+                        },
                         "file_writes": {
                             "type": "array",
                             "items": {
@@ -433,7 +447,6 @@ class CodexHarnessAdapter:
             )
             environment = os.environ.copy()
             environment.update(runtime_context["environment"])
-            inference = request.get("inference")
             if isinstance(inference, Mapping):
                 environment["OPENAI_API_KEY"] = "openevo-local"
             emit("Starting the Codex harness process.")

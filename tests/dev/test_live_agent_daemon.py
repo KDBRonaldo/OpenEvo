@@ -281,6 +281,8 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
         captured["skill_md"] = next(
             (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
         ).read_text(encoding="utf-8")
+        schema_path = Path(args[args.index("--output-schema") + 1])
+        captured["schema"] = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(args[args.index("--output-last-message") + 1])
         output_path.write_text(
             json.dumps(
@@ -358,6 +360,8 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert captured["skill_md"].startswith("---\nname: skill-artifact-1\ndescription: ")
     assert "\n---\n\n# Native evolved skill\n" in captured["skill_md"]
     assert "persistent OpenEvo project workspace" in captured["prompt"]
+    assert "trusted runtime model identifier is OpenEvo/Fixture-0.1B" in captured["prompt"]
+    assert captured["schema"]["properties"]["answer"]["minLength"] == 1
     assert "read-only" in captured["args"]
     assert "shell_tool" in captured["args"]
     assert "--image" in captured["args"]
