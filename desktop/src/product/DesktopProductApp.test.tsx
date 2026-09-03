@@ -703,6 +703,24 @@ describe("Desktop v2 product renderer", () => {
     expect(document.querySelector(".product-topbar")).toBeNull();
   });
 
+  it("reloads the browser page when startup retry is requested", async () => {
+    const reload = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      refresh: vi.fn(async () => {
+        throw new Error("The selected item was not found.");
+      }),
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await vi.waitFor(() => expect(document.body.textContent).toContain("Retry startup"));
+
+    await click("Retry startup");
+
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(provider.refresh).toHaveBeenCalledTimes(1);
+  });
+
   it("explains a lost local API connection with a compact actionable status", async () => {
     let refreshCount = 0;
     let listener: Parameters<DesktopProductProviderV2["subscribe"]>[0] | null = null;

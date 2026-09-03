@@ -555,7 +555,7 @@ export function DesktopProductApp({
     return (
       <InitialV2View
         error={loadError}
-        onRetry={() => void refresh()}
+        onRetry={() => globalThis.location.reload()}
       />
     );
   }
