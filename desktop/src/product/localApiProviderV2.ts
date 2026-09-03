@@ -1354,7 +1354,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }
       if (isDesktopLifecycleMutationV2(entry.mutation_kind)) {
         const operation = this.lifecycleOperations.get(operationId)?.operation
-          ?? await this.lifecycleOperations.refresh(operationId);
+          ?? await this.refreshLifecycleOperationForIntentV2(entry, operationId);
         if (isLifecycleTerminalV2(operation)) {
           await this.reconcileLifecycleTerminalV2(entry, operation, snapshot);
           acknowledged.add(operation.operation_id);
@@ -1402,6 +1402,32 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         await this.validateLifecycleResultV2(state.operation, snapshot);
       }
       await this.acknowledgeLifecycleTerminalV2(state.operation);
+    }
+  }
+
+  private async refreshLifecycleOperationForIntentV2(
+    entry: PendingMutationIntentV2,
+    operationId: string,
+  ): Promise<LifecycleOperationV2> {
+    try {
+      return await this.lifecycleOperations.refresh(operationId);
+    } catch (error) {
+      if (!(error instanceof DesktopApiErrorV2) || error.status !== 404) throw error;
+      // The self-hosted Web Layer can restart after the daemon mutation has
+      // committed but before the browser clears its durable retry journal.
+      // Recover through the action identity, then require the exact operation
+      // identity before accepting the reconstructed terminal projection.
+      const recovered = await this.client.getLifecycleOperationByAction(
+        entry.action_id,
+        expectedLifecycleKindForMutationIntentV2(entry),
+      );
+      assertLifecycleOperationMatchesMutationIntentV2(entry, recovered);
+      if (recovered.operation_id !== operationId) {
+        throw new DesktopContractErrorV2(
+          "Recovered lifecycle action returned another operation authority",
+        );
+      }
+      return this.observeOperation(recovered);
     }
   }
 

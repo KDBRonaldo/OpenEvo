@@ -1680,6 +1680,46 @@ def test_provider_projects_capabilities_for_a_self_deployed_project() -> None:
     assert projection.capabilities.evaluated_profile.execution_mode == "self_deployed"
 
 
+def test_provider_recovers_a_durable_project_create_operation_after_restart() -> None:
+    fake = FakeDaemonClient()
+    action_id = "project-create-restart-recovery-0001"
+    digest = hashlib.sha256(
+        json.dumps(
+            action_id,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    project_id = f"development-project-{digest[:12]}"
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Recovered project",
+                    "config": _config(),
+                    "created_at": "2026-09-03T00:00:00Z",
+                    "updated_at": "2026-09-03T00:00:00Z",
+                }
+            ],
+        }
+    )
+    restarted = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    operation = restarted.invoke(
+        "getDesktopLifecycleOperationByActionV2",
+        {"action_id": action_id, "kind": "project_create"},
+    )
+
+    assert operation.operation_id == f"development-project_create-{digest[:16]}"
+    assert operation.status == "succeeded"
+    assert operation.result is not None
+    assert operation.result.project_id == project_id
+
+
 def test_provider_pages_more_than_one_hundred_tasks_without_capping_history() -> None:
     fake = FakeDaemonClient()
     fake.state.update(

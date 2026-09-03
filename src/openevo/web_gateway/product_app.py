@@ -862,11 +862,24 @@ class DevelopmentAgentDesktopV2Provider:
         return operation
 
     def _operation_by_action(self, arguments: Mapping[str, object]) -> m.LifecycleOperationV2:
-        operation_id = self._actions.get(str(arguments.get("action_id")))
+        action_id = str(arguments.get("action_id"))
+        kind = arguments.get("kind")
+        operation_id = self._actions.get(action_id)
+        if operation_id is None and kind == "project_create":
+            # Development lifecycle operations are intentionally lightweight
+            # in-memory projections, while Project creation and its action ID
+            # are durable in the daemon. Reconstruct the terminal projection
+            # after a Web Layer restart so the browser's durable mutation
+            # journal can finish reconciliation instead of blocking startup.
+            project_id = f"development-project-{_canonical_digest(action_id)[:12]}"
+            self._find_project(project_id)
+            return self._terminal_operation(
+                kind="project_create", project_id=project_id, action_id=action_id
+            )
         if operation_id is None:
             raise HTTPException(status_code=404, detail="operation not found")
         operation = self._operations[operation_id]
-        if operation.kind != arguments.get("kind"):
+        if operation.kind != kind:
             raise HTTPException(status_code=404, detail="operation not found")
         return operation
 

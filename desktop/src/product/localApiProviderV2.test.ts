@@ -1655,6 +1655,78 @@ describe("Desktop v2 product provider", () => {
     expect(native.journalValue()).toBeNull();
   });
 
+  it("recovers an accepted lifecycle operation missing after a Web Layer restart", async () => {
+    const fixture = activeProjectFixture();
+    const actionId = "project-create-web-layer-restart-0001";
+    const operationId = "lifecycle-project-create-restarted-1";
+    const native = nativeFixture(undefined, JSON.stringify({
+      schema_version: "2",
+      revision: 1,
+      entries: [{
+        action_id: actionId,
+        mutation_kind: "project_create",
+        resource_scope: `project:new:${fixture.connected.profile_id}`,
+        request_sha256: "a".repeat(64),
+        authority_sha256: "b".repeat(64),
+        provider_stream_instance: "provider-instance-before-restart",
+        provider_stream_epoch: 1,
+        chain_step: "single",
+        accepted_operation_id: operationId,
+        completed_operation_ids: [],
+        state: "accepted",
+        created_at: NOW,
+        updated_at: NOW,
+      }],
+    }));
+    const missing = new DesktopApiErrorV2(404, {
+      schema_version: "2",
+      code: "desktop_resource_not_found",
+      summary: "operation not found",
+      retryable: false,
+      action: "none",
+      affected_resource_id: operationId,
+    });
+    const recovered = {
+      ...lifecycleOperation(),
+      operation_id: operationId,
+      kind: "project_create" as const,
+      resource: {
+        resource_kind: "project" as const,
+        resource_id: fixture.project.project_id,
+      },
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      cancellable: false,
+      result: {
+        result_kind: "project" as const,
+        project_id: fixture.project.project_id,
+      },
+      finished_at: NOW,
+    };
+    vi.mocked(fixture.client.getLifecycleOperation).mockRejectedValue(missing);
+    vi.mocked(fixture.client.getLifecycleOperationByAction).mockResolvedValue(recovered);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client: fixture.client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-after-restart",
+    });
+
+    await expect(provider.refresh()).resolves.toMatchObject({ status: "fresh" });
+
+    expect(fixture.client.getLifecycleOperationByAction).toHaveBeenCalledWith(
+      actionId,
+      "project_create",
+    );
+    expect(fixture.client.acknowledgeLifecycleOperation).toHaveBeenCalledWith(
+      operationId,
+      expect.objectContaining({ expected_terminal_status: "succeeded" }),
+      expect.objectContaining({ ifMatch: recovered.etag }),
+    );
+    expect(native.journalValue()).toBeNull();
+  });
+
   it("replays a reserved lifecycle cancellation after an ambiguous relaunch", async () => {
     const native = nativeFixture();
     const running = {
