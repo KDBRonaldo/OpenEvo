@@ -272,7 +272,10 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        stdout = "b" * 64 if command[1] == "run" else ""
+        if "--entrypoint" in command:
+            stdout = "0, 24576, 12000\n1, 24576, 24500\n"
+        else:
+            stdout = "b" * 64 if command[1] == "run" else ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     class Proxy:
@@ -306,14 +309,91 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
 
     assert first == replay
     assert first["base_url"].startswith("http://127.0.0.1:")
-    starts = [command for command in commands if command[1] == "run"]
+    starts = [command for command in commands if "--detach" in command]
     assert len(starts) == 1
     assert VLLM_IMAGE in starts[0]
     assert "--pull=never" in starts[0]
     assert "--gpus" in starts[0]
+    assert starts[0][starts[0].index("--gpus") + 1] == "device=1"
+    assert "--rm" not in starts[0]
     assert "--cap-add=DAC_READ_SEARCH" in starts[0]
     assert "--enable-auto-tool-choice" in starts[0]
     assert "hermes" in starts[0]
     assert any(value.startswith("127.0.0.1:") for value in starts[0])
     assert f"{snapshot}:/model:ro" in starts[0]
-    assert commands[-1] == ["/usr/bin/docker", "stop", "--time", "10", "b" * 64]
+    assert commands[-1] == ["/usr/bin/docker", "rm", "--force", "b" * 64]
+
+
+def test_vllm_runtime_reports_gpu_pressure_before_starting_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "--entrypoint" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="0, 32607, 11000\n1, 32607, 9000\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/docker")
+    runtime = VllmModelRuntime(command_runner=run)
+
+    with pytest.raises(StateConflictError, match="no GPU has enough free memory") as error:
+        runtime.ensure_running(
+            model_resource_id="model-fixture",
+            repository_id="OpenEvo/Fixture-0.1B",
+            snapshot_path=snapshot,
+        )
+
+    assert "GPU 0: 11000 MiB free" in str(error.value)
+    assert not any("--detach" in command for command in commands)
+
+
+def test_vllm_runtime_preserves_failure_logs_before_removing_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    container_id = "c" * 64
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if "--entrypoint" in command:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="0, 32607, 32600\n", stderr=""
+            )
+        if "--detach" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=container_id, stderr="")
+        if command[1] == "inspect" and "{{.State.Running}}" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="false\n", stderr="")
+        if command[1] == "logs":
+            return subprocess.CompletedProcess(
+                command, 0, stdout="CUDA out of memory", stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/docker")
+    runtime = VllmModelRuntime(
+        command_runner=run,
+        health_probe=lambda _: False,
+    )
+
+    with pytest.raises(StateConflictError, match="CUDA out of memory"):
+        runtime.ensure_running(
+            model_resource_id="model-fixture",
+            repository_id="OpenEvo/Fixture-0.1B",
+            snapshot_path=snapshot,
+        )
+
+    assert ["/usr/bin/docker", "logs", "--tail", "80", container_id] in commands
+    assert commands[-1] == ["/usr/bin/docker", "rm", "--force", container_id]

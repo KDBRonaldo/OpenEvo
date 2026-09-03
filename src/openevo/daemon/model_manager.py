@@ -43,6 +43,7 @@ VLLM_IMAGE = (
     "sha256:c48cf118e1e6e39d7790e174d6014f7af5d06f79c2d29d984d11cbe2e8d414e7"
 )
 VLLM_IMAGE_PULL_TIMEOUT_SECONDS = 1_800
+VLLM_GPU_MEMORY_UTILIZATION = 0.85
 
 
 class VllmModelRuntime:
@@ -87,6 +88,7 @@ class VllmModelRuntime:
                 raise StateConflictError("Docker is required to serve a downloaded model")
             self._ensure_image(docker)
             self._cleanup_stale(docker)
+            gpu_index = self._select_gpu(docker)
             import socket
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -95,16 +97,18 @@ class VllmModelRuntime:
             context_window = self._model_context_window(snapshot_path)
             name = f"openevo-vllm-{secrets.token_hex(8)}"
             command = [
-                docker, "run", "--detach", "--rm", "--pull=never", "--name", name,
+                docker, "run", "--detach", "--pull=never", "--name", name,
                 "--label", "com.openevo.owner=model-runtime",
                 "--label", f"com.openevo.instance={self._owner_id}",
-                "--gpus", "all", "--cap-drop=ALL", "--cap-add=DAC_READ_SEARCH",
+                "--gpus", f"device={gpu_index}",
+                "--cap-drop=ALL", "--cap-add=DAC_READ_SEARCH",
                 "--security-opt=no-new-privileges:true",
                 "--shm-size=4g", "--publish", f"127.0.0.1:{port}:8000",
                 "--volume", f"{snapshot_path}:/model:ro", VLLM_IMAGE,
                 "--model", "/model", "--served-model-name", repository_id,
                 "--dtype", "auto", "--max-model-len", str(context_window),
-                "--gpu-memory-utilization", "0.85", "--disable-log-stats",
+                "--gpu-memory-utilization", str(VLLM_GPU_MEMORY_UTILIZATION),
+                "--disable-log-stats",
                 "--enable-auto-tool-choice", "--tool-call-parser", "hermes",
             ]
             try:
@@ -172,6 +176,63 @@ class VllmModelRuntime:
             detail = (pulled.stderr or pulled.stdout).strip()[-2_000:]
             raise StateConflictError(f"pinned vLLM image pull failed: {detail}")
 
+    def _select_gpu(self, docker: str) -> int:
+        command = [
+            docker,
+            "run",
+            "--rm",
+            "--pull=never",
+            "--gpus",
+            "all",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            "--entrypoint",
+            "nvidia-smi",
+            VLLM_IMAGE,
+            "--query-gpu=index,memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            result = self._run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise StateConflictError(f"could not inspect available GPUs: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[-2_000:]
+            raise StateConflictError(f"could not inspect available GPUs: {detail}")
+
+        candidates: list[tuple[int, int, int]] = []
+        for line in result.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) != 3 or not all(field.isdigit() for field in fields):
+                raise StateConflictError("nvidia-smi returned an invalid GPU inventory")
+            index, total_mib, free_mib = (int(field) for field in fields)
+            if total_mib <= 0 or free_mib < 0 or free_mib > total_mib:
+                raise StateConflictError("nvidia-smi returned an invalid GPU inventory")
+            candidates.append((free_mib, total_mib, index))
+        if not candidates:
+            raise StateConflictError("no NVIDIA GPU is available to serve the selected model")
+
+        free_mib, total_mib, index = max(candidates)
+        required_mib = int(total_mib * VLLM_GPU_MEMORY_UTILIZATION)
+        if free_mib < required_mib:
+            summary = ", ".join(
+                f"GPU {candidate_index}: {candidate_free} MiB free"
+                for candidate_free, _, candidate_index in sorted(
+                    candidates, key=lambda item: item[2]
+                )
+            )
+            raise StateConflictError(
+                "no GPU has enough free memory for the managed vLLM runtime "
+                f"(requires {required_mib} MiB on GPU {index}; {summary})"
+            )
+        return index
+
     def _cleanup_stale(self, docker: str) -> None:
         if self._stale_cleaned:
             return
@@ -201,17 +262,17 @@ class VllmModelRuntime:
             if re.fullmatch(r"[0-9a-f]{12,64}", container_id) is None:
                 raise StateConflictError("Docker returned an invalid stale container identity")
             try:
-                stopped = self._run(
-                    [docker, "stop", "--time", "10", container_id],
+                removed = self._run(
+                    [docker, "rm", "--force", container_id],
                     check=False,
                     capture_output=True,
                     text=True,
                     timeout=20,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                raise StateConflictError(f"could not stop a stale vLLM container: {exc}") from exc
-            if stopped.returncode != 0:
-                raise StateConflictError("could not stop a stale vLLM container")
+                raise StateConflictError(f"could not remove a stale vLLM container: {exc}") from exc
+            if removed.returncode != 0:
+                raise StateConflictError("could not remove a stale vLLM container")
         self._stale_cleaned = True
 
     @staticmethod
@@ -291,7 +352,7 @@ class VllmModelRuntime:
             return
         try:
             self._run(
-                [docker, "stop", "--time", "10", container_id],
+                [docker, "rm", "--force", container_id],
                 check=False, capture_output=True, text=True, timeout=20,
             )
         except (OSError, subprocess.TimeoutExpired):
