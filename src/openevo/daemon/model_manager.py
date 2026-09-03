@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -90,11 +91,6 @@ class VllmModelRuntime:
             self._ensure_image(docker)
             self._cleanup_stale(docker)
             gpu_index = self._select_gpu(docker)
-            import socket
-
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-                listener.bind(("127.0.0.1", 0))
-                port = int(listener.getsockname()[1])
             context_window = self._model_context_window(snapshot_path)
             volume_name = self._prepare_model_volume(docker, snapshot_path)
             self._volume_name = volume_name
@@ -106,7 +102,7 @@ class VllmModelRuntime:
                 "--gpus", f"device={gpu_index}",
                 "--cap-drop=ALL", "--cap-add=DAC_READ_SEARCH",
                 "--security-opt=no-new-privileges:true",
-                "--shm-size=4g", "--publish", f"127.0.0.1:{port}:8000",
+                "--shm-size=4g",
                 "--volume", f"{volume_name}:/model:ro", VLLM_IMAGE,
                 "--model", "/model", "--served-model-name", repository_id,
                 "--dtype", "auto", "--max-model-len", str(context_window),
@@ -128,7 +124,12 @@ class VllmModelRuntime:
                 raise StateConflictError(f"vLLM container startup failed: {detail}")
             self._container_id = container_id
             self._model_resource_id = model_resource_id
-            self._upstream_base_url = f"http://127.0.0.1:{port}/v1"
+            try:
+                container_ip = self._container_ip(docker, container_id)
+            except StateConflictError:
+                self._stop_locked()
+                raise
+            self._upstream_base_url = f"http://{container_ip}:8000/v1"
             deadline = time.monotonic() + self._startup_timeout_seconds
             while time.monotonic() < deadline:
                 if self._health_probe(f"{self._upstream_base_url}/models"):
@@ -237,6 +238,44 @@ class VllmModelRuntime:
                 f"(requires {required_mib} MiB on GPU {index}; {summary})"
             )
         return index
+
+    def _container_ip(self, docker: str, container_id: str) -> str:
+        try:
+            result = self._run(
+                [docker, "inspect", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise StateConflictError(f"could not inspect the vLLM network: {exc}") from exc
+        try:
+            inspected = json.loads(result.stdout)
+            networks = inspected[0]["NetworkSettings"]["Networks"]
+            addresses = sorted(
+                str(network["IPAddress"]).strip()
+                for network in networks.values()
+                if str(network.get("IPAddress", "")).strip()
+            )
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError):
+            addresses = []
+        if result.returncode != 0 or not addresses:
+            detail = (result.stderr or result.stdout).strip()[-2_000:]
+            raise StateConflictError(f"could not resolve the vLLM container address: {detail}")
+        for address in addresses:
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if (
+                parsed.version == 4
+                and parsed.is_private
+                and not parsed.is_loopback
+                and not parsed.is_link_local
+            ):
+                return address
+        raise StateConflictError("vLLM did not receive a private Docker bridge address")
 
     def _prepare_model_volume(self, docker: str, snapshot_path: Path) -> str:
         volume_name = f"openevo-model-{secrets.token_hex(8)}"

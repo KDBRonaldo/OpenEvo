@@ -262,7 +262,7 @@ def test_vllm_runtime_bounds_context_window_from_model_config(tmp_path: Path) ->
     assert VllmModelRuntime._model_context_window(snapshot) == 32_768
 
 
-def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
+def test_vllm_runtime_keeps_vllm_on_docker_bridge_and_proxy_on_loopback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,6 +278,10 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
             stdout = "a" * 64
         elif "nvidia-smi" in command:
             stdout = "0, 24576, 12000\n1, 24576, 24500\n"
+        elif command[1] == "inspect" and len(command) == 3:
+            stdout = json.dumps([
+                {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.8"}}}}
+            ])
         else:
             stdout = "b" * 64 if "--detach" in command else ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
@@ -323,7 +327,8 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
     assert "--cap-add=DAC_READ_SEARCH" in starts[0]
     assert "--enable-auto-tool-choice" in starts[0]
     assert "hermes" in starts[0]
-    assert any(value.startswith("127.0.0.1:") for value in starts[0])
+    assert "--publish" not in starts[0]
+    assert ["/usr/bin/docker", "inspect", "b" * 64] in commands
     assert any(
         command[1] == "cp" and command[-1] == f"{'a' * 64}:/model"
         for command in commands
@@ -387,6 +392,15 @@ def test_vllm_runtime_preserves_failure_logs_before_removing_container(
             )
         if "--detach" in command:
             return subprocess.CompletedProcess(command, 0, stdout=container_id, stderr="")
+        if command[1] == "inspect" and len(command) == 3:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps([
+                    {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.9"}}}}
+                ]),
+                stderr="",
+            )
         if command[1] == "inspect" and "{{.State.Running}}" in command:
             return subprocess.CompletedProcess(command, 0, stdout="false\n", stderr="")
         if command[1] == "logs":
