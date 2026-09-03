@@ -65,6 +65,7 @@ class VllmModelRuntime:
         self._proxy_factory = proxy_factory
         self._lock = threading.Lock()
         self._container_id: str | None = None
+        self._volume_name: str | None = None
         self._model_resource_id: str | None = None
         self._upstream_base_url: str | None = None
         self._base_url: str | None = None
@@ -95,6 +96,8 @@ class VllmModelRuntime:
                 listener.bind(("127.0.0.1", 0))
                 port = int(listener.getsockname()[1])
             context_window = self._model_context_window(snapshot_path)
+            volume_name = self._prepare_model_volume(docker, snapshot_path)
+            self._volume_name = volume_name
             name = f"openevo-vllm-{secrets.token_hex(8)}"
             command = [
                 docker, "run", "--detach", "--pull=never", "--name", name,
@@ -104,7 +107,7 @@ class VllmModelRuntime:
                 "--cap-drop=ALL", "--cap-add=DAC_READ_SEARCH",
                 "--security-opt=no-new-privileges:true",
                 "--shm-size=4g", "--publish", f"127.0.0.1:{port}:8000",
-                "--volume", f"{snapshot_path}:/model:ro", VLLM_IMAGE,
+                "--volume", f"{volume_name}:/model:ro", VLLM_IMAGE,
                 "--model", "/model", "--served-model-name", repository_id,
                 "--dtype", "auto", "--max-model-len", str(context_window),
                 "--gpu-memory-utilization", str(VLLM_GPU_MEMORY_UTILIZATION),
@@ -116,10 +119,12 @@ class VllmModelRuntime:
                     command, check=False, capture_output=True, text=True, timeout=120
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
+                self._stop_locked()
                 raise StateConflictError(f"could not start the vLLM container: {exc}") from exc
             container_id = result.stdout.strip()
             if result.returncode != 0 or re.fullmatch(r"[0-9a-f]{12,64}", container_id) is None:
                 detail = (result.stderr or result.stdout).strip()[-2_000:]
+                self._stop_locked()
                 raise StateConflictError(f"vLLM container startup failed: {detail}")
             self._container_id = container_id
             self._model_resource_id = model_resource_id
@@ -233,6 +238,130 @@ class VllmModelRuntime:
             )
         return index
 
+    def _prepare_model_volume(self, docker: str, snapshot_path: Path) -> str:
+        volume_name = f"openevo-model-{secrets.token_hex(8)}"
+        helper_name = f"openevo-model-copy-{secrets.token_hex(8)}"
+        try:
+            created_volume = self._run(
+                [
+                    docker,
+                    "volume",
+                    "create",
+                    "--label",
+                    "com.openevo.owner=model-snapshot",
+                    "--label",
+                    f"com.openevo.instance={self._owner_id}",
+                    volume_name,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if created_volume.returncode != 0 or created_volume.stdout.strip() != volume_name:
+                detail = (created_volume.stderr or created_volume.stdout).strip()[-2_000:]
+                raise StateConflictError(f"could not create the model volume: {detail}")
+            created_helper = self._run(
+                [
+                    docker,
+                    "create",
+                    "--name",
+                    helper_name,
+                    "--label",
+                    "com.openevo.owner=model-copy",
+                    "--label",
+                    f"com.openevo.instance={self._owner_id}",
+                    "--volume",
+                    f"{volume_name}:/model",
+                    "--entrypoint",
+                    "/usr/bin/true",
+                    VLLM_IMAGE,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            helper_id = created_helper.stdout.strip()
+            if (
+                created_helper.returncode != 0
+                or re.fullmatch(r"[0-9a-f]{12,64}", helper_id) is None
+            ):
+                detail = (created_helper.stderr or created_helper.stdout).strip()[-2_000:]
+                raise StateConflictError(f"could not create the model copy container: {detail}")
+            copied = self._run(
+                [docker, "cp", f"{snapshot_path}{os.sep}.", f"{helper_id}:/model"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=VLLM_IMAGE_PULL_TIMEOUT_SECONDS,
+            )
+            if copied.returncode != 0:
+                detail = (copied.stderr or copied.stdout).strip()[-2_000:]
+                raise StateConflictError(f"could not copy the model into Docker: {detail}")
+            verified = self._run(
+                [
+                    docker,
+                    "run",
+                    "--rm",
+                    "--pull=never",
+                    "--volume",
+                    f"{volume_name}:/model:ro",
+                    "--entrypoint",
+                    "/usr/bin/test",
+                    VLLM_IMAGE,
+                    "-f",
+                    "/model/config.json",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if verified.returncode != 0:
+                detail = (verified.stderr or verified.stdout).strip()[-2_000:]
+                raise StateConflictError(
+                    f"the copied Docker model snapshot is incomplete: {detail}"
+                )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._remove_model_copy_resources(docker, helper_name, volume_name)
+            raise StateConflictError(f"could not prepare the Docker model snapshot: {exc}") from exc
+        except StateConflictError:
+            self._remove_model_copy_resources(docker, helper_name, volume_name)
+            raise
+        try:
+            self._run(
+                [docker, "rm", "--force", helper_name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return volume_name
+
+    def _remove_model_copy_resources(
+        self,
+        docker: str,
+        helper_name: str,
+        volume_name: str,
+    ) -> None:
+        for command in (
+            [docker, "rm", "--force", helper_name],
+            [docker, "volume", "rm", "--force", volume_name],
+        ):
+            try:
+                self._run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     def _cleanup_stale(self, docker: str) -> None:
         if self._stale_cleaned:
             return
@@ -344,19 +473,30 @@ class VllmModelRuntime:
             proxy.close()
         container_id = self._container_id
         self._container_id = None
+        volume_name = self._volume_name
+        self._volume_name = None
         self._model_resource_id = None
         self._upstream_base_url = None
         self._base_url = None
         docker = shutil.which("docker")
-        if container_id is None or docker is None:
+        if docker is None:
             return
-        try:
-            self._run(
-                [docker, "rm", "--force", container_id],
-                check=False, capture_output=True, text=True, timeout=20,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        if container_id is not None:
+            try:
+                self._run(
+                    [docker, "rm", "--force", container_id],
+                    check=False, capture_output=True, text=True, timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if volume_name is not None:
+            try:
+                self._run(
+                    [docker, "volume", "rm", "--force", volume_name],
+                    check=False, capture_output=True, text=True, timeout=20,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 def _utc_now() -> str:

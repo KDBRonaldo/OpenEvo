@@ -272,10 +272,14 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if "--entrypoint" in command:
+        if command[1:3] == ["volume", "create"]:
+            stdout = command[-1]
+        elif command[1] == "create":
+            stdout = "a" * 64
+        elif "nvidia-smi" in command:
             stdout = "0, 24576, 12000\n1, 24576, 24500\n"
         else:
-            stdout = "b" * 64 if command[1] == "run" else ""
+            stdout = "b" * 64 if "--detach" in command else ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     class Proxy:
@@ -320,8 +324,13 @@ def test_vllm_runtime_is_loopback_only_reuses_one_model_and_stops_its_container(
     assert "--enable-auto-tool-choice" in starts[0]
     assert "hermes" in starts[0]
     assert any(value.startswith("127.0.0.1:") for value in starts[0])
-    assert f"{snapshot}:/model:ro" in starts[0]
-    assert commands[-1] == ["/usr/bin/docker", "rm", "--force", "b" * 64]
+    assert any(
+        command[1] == "cp" and command[-1] == f"{'a' * 64}:/model"
+        for command in commands
+    )
+    assert any(value.endswith(":/model:ro") for value in starts[0])
+    assert ["/usr/bin/docker", "rm", "--force", "b" * 64] in commands
+    assert commands[-1][1:4] == ["volume", "rm", "--force"]
 
 
 def test_vllm_runtime_reports_gpu_pressure_before_starting_server(
@@ -334,7 +343,7 @@ def test_vllm_runtime_reports_gpu_pressure_before_starting_server(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if "--entrypoint" in command:
+        if "nvidia-smi" in command:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -368,7 +377,11 @@ def test_vllm_runtime_preserves_failure_logs_before_removing_container(
 
     def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if "--entrypoint" in command:
+        if command[1:3] == ["volume", "create"]:
+            return subprocess.CompletedProcess(command, 0, stdout=command[-1], stderr="")
+        if command[1] == "create":
+            return subprocess.CompletedProcess(command, 0, stdout="a" * 64, stderr="")
+        if "nvidia-smi" in command:
             return subprocess.CompletedProcess(
                 command, 0, stdout="0, 32607, 32600\n", stderr=""
             )
@@ -396,4 +409,5 @@ def test_vllm_runtime_preserves_failure_logs_before_removing_container(
         )
 
     assert ["/usr/bin/docker", "logs", "--tail", "80", container_id] in commands
-    assert commands[-1] == ["/usr/bin/docker", "rm", "--force", container_id]
+    assert ["/usr/bin/docker", "rm", "--force", container_id] in commands
+    assert commands[-1][1:4] == ["volume", "rm", "--force"]
