@@ -2713,9 +2713,9 @@ function ProjectFileWorkspaceV2({
   const imagePreviewAvailable = workspaceImagePreviewAvailableV2(entry);
   const imagePreviewWithinLimit = entry.byteSize <= WORKSPACE_IMAGE_PREVIEW_MAX_BYTES;
   const [imagePreview, setImagePreview] = useState<WorkspaceImagePreviewV2 | null>(null);
-  const [imageScale, setImageScale] = useState<"actual" | "fit">("actual");
+  const [imageScale, setImageScale] = useState<"actual" | "fit">("fit");
   useEffect(() => {
-    setImageScale("actual");
+    setImageScale("fit");
     if (!imagePreviewAvailable || !imagePreviewWithinLimit) {
       setImagePreview(null);
       return undefined;
