@@ -902,11 +902,19 @@ describe("Desktop v2 product renderer", () => {
 
     await click("microscope.png");
     await vi.waitFor(() => expect(document.querySelector<HTMLImageElement>('[alt="Preview of session-attachments/microscope.png"]')?.src).toBe("blob:workspace-image-preview"));
+    const preview = document.querySelector<HTMLElement>(".workspace-image-preview");
+    expect(preview?.classList.contains("actual")).toBe(true);
+    expect(preview?.querySelector("figcaption")).toBeNull();
+    expect(preview?.closest(".project-file-editor")?.classList.contains("product-panel")).toBe(false);
     expect(downloadWorkspaceFile).toHaveBeenCalledWith(
       "project-1",
       "session-attachments/microscope.png",
     );
     expect(createObjectURL).toHaveBeenCalledWith(image);
+
+    await act(async () => document.querySelector<HTMLButtonElement>('[aria-label="Fit image to window"]')?.click());
+    expect(preview?.classList.contains("fit")).toBe(true);
+    expect(document.querySelector('[aria-label="Show image at actual size"]')).toBeTruthy();
 
     await act(async () => document.querySelector<HTMLButtonElement>(".session-back-button")?.click());
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:workspace-image-preview");

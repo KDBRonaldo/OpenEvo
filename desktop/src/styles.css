@@ -3028,46 +3028,36 @@ pre.json {
 }
 
 .project-file-editor.image {
-  display: flex;
-  flex-direction: column;
+  min-height: 0;
+  overflow: visible;
+  background: transparent;
 }
 
 .workspace-image-preview {
-  display: grid;
-  min-height: 518px;
+  display: block;
+  min-height: 0;
   max-height: calc(100dvh - 230px);
-  flex: 1 1 auto;
-  grid-template-rows: minmax(0, 1fr) auto;
   margin: 0;
-  overflow: hidden;
-  background-color: #f7f9f7;
-  background-image:
-    linear-gradient(45deg, rgba(71, 88, 79, .055) 25%, transparent 25%),
-    linear-gradient(-45deg, rgba(71, 88, 79, .055) 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, rgba(71, 88, 79, .055) 75%),
-    linear-gradient(-45deg, transparent 75%, rgba(71, 88, 79, .055) 75%);
-  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
-  background-size: 16px 16px;
+  overflow: auto;
+  text-align: center;
 }
 
 .workspace-image-preview img {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  padding: 20px;
-  object-fit: contain;
+  display: block;
+  width: auto;
+  height: auto;
+  margin: 0 auto;
+  image-rendering: auto;
 }
 
-.workspace-image-preview figcaption {
-  overflow: hidden;
-  padding: 8px 14px;
-  border-top: 1px solid var(--line);
-  color: #6f7a74;
-  background: rgba(255, 255, 255, .9);
-  font-size: 10px;
-  text-align: center;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.workspace-image-preview.actual img {
+  max-width: none;
+  max-height: none;
+}
+
+.workspace-image-preview.fit img {
+  max-width: 100%;
+  max-height: calc(100dvh - 230px);
 }
 
 .workspace-image-loading {
@@ -3077,8 +3067,13 @@ pre.json {
   justify-content: center;
   gap: 9px;
   color: #6f7a74;
-  background: #fbfcfb;
+  background: transparent;
   font-size: 12px;
+}
+
+.project-file-editor.image > .quiet-empty {
+  border: 0;
+  background: transparent;
 }
 
 .session-name-cell {

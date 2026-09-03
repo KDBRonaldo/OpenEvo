@@ -2713,7 +2713,9 @@ function ProjectFileWorkspaceV2({
   const imagePreviewAvailable = workspaceImagePreviewAvailableV2(entry);
   const imagePreviewWithinLimit = entry.byteSize <= WORKSPACE_IMAGE_PREVIEW_MAX_BYTES;
   const [imagePreview, setImagePreview] = useState<WorkspaceImagePreviewV2 | null>(null);
+  const [imageScale, setImageScale] = useState<"actual" | "fit">("actual");
   useEffect(() => {
+    setImageScale("actual");
     if (!imagePreviewAvailable || !imagePreviewWithinLimit) {
       setImagePreview(null);
       return undefined;
@@ -2750,12 +2752,12 @@ function ProjectFileWorkspaceV2({
           <ArrowLeft size={14} /> New Session
         </button>
       </div>
-      <div className="workspace-heading"><div><p className="eyebrow">{project.display_name} / File</p><h1>{entry.path}</h1><p>{entry.mediaType ?? "unknown format"} · {formatBytes(entry.byteSize)}</p></div>{fileTransferAvailable ? <button type="button" className="secondary-button" disabled={busy} onClick={onDownload}><Download size={15} /> Download</button> : null}</div>
-      <section className={`product-panel project-file-editor${imagePreviewAvailable ? " image" : ""}`}><header>{imagePreviewAvailable ? <ImageIcon size={16} /> : <FileText size={16} />}<strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header>{imagePreviewAvailable ? (
+      <div className="workspace-heading"><div><p className="eyebrow">{project.display_name} / File</p><h1>{entry.path}</h1><p>{entry.mediaType ?? "unknown format"} · {formatBytes(entry.byteSize)}</p></div><div className="workspace-heading-actions">{imagePreviewAvailable && activeImagePreview?.status === "ready" ? <button type="button" className="secondary-button" aria-label={imageScale === "actual" ? "Fit image to window" : "Show image at actual size"} onClick={() => setImageScale((current) => current === "actual" ? "fit" : "actual")}>{imageScale === "actual" ? "Fit" : "1:1"}</button> : null}{fileTransferAvailable ? <button type="button" className="secondary-button" disabled={busy} onClick={onDownload}><Download size={15} /> Download</button> : null}</div></div>
+      <section className={`${imagePreviewAvailable ? "" : "product-panel "}project-file-editor${imagePreviewAvailable ? " image" : ""}`}>{!imagePreviewAvailable ? <header><FileText size={16} /><strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header> : null}{imagePreviewAvailable ? (
         !imagePreviewWithinLimit
           ? <div className="quiet-empty"><ImageIcon size={24} /><p>This image is larger than the {formatBytes(WORKSPACE_IMAGE_PREVIEW_MAX_BYTES)} browser preview limit. Download it to view the original.</p></div>
           : activeImagePreview?.status === "ready"
-            ? <figure className="workspace-image-preview"><img src={activeImagePreview.url} alt={`Preview of ${entry.path}`} onError={() => setImagePreview({ path: entry.path, status: "error", message: "The browser could not decode this image." })} /><figcaption>{entry.path} · {formatBytes(entry.byteSize)}</figcaption></figure>
+            ? <figure className={`workspace-image-preview ${imageScale}`}><img src={activeImagePreview.url} alt={`Preview of ${entry.path}`} onError={() => setImagePreview({ path: entry.path, status: "error", message: "The browser could not decode this image." })} /></figure>
             : activeImagePreview?.status === "error"
               ? <div className="quiet-empty"><AlertCircle size={24} /><p>Image preview could not be loaded. {activeImagePreview.message}</p></div>
               : <div className="workspace-image-loading" role="status"><LoaderCircle className="spin" size={22} /><span>Loading image preview…</span></div>
