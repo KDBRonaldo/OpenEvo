@@ -127,6 +127,19 @@ class FakeDaemonClient:
             }
         if parsed.path == "/development/capabilities":
             legacy = self.request("/capabilities")
+            parameters = parse_qs(parsed.query, keep_blank_values=True)
+            project_id = parameters.get("project_id", [None])[0]
+            if project_id is not None:
+                project = next(
+                    item for item in self.state["projects"]
+                    if item["project_id"] == project_id
+                )
+                mode = project["config"]["execution"]["mode"]
+                legacy["capabilities"]["evaluated_profile"]["execution_mode"] = (
+                    "subscription"
+                    if mode == "codex_subscription_transcript"
+                    else "self_deployed"
+                )
             return {
                 "schema_version": "2",
                 "authority": legacy["authority"],
@@ -1625,6 +1638,46 @@ def test_provider_projects_persisted_project_and_task_into_closed_v2_models() ->
     assert tasks.items[0].state == "running"
     assert tasks.items[0].admission.predecessor_project_head.project_id == "project-1"
     assert fake.task_observation_requests == 0
+
+
+def test_provider_projects_capabilities_for_a_self_deployed_project() -> None:
+    fake = FakeDaemonClient()
+    config = _config()
+    config["execution"] = {
+        "mode": "self-deployed",
+        "capture_mode": "transcript",
+        "token_level_metrics_available": False,
+        "harness_id": "codex",
+        "model_profile_id": None,
+        "model_resource_id": "model-ready",
+        "repository_id": "OpenEvo/Fixture-0.1B",
+        "model_revision": "a" * 40,
+        "token_limit": 4096,
+        "task_network_allow_internet": False,
+    }
+    fake.state.update(
+        {
+            "active_project_id": "project-self-deployed",
+            "projects": [
+                {
+                    "project_id": "project-self-deployed",
+                    "display_name": "Self-deployed project",
+                    "config": config,
+                    "created_at": "2026-09-03T00:00:00Z",
+                    "updated_at": "2026-09-03T00:00:00Z",
+                }
+            ],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    projection = provider.invoke(
+        "getDesktopProjectCapabilitiesV2",
+        {"project_id": "project-self-deployed"},
+    )
+
+    assert projection.execution_mode == "self-deployed"
+    assert projection.capabilities.evaluated_profile.execution_mode == "self_deployed"
 
 
 def test_provider_pages_more_than_one_hundred_tasks_without_capping_history() -> None:

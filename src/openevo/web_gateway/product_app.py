@@ -1311,7 +1311,10 @@ class DevelopmentAgentDesktopV2Provider:
     def _capabilities(self, arguments: Mapping[str, object]) -> m.ProjectCapabilityProjectionV2:
         project = self._find_project(arguments.get("project_id"))
         payload = DevelopmentCapabilitiesV2.model_validate(
-            self._client.request_v2("/development/capabilities")
+            self._client.request_v2(
+                "/development/capabilities?project_id="
+                f"{quote(project.project_id, safe='')}"
+            )
         )
         capabilities = payload.capabilities
         return m.ProjectCapabilityProjectionV2(

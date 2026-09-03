@@ -119,7 +119,7 @@ class EvolutionOrchestrator:
         self._timeout_seconds = timeout_seconds
         self._inference_preparer = inference_preparer
         self._registry: Any | None = None
-        self._capabilities: dict[str, Any] | None = None
+        self._capabilities: dict[str, dict[str, Any]] = {}
 
     def check_ready(self) -> None:
         if sys.version_info < (3, 11):
@@ -144,37 +144,44 @@ class EvolutionOrchestrator:
 
     def _load_catalog(self) -> None:
         from openevo.evolution.framework.capabilities import build_evolution_capabilities
-        from openevo.evolution.framework.contracts import EvolutionExecutionProfile
+        from openevo.evolution.framework.profiles import execution_profile_for_release_mode
 
         self._registry = development_registry_snapshot()
-        capability = build_evolution_capabilities(
-            self._registry,
-            profile=EvolutionExecutionProfile(
-                execution_mode="subscription",
-                capture_mode="transcript",
-                harness_id="codex",
-            ),
-            audience="maintainer",
-            core_version="development-catalog-unverified",
-        ).model_dump(mode="json")
-        # The development bridge currently executes the legacy worker ABI. Context-v1 methods
-        # stay registered in Core but are not advertised as runnable by this bridge yet.
-        for target in capability["targets"]:
-            target["methods"] = [
-                method
-                for method in target["methods"]
-                if self._registry.methods[method["method_id"]].invocation_abi.value
-                == "legacy_worker_job_v1"
-            ]
-        self._capabilities = capability
+        self._capabilities = {}
+        for execution_mode in ("codex_subscription_transcript", "self-deployed"):
+            capability = build_evolution_capabilities(
+                self._registry,
+                profile=execution_profile_for_release_mode(execution_mode),
+                audience="maintainer",
+                core_version="development-catalog-unverified",
+            ).model_dump(mode="json")
+            # The development bridge currently executes the legacy worker ABI. Context-v1
+            # methods stay registered in Core but are not advertised as runnable by this
+            # bridge yet.
+            for target in capability["targets"]:
+                target["methods"] = [
+                    method
+                    for method in target["methods"]
+                    if self._registry.methods[method["method_id"]].invocation_abi.value
+                    == "legacy_worker_job_v1"
+                ]
+            self._capabilities[execution_mode] = capability
 
-    def capabilities(self) -> dict[str, Any]:
-        if self._capabilities is None:
+    def capabilities(
+        self, execution_mode: str = "codex_subscription_transcript"
+    ) -> dict[str, Any]:
+        if not self._capabilities:
             self._load_catalog()
+        try:
+            capabilities = self._capabilities[execution_mode]
+        except KeyError as exc:
+            raise EvolutionRunError(
+                f"unsupported project execution mode for capabilities: {execution_mode}"
+            ) from exc
         return {
             "schema_version": "1",
             "authority": "development_catalog_unverified",
-            "capabilities": self._capabilities,
+            "capabilities": capabilities,
         }
 
     def _descriptor(self, target_id: str, method_id: str) -> tuple[Any, Any, Any]:

@@ -1427,6 +1427,65 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
     ]
 
 
+def test_daemon_v2_capabilities_follow_the_persisted_project_execution_mode(
+    tmp_path: Path,
+) -> None:
+    token = "c" * 32
+    project_id = "development-project-self-deployed"
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project(
+        {
+            "project_id": project_id,
+            "display_name": "Self-deployed project",
+            "config": {"execution": {"mode": "self-deployed"}},
+        }
+    )
+
+    class Evolution:
+        def __init__(self) -> None:
+            self.execution_modes: list[str] = []
+
+        def capabilities(
+            self, execution_mode: str = "codex_subscription_transcript"
+        ) -> dict[str, object]:
+            self.execution_modes.append(execution_mode)
+            return {
+                "schema_version": "1",
+                "authority": "development_catalog_unverified",
+                "capabilities": {
+                    "evaluated_profile": {
+                        "execution_mode": (
+                            "subscription"
+                            if execution_mode == "codex_subscription_transcript"
+                            else "self_deployed"
+                        )
+                    }
+                },
+            }
+
+    evolution = Evolution()
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0), token, object(), store, evolution
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}/v2/development/capabilities"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        request = urllib.request.Request(
+            f"{base}?{urlencode({'project_id': project_id})}", headers=headers
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert evolution.execution_modes == ["self-deployed"]
+    assert payload["capabilities"]["evaluated_profile"]["execution_mode"] == "self_deployed"
+
+
 def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(
     tmp_path: Path,
 ) -> None:
@@ -2328,8 +2387,18 @@ def test_development_capabilities_are_projected_from_the_core_catalog(tmp_path: 
     )
     runner.check_ready()
     payload = runner.capabilities()
+    self_deployed = runner.capabilities("self-deployed")
 
     assert payload["authority"] == "development_catalog_unverified"
+    assert payload["capabilities"]["evaluated_profile"]["execution_mode"] == "subscription"
+    assert (
+        self_deployed["capabilities"]["evaluated_profile"]["execution_mode"]
+        == "self_deployed"
+    )
+    assert (
+        self_deployed["capabilities"]["registry_digest"]
+        == payload["capabilities"]["registry_digest"]
+    )
     targets = payload["capabilities"]["targets"]
     assert {target["target_id"] for target in targets} >= {
         "text_memory",

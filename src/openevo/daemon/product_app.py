@@ -4172,12 +4172,52 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                     "development evolution runner is unavailable",
                 )
             else:
-                legacy = self.server.evolution_runner.capabilities()
-                response = DevelopmentCapabilitiesV2(
-                    authority="development_catalog_unverified",
-                    capabilities=legacy["capabilities"],
-                )
-                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+                try:
+                    parameters = parse_qs(
+                        parsed_path.query, keep_blank_values=True, strict_parsing=True
+                    )
+                    if set(parameters) - {"project_id"} or any(
+                        len(values) != 1 for values in parameters.values()
+                    ):
+                        raise RequestError(
+                            "capabilities query contains unsupported parameters"
+                        )
+                    project_id = parameters.get("project_id", [None])[0]
+                    execution_mode = "codex_subscription_transcript"
+                    if project_id is not None:
+                        if not ID_PATTERN.fullmatch(project_id):
+                            raise RequestError("project_id is invalid")
+                        execution = self.server.store.project_config(project_id).get(
+                            "execution"
+                        )
+                        if not isinstance(execution, dict) or not isinstance(
+                            execution.get("mode"), str
+                        ):
+                            raise StateConflictError(
+                                "project execution configuration is unavailable"
+                            )
+                        execution_mode = execution["mode"]
+                    legacy = self.server.evolution_runner.capabilities(execution_mode)
+                    response = DevelopmentCapabilitiesV2(
+                        authority="development_catalog_unverified",
+                        capabilities=legacy["capabilities"],
+                    )
+                except (RequestError, ValueError) as exc:
+                    self._json_error_v2(
+                        HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
+                    )
+                except KeyError:
+                    self._json_error_v2(
+                        HTTPStatus.NOT_FOUND, "not_found", "project not found"
+                    )
+                except (EvolutionRunError, StateConflictError) as exc:
+                    self._json_error_v2(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "capabilities_unavailable",
+                        str(exc),
+                    )
+                else:
+                    self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
         if parsed_path.path == DAEMON_V2_DEVELOPMENT_MODELS_PATH:
             if self.server.model_manager is None:
