@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 from types import SimpleNamespace
 import time
 
@@ -91,6 +92,18 @@ def _wait_for_terminal(manager: HuggingFaceModelManager, model_id: str) -> dict[
             return model
         time.sleep(0.01)
     raise AssertionError("model worker did not become terminal")
+
+
+def _wait_for_runtime(
+    manager: HuggingFaceModelManager, state: str
+) -> dict[str, object]:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        runtime = manager.runtime_status()
+        if runtime["state"] == state:
+            return runtime
+        time.sleep(0.01)
+    raise AssertionError(f"model runtime did not reach {state}")
 
 
 def test_downloads_public_safetensors_to_a_private_persistent_snapshot(
@@ -231,12 +244,16 @@ def test_restart_marks_an_interrupted_download_failed(tmp_path: Path) -> None:
             "'downloading', ?, ?)",
             (now, now),
         )
+    staging = tmp_path / "models" / "staging" / "model-interrupted"
+    staging.mkdir(parents=True)
+    (staging / "weights.safetensors.incomplete").write_bytes(b"partial")
 
     restarted = HuggingFaceModelManager(state_path=state_path, root=tmp_path / "models")
 
     recovered = restarted.get("model-interrupted")
     assert recovered["state"] == "failed"
     assert "interrupted" in str(recovered["error"])
+    assert recovered["downloaded_bytes"] == len(b"partial")
 
 
 def test_download_progress_counts_incomplete_weight_but_not_cache_metadata(
@@ -252,6 +269,144 @@ def test_download_progress_counts_incomplete_weight_but_not_cache_metadata(
     assert HuggingFaceModelManager._tree_size(root) == len(b"configpartial-weight")
 
 
+def test_retry_resumes_matching_partial_snapshot(tmp_path: Path) -> None:
+    attempts = 0
+    resumed = False
+
+    def download(**kwargs: object) -> str:
+        nonlocal attempts, resumed
+        attempts += 1
+        destination = Path(str(kwargs["local_dir"]))
+        partial = destination / ".cache" / "huggingface" / "download" / "weights.incomplete"
+        if attempts == 1:
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"partial-weight")
+            raise RuntimeError("connection closed")
+        resumed = partial.is_file()
+        partial.unlink()
+        (destination / "config.json").write_bytes(CONFIG)
+        (destination / "model.safetensors").write_bytes(WEIGHTS)
+        return str(destination)
+
+    manager = HuggingFaceModelManager(
+        state_path=tmp_path / "state.sqlite3",
+        root=tmp_path / "models",
+        api_factory=PublicModelApi,
+        snapshot_download=download,
+    )
+    admitted = manager.register(
+        action_id="register-resumable",
+        repository_id="OpenEvo/Fixture-0.1B",
+    )
+    assert _wait_for_terminal(manager, admitted["model_resource_id"])["state"] == "failed"
+
+    manager.retry(admitted["model_resource_id"], action_id="retry-resumable")
+    ready = _wait_for_terminal(manager, admitted["model_resource_id"])
+
+    assert ready["state"] == "ready"
+    assert attempts == 2
+    assert resumed is True
+
+
+def test_production_download_stall_becomes_retryable_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class Runtime:
+        def image_available(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            return
+
+    class HungProcess:
+        returncode: int | None = None
+        terminated = False
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None
+            return self.returncode or 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = HungProcess()
+
+    def popen(command: list[str], **kwargs: object) -> HungProcess:
+        observed["command"] = command
+        observed["environment"] = kwargs["env"]
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    manager = HuggingFaceModelManager(
+        state_path=tmp_path / "state.sqlite3",
+        root=tmp_path / "models",
+        api_factory=PublicModelApi,
+        runtime=Runtime(),  # type: ignore[arg-type]
+        download_stall_timeout_seconds=0.03,
+        download_poll_seconds=0.005,
+    )
+    admitted = manager.register(
+        action_id="register-stalled",
+        repository_id="OpenEvo/Fixture-0.1B",
+    )
+    failed = _wait_for_terminal(manager, admitted["model_resource_id"])
+
+    assert failed["state"] == "failed"
+    assert str(failed["error"]).startswith("Model download stalled")
+    assert process.terminated is True
+    assert "openevo.daemon.model_download_worker" in observed["command"]
+    assert observed["environment"]["HF_HUB_DISABLE_XET"] == "1"  # type: ignore[index]
+
+
+def test_vllm_image_download_has_independent_persisted_runtime_state(
+    tmp_path: Path,
+) -> None:
+    pulling = threading.Event()
+    release = threading.Event()
+
+    class Runtime:
+        def image_available(self) -> bool:
+            return False
+
+        def prepare_image(self) -> None:
+            pulling.set()
+            assert release.wait(5)
+
+        def close(self) -> None:
+            return
+
+    manager = HuggingFaceModelManager(
+        state_path=tmp_path / "state.sqlite3",
+        root=tmp_path / "models",
+        api_factory=PublicModelApi,
+        snapshot_download=lambda **_: (_ for _ in ()).throw(RuntimeError("offline")),
+        runtime=Runtime(),  # type: ignore[arg-type]
+    )
+
+    manager.register(
+        action_id="register-runtime-state",
+        repository_id="OpenEvo/Fixture-0.1B",
+    )
+    assert pulling.wait(5)
+    downloading = manager.runtime_status()
+    assert downloading["runtime_id"] == "vllm"
+    assert downloading["image_ref"] == VLLM_IMAGE
+    assert downloading["state"] == "downloading"
+
+    release.set()
+    assert _wait_for_runtime(manager, "ready")["error"] is None
+
+
 def test_vllm_runtime_bounds_context_window_from_model_config(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -260,6 +415,29 @@ def test_vllm_runtime_bounds_context_window_from_model_config(tmp_path: Path) ->
     )
 
     assert VllmModelRuntime._model_context_window(snapshot) == 32_768
+
+
+def test_session_runtime_never_pulls_a_missing_vllm_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="missing")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/docker")
+    runtime = VllmModelRuntime(command_runner=run)
+
+    with pytest.raises(StateConflictError, match="prepare.*before starting a Session"):
+        runtime.ensure_running(
+            model_resource_id="model-fixture",
+            repository_id="OpenEvo/Fixture-0.1B",
+            snapshot_path=tmp_path,
+        )
+
+    assert commands == [["/usr/bin/docker", "image", "inspect", VLLM_IMAGE]]
 
 
 def test_vllm_runtime_keeps_vllm_on_docker_bridge_and_proxy_on_loopback(

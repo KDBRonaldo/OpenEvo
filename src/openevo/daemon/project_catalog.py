@@ -173,6 +173,33 @@ class SqliteProjectCatalog:
     def update(self, project_id: str, request: dict[str, Any]) -> PersistedProject:
         now = self._clock()
         with self._lock, self._connection_factory() as connection:
+            existing_row = connection.execute(
+                "SELECT * FROM development_projects WHERE project_id = ? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM development_deleted_projects "
+                "WHERE development_deleted_projects.project_id = development_projects.project_id"
+                ")",
+                (project_id,),
+            ).fetchone()
+            if existing_row is None:
+                raise ProjectCatalogNotFoundError(project_id)
+            existing = self._project_from_row(existing_row)
+            existing_execution = existing.config.get("execution")
+            requested_execution = request["config"].get("execution")
+            existing_mode = (
+                existing_execution.get("mode") if isinstance(existing_execution, dict) else None
+            )
+            requested_mode = (
+                requested_execution.get("mode") if isinstance(requested_execution, dict) else None
+            )
+            if (
+                isinstance(existing_mode, str)
+                and isinstance(requested_mode, str)
+                and requested_mode != existing_mode
+            ):
+                raise ProjectCatalogConflictError(
+                    "project execution mode is immutable; create a new project to use another mode"
+                )
             cursor = connection.execute(
                 """
                 UPDATE development_projects
@@ -260,13 +287,16 @@ class SqliteProjectCatalog:
 
     @staticmethod
     def exists(connection: sqlite3.Connection, project_id: str) -> bool:
-        return connection.execute(
-            "SELECT 1 FROM development_projects AS project "
-            "LEFT JOIN development_deleted_projects AS deleted "
-            "ON deleted.project_id = project.project_id "
-            "WHERE project.project_id = ? AND deleted.project_id IS NULL",
-            (project_id,),
-        ).fetchone() is not None
+        return (
+            connection.execute(
+                "SELECT 1 FROM development_projects AS project "
+                "LEFT JOIN development_deleted_projects AS deleted "
+                "ON deleted.project_id = project.project_id "
+                "WHERE project.project_id = ? AND deleted.project_id IS NULL",
+                (project_id,),
+            ).fetchone()
+            is not None
+        )
 
     @staticmethod
     def _set_active(connection: sqlite3.Connection, project_id: str) -> None:

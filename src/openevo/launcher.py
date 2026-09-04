@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import BinaryIO, Callable, Iterator
 
 from openevo.release_bundle import (
     RELEASE_ID_PATTERN,
@@ -60,9 +60,12 @@ LOCAL_DEVELOPMENT_STATE_ROOT = Path("~/.openevo/dev-agent").expanduser()
 REMOTE_LIFECYCLE_ACTIONS = frozenset({"status", "logs", "stop"})
 SOURCE_ACTIONS = frozenset({"auto", "install", "update", "start"})
 SSH_CONNECT_TIMEOUT_SECONDS = 15
-REMOTE_COMMAND_TIMEOUT_SECONDS = 600
+REMOTE_COMMAND_TIMEOUT_SECONDS = 1200
+REMOTE_HOST_SETUP_TIMEOUT_SECONDS = 3600
 SOURCE_TRANSFER_TIMEOUT_SECONDS = 180
 LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS = 3
+CODEX_INSTALL_URL = "https://chatgpt.com/codex/install.sh"
+CODEX_DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 SSH_CONFIG_MAX_INCLUDE_DEPTH = 8
 SSH_CONFIG_MAX_FILES = 64
 LAUNCHER_PREFERENCES_SCHEMA_VERSION = 1
@@ -690,6 +693,311 @@ def upload_release_bundle(
         )
 
 
+def build_remote_prerequisite_script(*, include_git: bool) -> str:
+    """Install the small host-tool baseline without prompting for sudo credentials."""
+
+    required_commands = ["python3", "curl", "timeout", "sha256sum"]
+    packages = ["python3", "curl", "coreutils", "ca-certificates"]
+    if include_git:
+        required_commands.append("git")
+        packages.append("git")
+    required = " ".join(required_commands)
+    package_arguments = " ".join(packages)
+    return f"""\
+missing_prerequisites=''
+for required_command in {required}; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    missing_prerequisites="$missing_prerequisites $required_command"
+  fi
+done
+
+if [ -n "$missing_prerequisites" ]; then
+  echo "Installing required server tools:$missing_prerequisites"
+  run_as_root() {{
+    if [ "$(id -u)" -eq 0 ]; then
+      "$@"
+    else
+      sudo -n "$@"
+    fi
+  }}
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+      echo "Automatic server preparation requires root or passwordless sudo." >&2
+      echo "Enable passwordless sudo for this SSH user, then retry EvoLab." >&2
+      exit 56
+    fi
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+    run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y {package_arguments}
+  elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y {package_arguments}
+  elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y {package_arguments}
+  elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add --no-cache {package_arguments}
+  else
+    echo "No supported package manager was found for automatic server preparation." >&2
+    echo "Supported package managers: apt-get, dnf, yum, apk." >&2
+    exit 57
+  fi
+
+  for required_command in {required}; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+      echo "Server preparation completed without required command: $required_command" >&2
+      exit 58
+    fi
+  done
+fi
+"""
+
+
+def build_remote_host_setup_script(*, include_git: bool) -> str:
+    """Prepare baseline tools and the NVIDIA container stack when applicable."""
+
+    prerequisite_script = build_remote_prerequisite_script(include_git=include_git)
+    return """\
+set -eu
+umask 077
+
+""" + prerequisite_script + r"""
+has_nvidia_gpu=0
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  has_nvidia_gpu=1
+else
+  for vendor_file in /sys/bus/pci/devices/*/vendor; do
+    [ -r "$vendor_file" ] || continue
+    IFS= read -r vendor_id < "$vendor_file" || continue
+    [ "$vendor_id" = "0x10de" ] || continue
+    class_file="${vendor_file%/vendor}/class"
+    [ -r "$class_file" ] || continue
+    IFS= read -r device_class < "$class_file" || continue
+    case "$device_class" in
+      0x03*|0x12*) has_nvidia_gpu=1; break ;;
+    esac
+  done
+fi
+
+if [ "$has_nvidia_gpu" -ne 1 ]; then
+  echo "No NVIDIA GPU detected; skipping the self-deployed model runtime setup."
+  exit 0
+fi
+
+echo "NVIDIA GPU detected; checking the self-deployed model runtime..."
+
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+require_root_access() {
+  if [ "$(id -u)" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+      echo "Automatic GPU server preparation requires root or passwordless sudo." >&2
+      echo "Use a standard cloud Ubuntu user with passwordless sudo, then retry EvoLab." >&2
+      exit 59
+    fi
+  fi
+}
+
+os_id=''
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  os_id="${ID:-}"
+fi
+init_name="$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]')"
+
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+  if [ "$init_name" != "systemd" ]; then
+    echo "An NVIDIA GPU is present, but its driver is not ready inside this containerized server." >&2
+    echo "EvoLab did not change GPU drivers or services. Use an image with its driver preinstalled." >&2
+    exit 60
+  fi
+  require_root_access
+  if [ "$os_id" != "ubuntu" ] || ! command -v apt-get >/dev/null 2>&1; then
+    echo "An NVIDIA GPU is present, but its driver is not ready." >&2
+    echo "Automatic NVIDIA driver installation currently supports Ubuntu GPU servers." >&2
+    echo "Use a cloud GPU image with its NVIDIA driver preinstalled, then retry EvoLab." >&2
+    exit 60
+  fi
+  echo "Installing the Ubuntu-recommended NVIDIA compute driver..."
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ubuntu-drivers-common
+  run_as_root env DEBIAN_FRONTEND=noninteractive ubuntu-drivers install --gpgpu
+  run_as_root modprobe nvidia >/dev/null 2>&1 || true
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "The NVIDIA driver was installed, but the server must reboot before it can load." >&2
+    echo "Reboot this GPU server once, then run the same EvoLab command again." >&2
+    exit 61
+  fi
+fi
+
+docker_needs_install=0
+if ! command -v docker >/dev/null 2>&1; then
+  docker_needs_install=1
+fi
+
+docker_daemon_ready=0
+docker_access='none'
+if [ "$docker_needs_install" -eq 0 ]; then
+  if timeout 15 docker info >/dev/null 2>&1; then
+    docker_daemon_ready=1
+    docker_access='user'
+  elif [ "$(id -u)" -eq 0 ]; then
+    if timeout 15 docker info >/dev/null 2>&1; then
+      docker_daemon_ready=1
+      docker_access='root'
+    fi
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    if sudo -n timeout 15 docker info >/dev/null 2>&1; then
+      docker_daemon_ready=1
+      docker_access='root'
+    fi
+  fi
+fi
+
+run_docker() {
+  if [ "$docker_access" = "user" ]; then
+    timeout 30 docker "$@"
+  else
+    run_as_root timeout 30 docker "$@"
+  fi
+}
+
+nvidia_runtime_ready=0
+if [ "$docker_daemon_ready" -eq 1 ]; then
+  if run_docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+    nvidia_runtime_ready=1
+  fi
+fi
+
+if [ "$init_name" != "systemd" ]; then
+  if [ "$docker_daemon_ready" -eq 1 ] && [ "$nvidia_runtime_ready" -eq 1 ] \
+      && [ "$docker_access" = "user" ]; then
+    echo "Using the containerized GPU server's existing Docker and NVIDIA runtime."
+    exit 0
+  fi
+  echo "This is a containerized GPU server (PID 1 is $init_name), not a systemd virtual machine." >&2
+  echo "It does not expose a ready user-accessible Docker daemon with the NVIDIA runtime." >&2
+  echo "EvoLab did not install GPU packages, start services, or change Docker configuration." >&2
+  echo "Ask the provider for a Docker-enabled GPU container, or use an Ubuntu GPU virtual machine." >&2
+  exit 62
+fi
+
+if [ "$docker_daemon_ready" -eq 1 ] && [ "$nvidia_runtime_ready" -eq 1 ] \
+    && [ "$docker_access" = "user" ]; then
+  echo "The server's existing Docker and NVIDIA runtime are ready."
+  exit 0
+fi
+
+require_root_access
+if [ "$os_id" != "ubuntu" ] || ! command -v apt-get >/dev/null 2>&1; then
+  echo "Automatic Docker and NVIDIA Container Toolkit installation currently supports Ubuntu GPU servers." >&2
+  echo "Use a supported Ubuntu GPU image, then retry EvoLab." >&2
+  exit 63
+fi
+
+if [ "$docker_needs_install" -eq 1 ]; then
+  echo "Installing Docker for the self-deployed model runtime..."
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+fi
+
+if [ "$docker_daemon_ready" -ne 1 ]; then
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "Docker was installed, but systemd is unavailable on this Ubuntu virtual machine." >&2
+    exit 64
+  fi
+  run_as_root systemctl enable --now docker
+  if ! run_as_root timeout 30 docker info >/dev/null 2>&1; then
+    echo "Docker is installed, but its daemon is not ready." >&2
+    exit 65
+  fi
+  docker_daemon_ready=1
+  if [ "$(id -u)" -eq 0 ]; then
+    docker_access='user'
+  else
+    docker_access='root'
+  fi
+fi
+
+if [ "$nvidia_runtime_ready" -ne 1 ] && ! command -v nvidia-ctk >/dev/null 2>&1; then
+  echo "Installing NVIDIA Container Toolkit from NVIDIA's signed repository..."
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+  toolkit_tmp="$(mktemp -d)"
+  cleanup_toolkit_tmp() {
+    rm -rf "$toolkit_tmp"
+  }
+  trap cleanup_toolkit_tmp EXIT HUP INT TERM
+  curl --connect-timeout 15 --max-time 120 --fail --silent --show-error --location \
+    https://nvidia.github.io/libnvidia-container/gpgkey \
+    --output "$toolkit_tmp/gpgkey"
+  gpg --batch --yes --dearmor \
+    --output "$toolkit_tmp/nvidia-container-toolkit-keyring.gpg" \
+    "$toolkit_tmp/gpgkey"
+  curl --connect-timeout 15 --max-time 120 --fail --silent --show-error --location \
+    https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    --output "$toolkit_tmp/nvidia-container-toolkit.list"
+  sed \
+    's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    "$toolkit_tmp/nvidia-container-toolkit.list" \
+    > "$toolkit_tmp/nvidia-container-toolkit.signed.list"
+  if ! grep -q 'https://nvidia.github.io/libnvidia-container/stable/deb' \
+    "$toolkit_tmp/nvidia-container-toolkit.signed.list"; then
+    echo "NVIDIA Container Toolkit returned an unexpected repository definition." >&2
+    exit 66
+  fi
+  run_as_root install -m 0644 \
+    "$toolkit_tmp/nvidia-container-toolkit-keyring.gpg" \
+    /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  run_as_root install -m 0644 \
+    "$toolkit_tmp/nvidia-container-toolkit.signed.list" \
+    /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-container-toolkit
+  cleanup_toolkit_tmp
+  trap - EXIT HUP INT TERM
+fi
+
+if [ "$nvidia_runtime_ready" -ne 1 ]; then
+  echo "Configuring Docker to expose NVIDIA GPUs..."
+  run_as_root nvidia-ctk runtime configure --runtime=docker
+  run_as_root systemctl restart docker
+  if ! run_as_root timeout 30 docker info --format '{{json .Runtimes}}' \
+      | grep -q '"nvidia"'; then
+    echo "Docker restarted without registering the NVIDIA runtime." >&2
+    exit 67
+  fi
+  nvidia_runtime_ready=1
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+  case " $(id -nG) " in
+    *" docker "*) ;;
+    *)
+      require_root_access
+      if ! getent group docker >/dev/null 2>&1; then
+        run_as_root groupadd --system docker
+      fi
+      run_as_root usermod -aG docker "$(id -un)"
+      echo "Docker access was granted to this SSH user; the next launcher connection will use it."
+      ;;
+  esac
+fi
+
+if ! run_as_root timeout 30 nvidia-container-cli info >/dev/null 2>&1; then
+  echo "NVIDIA Container Toolkit is installed, but it cannot access the GPU driver." >&2
+  echo "Reboot the GPU server once, then run the same EvoLab command again." >&2
+  exit 68
+fi
+
+echo "Docker and NVIDIA Container Toolkit are ready."
+"""
+
+
 def build_remote_release_install_script(
     bundle: ReleaseBundleReceipt,
     *,
@@ -704,6 +1012,7 @@ def build_remote_release_install_script(
         "product_version": bundle.product_version,
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
+    prerequisite_script = build_remote_prerequisite_script(include_git=False)
     return rf"""\
 set -eu
 umask 077
@@ -717,6 +1026,8 @@ releases_root="$state_root/releases"
 release_root="$releases_root/$release_id"
 active_marker="$state_root/active-release-v1"
 mkdir -p "$state_root/incoming" "$releases_root"
+
+{prerequisite_script}
 
 if [ ! -e "$release_root" ]; then
   if [ -z "$bundle_sha256" ] || [ ! -f "$archive" ]; then
@@ -1044,6 +1355,7 @@ def build_remote_script(
     remote_web_port: int = 8788,
     browser_endpoint: str = "http://127.0.0.1:8765",
     release_id: str = "",
+    allow_device_auth: bool = True,
 ) -> str:
     values = {
         "branch": branch,
@@ -1060,8 +1372,10 @@ def build_remote_script(
         "browser_endpoint": browser_endpoint,
         "release_id": release_id,
         "delivery_mode": "release" if release_id else "git",
+        "allow_device_auth": "1" if allow_device_auth else "0",
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
+    prerequisite_script = build_remote_prerequisite_script(include_git=not release_id)
     webui_script = ""
     if self_hosted_webui:
         webui_script = f"""
@@ -1094,6 +1408,7 @@ if [ -f "$web_pid_file" ]; then
 fi
 
 nohup env \\
+  "PYTHONPATH=$source_root/src" \\
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \\
   "OPENEVO_DEV_WEB_SESSION_TOKEN=$web_session_token" \\
   "OPENEVO_DEV_WEB_BOOTSTRAP_TOKEN=$web_bootstrap_token" \\
@@ -1136,6 +1451,7 @@ expected_commit={quoted['expected_commit']}
 source_bundle_sha256={quoted['source_bundle_sha256']}
 prepare_runtime={quoted['prepare_runtime']}
 start_services={quoted['start_services']}
+allow_device_auth={quoted['allow_device_auth']}
 agent_token={quoted['token']}
 remote_port={quoted['remote_port']}
 evolution_model={quoted['evolution_model']}
@@ -1152,7 +1468,9 @@ source_bundle="$state_root/incoming/source-$expected_commit.bundle"
 pid_file="$state_root/daemon.pid"
 log_file="$state_root/daemon.log"
 
-mkdir -p "$state_root"
+mkdir -p "$state_root" "$state_root/incoming"
+
+{prerequisite_script}
 
 if [ "$delivery_mode" = release ]; then
   active_release="$(cat "$state_root/active-release-v1" 2>/dev/null || true)"
@@ -1319,7 +1637,7 @@ if [ "$runtime_commit" != "$runtime_identity" ]; then
     exit 36
   fi
   if [ "$delivery_mode" = release ]; then
-    timeout 300 "$uv_bin" sync --frozen --no-dev --python 3.11
+    timeout 300 "$uv_bin" sync --frozen --no-dev --no-install-project --python 3.11
   else
     timeout 300 "$uv_bin" sync --frozen --python 3.11
   fi
@@ -1328,42 +1646,90 @@ if [ "$runtime_commit" != "$runtime_identity" ]; then
   mv "$runtime_marker_tmp" "$runtime_marker"
 fi
 
-if [ "$start_services" -ne 1 ]; then
-  echo "Remote EvoLab source and runtime are installed at $runtime_identity."
-  exit 0
+find_codex() {{
+  found_codex="$(command -v codex || true)"
+  if [ -z "$found_codex" ] && command -v bash >/dev/null 2>&1; then
+    found_codex="$(bash -lc 'command -v codex' 2>/dev/null || true)"
+  fi
+  if [ -z "$found_codex" ]; then
+    for candidate in \
+      "$HOME/.local/bin/codex" \
+      "$HOME/.npm-global/bin/codex" \
+      /usr/local/bin/codex \
+      /usr/bin/codex \
+      "$HOME"/.nvm/versions/node/*/bin/codex; do
+      if [ -x "$candidate" ]; then
+        found_codex="$candidate"
+        break
+      fi
+    done
+  fi
+  case "$found_codex" in
+    /*) if [ -x "$found_codex" ]; then printf '%s\n' "$found_codex"; fi ;;
+  esac
+}}
+
+codex_bin="$(find_codex)"
+if [ -z "$codex_bin" ]; then
+  if [ "$prepare_runtime" -ne 1 ]; then
+    echo "Codex CLI is not installed; run with --source-action auto, install, or update first." >&2
+    exit 27
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required to install Codex CLI automatically." >&2
+    exit 27
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "timeout is required for bounded Codex CLI installation." >&2
+    exit 27
+  fi
+  echo "[remote 2/4] Installing Codex CLI for remote user $(id -un)..."
+  codex_installer="$(mktemp "$state_root/incoming/codex-install.XXXXXX")"
+  if ! curl --connect-timeout 15 --max-time 120 -fsSL \
+      {shlex.quote(CODEX_INSTALL_URL)} --output "$codex_installer"; then
+    rm -f "$codex_installer"
+    echo "Could not download the official Codex CLI installer." >&2
+    exit 27
+  fi
+  if ! timeout 180 sh "$codex_installer"; then
+    rm -f "$codex_installer"
+    echo "The official Codex CLI installer failed or exceeded 180 seconds." >&2
+    exit 27
+  fi
+  rm -f "$codex_installer"
+  codex_bin="$(find_codex)"
 fi
 
-codex_bin="$(command -v codex || true)"
-if [ -z "$codex_bin" ] && command -v bash >/dev/null 2>&1; then
-  codex_bin="$(bash -lc 'command -v codex' 2>/dev/null || true)"
-fi
-if [ -z "$codex_bin" ]; then
-  for candidate in \
-    "$HOME/.local/bin/codex" \
-    "$HOME/.npm-global/bin/codex" \
-    /usr/local/bin/codex \
-    /usr/bin/codex \
-    "$HOME"/.nvm/versions/node/*/bin/codex; do
-    if [ -x "$candidate" ]; then
-      codex_bin="$candidate"
-      break
-    fi
-  done
-fi
-case "$codex_bin" in
-  /*) ;;
-  *) codex_bin='' ;;
-esac
 if [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; then
-  echo "Codex CLI was not found in the non-interactive SSH environment." >&2
+  echo "Codex CLI installation completed, but the executable was not found." >&2
   echo "Log in normally and run: command -v codex" >&2
   exit 27
 fi
 codex_dir="$(dirname "$codex_bin")"
 if ! timeout 30 env "PATH=$codex_dir:$PATH" "$codex_bin" login status >/dev/null 2>&1; then
-  echo "Codex CLI is installed but is not logged in for remote user $(id -un)." >&2
-  echo "Run 'codex login --device-auth' as that same remote user, then retry." >&2
-  exit 28
+  if [ "$allow_device_auth" -ne 1 ]; then
+    echo "Codex CLI is not logged in for remote user $(id -un)." >&2
+    echo "Run interactively without --non-interactive to complete device-code login." >&2
+    exit 28
+  fi
+  echo "Codex login is required for remote user $(id -un)."
+  echo "A browser will open on this computer. Enter the one-time code shown below."
+  echo "{CODEX_DEVICE_AUTH_URL}"
+  if ! timeout 600 env "PATH=$codex_dir:$PATH" "$codex_bin" login --device-auth; then
+    echo "Codex device-code login failed, was cancelled, or exceeded 10 minutes." >&2
+    echo "Device-code login may need to be enabled in ChatGPT security or workspace settings." >&2
+    exit 28
+  fi
+  if ! timeout 30 env "PATH=$codex_dir:$PATH" "$codex_bin" login status >/dev/null 2>&1; then
+    echo "Codex device-code login finished without a usable remote login." >&2
+    exit 28
+  fi
+  echo "Codex login completed for remote user $(id -un)."
+fi
+
+if [ "$start_services" -ne 1 ]; then
+  echo "Remote EvoLab source, runtime, and Codex CLI are ready at $runtime_identity."
+  exit 0
 fi
 
 echo "[remote 3/4] Restarting the development daemon..."
@@ -1392,6 +1758,7 @@ if [ -f "$pid_file" ]; then
 fi
 
 nohup env \
+  "PYTHONPATH=$source_root/src" \
   "PATH=$codex_dir:$PATH" \
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
@@ -1471,29 +1838,78 @@ def _run_remote_capture(
     return completed.stdout.decode("utf-8", errors="strict")
 
 
-def _run_remote(ssh_binary: str, connection: SshConnection, script: str) -> None:
+def _relay_remote_output(stream: BinaryIO, *, open_device_auth: bool) -> None:
+    browser_attempted = False
+    for raw_line in iter(stream.readline, b""):
+        line = raw_line.decode("utf-8", errors="replace")
+        print(line, end="", flush=True)
+        if (
+            open_device_auth
+            and not browser_attempted
+            and CODEX_DEVICE_AUTH_URL in line
+        ):
+            browser_attempted = True
+            if not open_browser(CODEX_DEVICE_AUTH_URL):
+                print(
+                    "The Codex login page could not be opened automatically; "
+                    "open the URL shown above.",
+                    flush=True,
+                )
+
+
+def _run_remote(
+    ssh_binary: str,
+    connection: SshConnection,
+    script: str,
+    *,
+    open_device_auth: bool = False,
+    timeout: int = REMOTE_COMMAND_TIMEOUT_SECONDS,
+) -> None:
     script_bytes = script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    process = subprocess.Popen(
+        [
+            ssh_binary,
+            *connection.options,
+            *_ssh_transport_options(),
+            connection.destination,
+            "sh",
+            "-s",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    relay_thread = threading.Thread(
+        target=_relay_remote_output,
+        args=(process.stdout,),
+        kwargs={"open_device_auth": open_device_auth},
+        daemon=True,
+    )
+    relay_thread.start()
     try:
-        completed = subprocess.run(
-            [
-                ssh_binary,
-                *connection.options,
-                *_ssh_transport_options(),
-                connection.destination,
-                "sh",
-                "-s",
-            ],
-            input=script_bytes,
-            check=False,
-            timeout=REMOTE_COMMAND_TIMEOUT_SECONDS,
-        )
+        try:
+            process.stdin.write(script_bytes)
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+        returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait(timeout=5)
         raise LauncherError(
-            f"remote deployment exceeded {REMOTE_COMMAND_TIMEOUT_SECONDS} seconds"
+            f"remote deployment exceeded {timeout} seconds"
         ) from exc
-    if completed.returncode != 0:
+    finally:
+        relay_thread.join(timeout=5)
+    if returncode != 0:
         raise LauncherError(
-            f"remote deployment failed with exit code {completed.returncode}"
+            f"remote deployment failed with exit code {returncode}"
         )
 
 
@@ -1746,7 +2162,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--non-interactive",
         action="store_true",
-        help="do not prompt when selecting an SSH workspace",
+        help="do not prompt for SSH workspace selection or Codex device-code login",
     )
     parser.add_argument(
         "--no-remember",
@@ -1830,7 +2246,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-open",
         action="store_true",
-        help="print the WebUI URL without opening the default browser",
+        help="print login and WebUI URLs without opening the default browser",
     )
     lifecycle = parser.add_mutually_exclusive_group()
     lifecycle.add_argument(
@@ -1997,6 +2413,14 @@ def main(argv: list[str] | None = None) -> int:
             "run --source-action update first"
         )
 
+    print("Preparing required server tools and GPU runtime when applicable...", flush=True)
+    _run_remote(
+        ssh_binary,
+        connection,
+        build_remote_host_setup_script(include_git=release_bundle is None),
+        timeout=REMOTE_HOST_SETUP_TIMEOUT_SECONDS,
+    )
+
     needs_source_delivery = remote_identity != expected_identity
     prepare_runtime = args.source_action != "start"
     start_services = not source_only
@@ -2039,7 +2463,9 @@ def main(argv: list[str] | None = None) -> int:
                 remote_web_port=args.remote_web_port,
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
                 release_id=release_bundle.release_id,
+                allow_device_auth=not args.non_interactive,
             ),
+            open_device_auth=not args.no_open and not args.non_interactive,
         )
     elif needs_source_delivery:
         with create_source_bundle(
@@ -2072,8 +2498,14 @@ def main(argv: list[str] | None = None) -> int:
                 web_bootstrap_token=web_bootstrap_token,
                 remote_web_port=args.remote_web_port,
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
+                allow_device_auth=not args.non_interactive,
             )
-            _run_remote(ssh_binary, connection, remote_script)
+            _run_remote(
+                ssh_binary,
+                connection,
+                remote_script,
+                open_device_auth=not args.no_open and not args.non_interactive,
+            )
     else:
         print(
             f"Installed source already matches {expected_commit[:12]}; no upload is needed.",
@@ -2092,11 +2524,18 @@ def main(argv: list[str] | None = None) -> int:
             web_bootstrap_token=web_bootstrap_token,
             remote_web_port=args.remote_web_port,
             browser_endpoint=f"http://127.0.0.1:{args.local_port}",
+            allow_device_auth=not args.non_interactive,
         )
-        _run_remote(ssh_binary, connection, remote_script)
+        _run_remote(
+            ssh_binary,
+            connection,
+            remote_script,
+            open_device_auth=not args.no_open and not args.non_interactive,
+        )
     if source_only:
         print(
-            f"Source and runtime {args.source_action} completed. Services were not started.",
+            f"Source, runtime, and Codex {args.source_action} completed. "
+            "Services were not started.",
             flush=True,
         )
         return 0

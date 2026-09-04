@@ -48,6 +48,16 @@ class FakeDaemonClient:
         self.evolution_action_ids: dict[str, str] = {}
         self.evolution_retry_action_ids: dict[str, str] = {}
         self.models: list[dict[str, object]] = []
+        self.model_runtime: dict[str, object] = {
+            "schema_version": "2",
+            "runtime_id": "vllm",
+            "image_ref": "docker.io/vllm/vllm-openai@sha256:fixture",
+            "state": "downloading",
+            "error": None,
+            "created_at": "2026-09-02T00:00:00Z",
+            "updated_at": "2026-09-02T00:00:00Z",
+        }
+        self.project_readiness_status = "passed"
 
     def emit_event(self, project_id: str) -> None:
         sequence = len(self.events) + 1
@@ -117,12 +127,10 @@ class FakeDaemonClient:
                 "schema_version": "2",
                 "active_project_id": self.state["active_project_id"],
                 "projects": [
-                    {"schema_version": "2", **project}
-                    for project in self.state["projects"]
+                    {"schema_version": "2", **project} for project in self.state["projects"]
                 ],
                 "project_heads": [
-                    {"schema_version": "2", **head}
-                    for head in self.state["project_heads"]
+                    {"schema_version": "2", **head} for head in self.state["project_heads"]
                 ],
             }
         if parsed.path == "/development/capabilities":
@@ -131,14 +139,11 @@ class FakeDaemonClient:
             project_id = parameters.get("project_id", [None])[0]
             if project_id is not None:
                 project = next(
-                    item for item in self.state["projects"]
-                    if item["project_id"] == project_id
+                    item for item in self.state["projects"] if item["project_id"] == project_id
                 )
                 mode = project["config"]["execution"]["mode"]
                 legacy["capabilities"]["evaluated_profile"]["execution_mode"] = (
-                    "subscription"
-                    if mode == "codex_subscription_transcript"
-                    else "self_deployed"
+                    "subscription" if mode == "codex_subscription_transcript" else "self_deployed"
                 )
             return {
                 "schema_version": "2",
@@ -148,10 +153,39 @@ class FakeDaemonClient:
         if parsed.path == "/development/events":
             legacy = self.request(f"/events?{parsed.query}")
             return {**legacy, "schema_version": "2"}
+        project_readiness = re.fullmatch(r"/development/projects/([^/]+)/readiness", parsed.path)
+        if project_readiness:
+            project = next(
+                item
+                for item in self.state["projects"]
+                if item["project_id"] == project_readiness.group(1)
+            )
+            mode = project["config"]["execution"]["mode"]
+            return {
+                "schema_version": "2",
+                "project_id": project["project_id"],
+                "execution_mode": mode,
+                "ready": self.project_readiness_status == "passed",
+                "checks": [
+                    {
+                        "schema_version": "2",
+                        "check_id": (
+                            "codex_subscription_login"
+                            if mode == "codex_subscription_transcript"
+                            else "self_deployed_model"
+                        ),
+                        "status": self.project_readiness_status,
+                    }
+                ],
+            }
         if parsed.path == "/development/projects" and method == "POST":
             assert isinstance(body, dict)
             existing = next(
-                (item for item in self.state["projects"] if item["project_id"] == body["project_id"]),
+                (
+                    item
+                    for item in self.state["projects"]
+                    if item["project_id"] == body["project_id"]
+                ),
                 None,
             )
             if existing is None:
@@ -167,25 +201,34 @@ class FakeDaemonClient:
             return {"schema_version": "2", **existing}
         activate_project = re.fullmatch(r"/development/projects/([^/]+)/activate", parsed.path)
         if activate_project and method == "POST":
-            project = next(item for item in self.state["projects"] if item["project_id"] == activate_project.group(1))
+            project = next(
+                item
+                for item in self.state["projects"]
+                if item["project_id"] == activate_project.group(1)
+            )
             self.state["active_project_id"] = project["project_id"]
             return {"schema_version": "2", **project}
         update_project = re.fullmatch(r"/development/projects/([^/]+)", parsed.path)
         if update_project and method == "PUT":
             assert isinstance(body, dict)
-            project = next(item for item in self.state["projects"] if item["project_id"] == update_project.group(1))
-            project.update({
-                "display_name": body["display_name"],
-                "config": body["config"],
-                "updated_at": "2026-08-23T00:00:01Z",
-            })
+            project = next(
+                item
+                for item in self.state["projects"]
+                if item["project_id"] == update_project.group(1)
+            )
+            project.update(
+                {
+                    "display_name": body["display_name"],
+                    "config": body["config"],
+                    "updated_at": "2026-08-23T00:00:01Z",
+                }
+            )
             return {"schema_version": "2", **project}
         if update_project and method == "DELETE":
             assert isinstance(body, dict)
             project_id = update_project.group(1)
             self.state["projects"] = [
-                item for item in self.state["projects"]
-                if item["project_id"] != project_id
+                item for item in self.state["projects"] if item["project_id"] != project_id
             ]
             if self.state["active_project_id"] == project_id:
                 self.state["active_project_id"] = None
@@ -198,7 +241,9 @@ class FakeDaemonClient:
             }
         if parsed.path == "/development/tasks" and method == "POST":
             assert isinstance(body, dict)
-            session_id = f"dev-session-{hashlib.sha256(body['action_id'].encode()).hexdigest()[:16]}"
+            session_id = (
+                f"dev-session-{hashlib.sha256(body['action_id'].encode()).hexdigest()[:16]}"
+            )
             existing = next(
                 (item for item in self.state["sessions"] if item["session_id"] == session_id),
                 None,
@@ -230,7 +275,8 @@ class FakeDaemonClient:
         cancel_task = re.fullmatch(r"/development/tasks/([^/]+)/cancel", parsed.path)
         if cancel_task and method == "POST":
             session = next(
-                item for item in self.state["sessions"]
+                item
+                for item in self.state["sessions"]
                 if item["session_id"] == cancel_task.group(1)
             )
             session["updated_at"] = "2026-08-23T00:00:02Z"
@@ -240,8 +286,7 @@ class FakeDaemonClient:
             assert isinstance(body, dict)
             task_id = delete_task.group(1)
             self.state["sessions"] = [
-                item for item in self.state["sessions"]
-                if item["session_id"] != task_id
+                item for item in self.state["sessions"] if item["session_id"] != task_id
             ]
             return {
                 "schema_version": "2",
@@ -255,23 +300,23 @@ class FakeDaemonClient:
             items = []
             for session in self.state["sessions"]:
                 state = "closed" if session["state"] == "completed" else session["state"]
-                items.append({
-                    "schema_version": "2",
-                    "task_id": session["session_id"],
-                    "project_id": session["project_id"],
-                    "project_head_id": session.get("project_head_id"),
-                    "state": state,
-                    "created_at": session["created_at"],
-                    "updated_at": session["updated_at"],
-                })
+                items.append(
+                    {
+                        "schema_version": "2",
+                        "task_id": session["session_id"],
+                        "project_id": session["project_id"],
+                        "project_head_id": session.get("project_head_id"),
+                        "state": state,
+                        "created_at": session["created_at"],
+                        "updated_at": session["updated_at"],
+                    }
+                )
             query = parse_qs(parsed.query)
             after = query.get("after", [None])[0]
             start = 0
             if after is not None:
                 start = next(
-                    index + 1
-                    for index, item in enumerate(items)
-                    if item["task_id"] == after
+                    index + 1 for index, item in enumerate(items) if item["task_id"] == after
                 )
             limit = int(query.get("limit", ["100"])[0])
             page_items = items[start : start + limit]
@@ -285,8 +330,7 @@ class FakeDaemonClient:
         task_logs = re.fullmatch(r"/tasks/([^/]+)/logs", parsed.path)
         if task_logs:
             session = next(
-                item for item in self.state["sessions"]
-                if item["session_id"] == task_logs.group(1)
+                item for item in self.state["sessions"] if item["session_id"] == task_logs.group(1)
             )
             messages = [
                 *[("system", message) for message in session.get("logs", [])],
@@ -296,12 +340,15 @@ class FakeDaemonClient:
             query = parse_qs(parsed.query)
             after = int(query.get("after", ["0"])[0])
             limit = int(query.get("limit", ["100"])[0])
-            all_items = [{
-                "sequence": index + 1,
-                "occurred_at": session["updated_at"],
-                "stream": stream,
-                "message": message,
-            } for index, (stream, message) in enumerate(messages)]
+            all_items = [
+                {
+                    "sequence": index + 1,
+                    "occurred_at": session["updated_at"],
+                    "stream": stream,
+                    "message": message,
+                }
+                for index, (stream, message) in enumerate(messages)
+            ]
             remaining = [item for item in all_items if item["sequence"] > after]
             items = remaining[:limit]
             has_more = len(remaining) > limit
@@ -314,26 +361,30 @@ class FakeDaemonClient:
         task_timeline = re.fullmatch(r"/tasks/([^/]+)/timeline", parsed.path)
         if task_timeline:
             session = next(
-                item for item in self.state["sessions"]
+                item
+                for item in self.state["sessions"]
                 if item["session_id"] == task_timeline.group(1)
             )
-            events = [{
-                "schema_version": "2",
-                "event_id": f"{session['session_id']}-event-admitted",
-                "sequence": 1,
-                "occurred_at": session["created_at"],
-                "project_id": session["project_id"],
-                "task_id": session["session_id"],
-                "event_type": "task_admitted",
-            }, {
-                "schema_version": "2",
-                "event_id": f"{session['session_id']}-event-attempt",
-                "sequence": 2,
-                "occurred_at": session["created_at"],
-                "project_id": session["project_id"],
-                "task_id": session["session_id"],
-                "event_type": "attempt_appended",
-            }]
+            events = [
+                {
+                    "schema_version": "2",
+                    "event_id": f"{session['session_id']}-event-admitted",
+                    "sequence": 1,
+                    "occurred_at": session["created_at"],
+                    "project_id": session["project_id"],
+                    "task_id": session["session_id"],
+                    "event_type": "task_admitted",
+                },
+                {
+                    "schema_version": "2",
+                    "event_id": f"{session['session_id']}-event-attempt",
+                    "sequence": 2,
+                    "occurred_at": session["created_at"],
+                    "project_id": session["project_id"],
+                    "task_id": session["session_id"],
+                    "event_type": "attempt_appended",
+                },
+            ]
             query = parse_qs(parsed.query)
             after = int(query.get("after", ["0"])[0])
             limit = int(query.get("limit", ["100"])[0])
@@ -362,20 +413,24 @@ class FakeDaemonClient:
         artifact_content = re.fullmatch(r"/artifacts/([^/]+)/content", parsed.path)
         if artifact_content:
             raw = next(
-                artifact for artifact in self.state["artifacts"]
+                artifact
+                for artifact in self.state["artifacts"]
                 if artifact["artifact_id"] == artifact_content.group(1)
             )
             return {
                 "schema_version": "2",
                 "artifact": self._core_artifact(raw),
-                "media_type": raw["documents"][0]["media_type"] if raw["documents"] else "application/octet-stream",
+                "media_type": raw["documents"][0]["media_type"]
+                if raw["documents"]
+                else "application/octet-stream",
                 "content_sha256": raw["content_sha256"],
                 "byte_size": raw["byte_size"],
             }
         artifact_detail = re.fullmatch(r"/artifacts/([^/]+)", parsed.path)
         if artifact_detail:
             raw = next(
-                artifact for artifact in self.state["artifacts"]
+                artifact
+                for artifact in self.state["artifacts"]
                 if artifact["artifact_id"] == artifact_detail.group(1)
             )
             return self._core_artifact(raw)
@@ -395,20 +450,17 @@ class FakeDaemonClient:
             "state": session["state"],
             "duration_ms": session.get("duration_ms"),
             "selected_evolution": [
-                {"schema_version": "2", **item}
-                for item in session.get("selected_evolution", [])
+                {"schema_version": "2", **item} for item in session.get("selected_evolution", [])
             ],
             "evolution_errors": [
-                {"schema_version": "2", **item}
-                for item in session.get("evolution_errors", [])
+                {"schema_version": "2", **item} for item in session.get("evolution_errors", [])
             ],
             "workspace_changes": [
                 {
                     "schema_version": "2",
                     **item,
                     "diff_lines": [
-                        {"schema_version": "2", **line}
-                        for line in item.get("diff_lines", [])
+                        {"schema_version": "2", **line} for line in item.get("diff_lines", [])
                     ],
                 }
                 for item in session.get("workspace_changes", [])
@@ -426,7 +478,9 @@ class FakeDaemonClient:
             "schema_version": "2",
             "artifact_id": raw["artifact_id"],
             "project_id": raw["project_id"],
-            "artifact_type": "diagnostic" if raw["artifact_type"] == "report" else raw["artifact_type"],
+            "artifact_type": "diagnostic"
+            if raw["artifact_type"] == "report"
+            else raw["artifact_type"],
             "manifest_sha256": raw["content_sha256"],
             "byte_size": raw["byte_size"],
             "created_at": raw["created_at"],
@@ -445,9 +499,21 @@ class FakeDaemonClient:
         del content_type
         parameters = parse_qs(query)
         if path == "development/models" and method == "GET":
-            return 200, json.dumps(
-                {"schema_version": "2", "items": self.models}
-            ).encode(), {"Content-Type": "application/json"}
+            return (
+                200,
+                json.dumps({"schema_version": "2", "items": self.models}).encode(),
+                {"Content-Type": "application/json"},
+            )
+        if path == "development/model-runtime" and method == "GET":
+            return 200, json.dumps(self.model_runtime).encode(), {
+                "Content-Type": "application/json"
+            }
+        if path == "development/model-runtime/retry" and method == "POST":
+            self.model_runtime["state"] = "queued"
+            self.model_runtime["error"] = None
+            return 202, json.dumps(self.model_runtime).encode(), {
+                "Content-Type": "application/json"
+            }
         if path == "development/models" and method == "POST":
             registration = json.loads(body)
             model = {
@@ -469,15 +535,13 @@ class FakeDaemonClient:
         model_detail = re.fullmatch(r"development/models/([^/]+)", path)
         if model_detail and method == "GET":
             model = next(
-                item for item in self.models
-                if item["model_resource_id"] == model_detail.group(1)
+                item for item in self.models if item["model_resource_id"] == model_detail.group(1)
             )
             return 200, json.dumps(model).encode(), {"Content-Type": "application/json"}
         model_retry = re.fullmatch(r"development/models/([^/]+)/retry", path)
         if model_retry and method == "POST":
             model = next(
-                item for item in self.models
-                if item["model_resource_id"] == model_retry.group(1)
+                item for item in self.models if item["model_resource_id"] == model_retry.group(1)
             )
             return 202, json.dumps(model).encode(), {"Content-Type": "application/json"}
         if path == "development/tasks" and method == "GET":
@@ -498,8 +562,7 @@ class FakeDaemonClient:
             deletion = json.loads(body)
             task_id = delete_task.group(1)
             self.state["sessions"] = [
-                item for item in self.state["sessions"]
-                if item["session_id"] != task_id
+                item for item in self.state["sessions"] if item["session_id"] != task_id
             ]
             payload = {
                 "schema_version": "2",
@@ -514,8 +577,7 @@ class FakeDaemonClient:
             deletion = json.loads(body)
             project_id = delete_project.group(1)
             self.state["projects"] = [
-                item for item in self.state["projects"]
-                if item["project_id"] != project_id
+                item for item in self.state["projects"] if item["project_id"] != project_id
             ]
             if self.state["active_project_id"] == project_id:
                 self.state["active_project_id"] = None
@@ -530,8 +592,7 @@ class FakeDaemonClient:
         if path == "development/evolution-jobs" and method == "GET":
             project_id = parameters["project_id"][0]
             session_projects = {
-                session["session_id"]: session["project_id"]
-                for session in self.state["sessions"]
+                session["session_id"]: session["project_id"] for session in self.state["sessions"]
             }
             items = [
                 self._evolution_job_v2(job, project_id=project_id)
@@ -545,38 +606,40 @@ class FakeDaemonClient:
                 "has_more": False,
             }
             return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
-        evolution_job_retry = re.fullmatch(
-            r"development/evolution-jobs/([^/]+)/retry", path
-        )
+        evolution_job_retry = re.fullmatch(r"development/evolution-jobs/([^/]+)/retry", path)
         if evolution_job_retry and method == "POST":
             retry = json.loads(body)
             job = next(
-                item for item in self.state["evolution_jobs"]
+                item
+                for item in self.state["evolution_jobs"]
                 if item["job_id"] == evolution_job_retry.group(1)
             )
             attempt_id = self.evolution_retry_action_ids.get(retry["action_id"])
             if attempt_id is None:
                 attempt_id = f"{job['job_id']}-attempt-{len(job['attempts']) + 1}"
                 self.evolution_retry_action_ids[retry["action_id"]] = attempt_id
-                job["attempts"].append({
-                    "attempt_id": attempt_id,
-                    "job_id": job["job_id"],
-                    "ordinal": len(job["attempts"]) + 1,
-                    "state": "running",
-                    "stage": "input_resolution",
-                    "artifact_ids": [],
-                    "error_code": None,
-                    "error_message": None,
-                    "logs": ["Retry admitted with the original fixed inputs."],
-                    "created_at": "2026-08-23T00:00:01Z",
-                    "started_at": "2026-08-23T00:00:01Z",
-                    "completed_at": None,
-                    "updated_at": "2026-08-23T00:00:01Z",
-                })
+                job["attempts"].append(
+                    {
+                        "attempt_id": attempt_id,
+                        "job_id": job["job_id"],
+                        "ordinal": len(job["attempts"]) + 1,
+                        "state": "running",
+                        "stage": "input_resolution",
+                        "artifact_ids": [],
+                        "error_code": None,
+                        "error_message": None,
+                        "logs": ["Retry admitted with the original fixed inputs."],
+                        "created_at": "2026-08-23T00:00:01Z",
+                        "started_at": "2026-08-23T00:00:01Z",
+                        "completed_at": None,
+                        "updated_at": "2026-08-23T00:00:01Z",
+                    }
+                )
                 job["state"] = "running"
                 job["error"] = None
             project_id = next(
-                session["project_id"] for session in self.state["sessions"]
+                session["project_id"]
+                for session in self.state["sessions"]
                 if session["session_id"] == job["session_id"]
             )
             payload = self._evolution_job_v2(job, project_id=project_id)
@@ -584,11 +647,13 @@ class FakeDaemonClient:
         evolution_job_detail = re.fullmatch(r"development/evolution-jobs/([^/]+)", path)
         if evolution_job_detail and method == "GET":
             job = next(
-                item for item in self.state["evolution_jobs"]
+                item
+                for item in self.state["evolution_jobs"]
                 if item["job_id"] == evolution_job_detail.group(1)
             )
             project_id = next(
-                session["project_id"] for session in self.state["sessions"]
+                session["project_id"]
+                for session in self.state["sessions"]
                 if session["session_id"] == job["session_id"]
             )
             payload = self._evolution_job_v2(job, project_id=project_id)
@@ -634,7 +699,8 @@ class FakeDaemonClient:
                 self.evolution_action_ids[creation["action_id"]] = run_id
             else:
                 run = next(
-                    item for item in self.state["evolution_runs"]
+                    item
+                    for item in self.state["evolution_runs"]
                     if item["run_id"] == existing_run_id
                 )
             payload = self._evolution_run_v2(run)
@@ -642,7 +708,8 @@ class FakeDaemonClient:
         evolution_apply = re.fullmatch(r"development/evolution-runs/([^/]+)/apply", path)
         if evolution_apply and method == "POST":
             run = next(
-                item for item in self.state["evolution_runs"]
+                item
+                for item in self.state["evolution_runs"]
                 if item["run_id"] == evolution_apply.group(1)
             )
             run["state"] = "applied"
@@ -652,7 +719,8 @@ class FakeDaemonClient:
         evolution_detail = re.fullmatch(r"development/evolution-runs/([^/]+)", path)
         if evolution_detail and method == "GET":
             run = next(
-                item for item in self.state["evolution_runs"]
+                item
+                for item in self.state["evolution_runs"]
                 if item["run_id"] == evolution_detail.group(1)
             )
             payload = self._evolution_run_v2(run)
@@ -664,8 +732,7 @@ class FakeDaemonClient:
                     "schema_version": "2",
                     **artifact,
                     "documents": [
-                        {"schema_version": "2", **document}
-                        for document in artifact["documents"]
+                        {"schema_version": "2", **document} for document in artifact["documents"]
                     ],
                 }
                 for artifact in self.state["artifacts"]
@@ -681,15 +748,15 @@ class FakeDaemonClient:
         artifact_detail = re.fullmatch(r"development/artifacts/([^/]+)", path)
         if artifact_detail and method == "GET":
             artifact = next(
-                item for item in self.state["artifacts"]
+                item
+                for item in self.state["artifacts"]
                 if item["artifact_id"] == artifact_detail.group(1)
             )
             payload = {
                 "schema_version": "2",
                 **artifact,
                 "documents": [
-                    {"schema_version": "2", **document}
-                    for document in artifact["documents"]
+                    {"schema_version": "2", **document} for document in artifact["documents"]
                 ],
             }
             return 200, json.dumps(payload).encode(), {"Content-Type": "application/json"}
@@ -745,10 +812,14 @@ class FakeDaemonClient:
                 return 201, json.dumps(result).encode(), {"Content-Type": "application/json"}
             if method == "GET":
                 payload = self.workspace_files[relative_path]
-                return 200, payload, {
-                    "Content-Type": "text/plain",
-                    "X-OpenEvo-Content-SHA256": hashlib.sha256(payload).hexdigest(),
-                }
+                return (
+                    200,
+                    payload,
+                    {
+                        "Content-Type": "text/plain",
+                        "X-OpenEvo-Content-SHA256": hashlib.sha256(payload).hexdigest(),
+                    },
+                )
             if method == "DELETE":
                 del self.workspace_files[relative_path]
                 result = {
@@ -763,7 +834,8 @@ class FakeDaemonClient:
     def _evolution_run_v2(self, run: dict[str, object]) -> dict[str, object]:
         action_id = next(
             (
-                action_id for action_id, run_id in self.evolution_action_ids.items()
+                action_id
+                for action_id, run_id in self.evolution_action_ids.items()
                 if run_id == run["run_id"]
             ),
             f"legacy-{run['run_id']}",
@@ -775,8 +847,7 @@ class FakeDaemonClient:
             "project_id": run["project_id"],
             "source_task_ids": run["source_session_ids"],
             "selections": [
-                {"schema_version": "2", **selection}
-                for selection in run["selections"]
+                {"schema_version": "2", **selection} for selection in run["selections"]
             ],
             "state": run["state"],
             "artifact_ids": run["artifact_ids"],
@@ -843,9 +914,9 @@ def _config() -> dict[str, object]:
 
 
 def test_provider_exposes_only_honest_development_features() -> None:
-    version = DevelopmentAgentDesktopV2Provider(
-        FakeDaemonClient(), source_commit="a" * 40
-    ).invoke("getDesktopContractVersionV2", {})
+    version = DevelopmentAgentDesktopV2Provider(FakeDaemonClient(), source_commit="a" * 40).invoke(
+        "getDesktopContractVersionV2", {}
+    )
 
     assert version.build_channel == "development"
     assert version.openapi_sha256 == OPENAPI_SHA256
@@ -1097,16 +1168,20 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
     import openevo.web_gateway.product_app as web
 
     fake = FakeDaemonClient()
-    fake.state.update({
-        "active_project_id": "project-workspace-v2",
-        "projects": [{
-            "project_id": "project-workspace-v2",
-            "display_name": "Workspace v2",
-            "config": _config(),
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-    })
+    fake.state.update(
+        {
+            "active_project_id": "project-workspace-v2",
+            "projects": [
+                {
+                    "project_id": "project-workspace-v2",
+                    "display_name": "Workspace v2",
+                    "config": _config(),
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+        }
+    )
     original = web.DevelopmentDaemonClient
     web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
     try:
@@ -1135,25 +1210,21 @@ def test_http_layer_proxies_authenticated_workspace_v2_with_verified_bytes() -> 
             content=b"OpenEvo v2\n",
         )
         assert created.status_code == 201
-        assert created.json()["entry"]["content_sha256"] == hashlib.sha256(
-            b"OpenEvo v2\n"
-        ).hexdigest()
+        assert (
+            created.json()["entry"]["content_sha256"]
+            == hashlib.sha256(b"OpenEvo v2\n").hexdigest()
+        )
 
         inventory = client.get(f"{root}?limit=100", headers=headers)
-        assert [entry["path"] for entry in inventory.json()["items"]] == [
-            "notes/answer.txt"
-        ]
-        downloaded = client.get(
-            f"{root}/files?path=notes%2Fanswer.txt", headers=headers
-        )
+        assert [entry["path"] for entry in inventory.json()["items"]] == ["notes/answer.txt"]
+        downloaded = client.get(f"{root}/files?path=notes%2Fanswer.txt", headers=headers)
         assert downloaded.content == b"OpenEvo v2\n"
-        assert downloaded.headers["X-OpenEvo-Content-SHA256"] == hashlib.sha256(
-            downloaded.content
-        ).hexdigest()
-
-        deleted = client.delete(
-            f"{root}/files?path=notes%2Fanswer.txt", headers=headers
+        assert (
+            downloaded.headers["X-OpenEvo-Content-SHA256"]
+            == hashlib.sha256(downloaded.content).hexdigest()
         )
+
+        deleted = client.delete(f"{root}/files?path=notes%2Fanswer.txt", headers=headers)
         assert deleted.status_code == 200
         assert deleted.json()["deleted_path"] == "notes/answer.txt"
 
@@ -1204,6 +1275,17 @@ def test_http_layer_proxies_server_owned_model_downloads() -> None:
         )
         assert retry.status_code == 202
         assert retry.json()["model_resource_id"] == "model-fixture"
+        runtime_root = "/desktop/v2/development/model-runtime"
+        runtime = client.get(runtime_root, headers=headers)
+        assert runtime.status_code == 200
+        assert runtime.json()["state"] == "downloading"
+        runtime_retry = client.post(
+            f"{runtime_root}/retry",
+            headers=headers,
+            json={"schema_version": "2", "action_id": "retry-runtime"},
+        )
+        assert runtime_retry.status_code == 202
+        assert runtime_retry.json()["state"] == "queued"
 
 
 def test_http_layer_proxies_authenticated_project_and_task_deletions() -> None:
@@ -1212,17 +1294,21 @@ def test_http_layer_proxies_authenticated_project_and_task_deletions() -> None:
     fake = FakeDaemonClient()
     project_id = "project-delete-v2"
     task_id = "task-delete-v2"
-    fake.state.update({
-        "active_project_id": project_id,
-        "projects": [{
-            "project_id": project_id,
-            "display_name": "Delete v2",
-            "config": _config(),
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-        "sessions": [{"session_id": task_id, "project_id": project_id}],
-    })
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Delete v2",
+                    "config": _config(),
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+            "sessions": [{"session_id": task_id, "project_id": project_id}],
+        }
+    )
     original = web.DevelopmentDaemonClient
     web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
     try:
@@ -1239,11 +1325,14 @@ def test_http_layer_proxies_authenticated_project_and_task_deletions() -> None:
 
     headers = {"X-OpenEvo-Desktop-Session": "desktop-secret"}
     with TestClient(app) as client:
-        assert client.request(
-            "DELETE",
-            f"/desktop/v2/development/tasks/{task_id}",
-            json={"schema_version": "2", "action_id": "delete-task-action"},
-        ).status_code == 401
+        assert (
+            client.request(
+                "DELETE",
+                f"/desktop/v2/development/tasks/{task_id}",
+                json={"schema_version": "2", "action_id": "delete-task-action"},
+            ).status_code
+            == 401
+        )
         task = client.request(
             "DELETE",
             f"/desktop/v2/development/tasks/{task_id}",
@@ -1290,46 +1379,60 @@ def test_http_layer_uses_authenticated_daemon_v2_artifact_authority() -> None:
     project_id = "project-artifact-v2"
     task_id = "task-artifact-v2"
     content = "# Evolved skill\n"
-    fake.state.update({
-        "active_project_id": project_id,
-        "projects": [{
-            "project_id": project_id,
-            "display_name": "Artifact v2",
-            "config": _config(),
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-        "artifacts": [{
-            "artifact_id": "artifact-skill-v2",
-            "project_id": project_id,
-            "session_id": task_id,
-            "run_id": None,
-            "target_id": "skill_bundle",
-            "artifact_type": "skill_bundle",
-            "method": "skill_bundle_reflector",
-            "renderer_kind": "file_bundle",
-            "documents": [{
-                "path": "SKILL.md",
-                "media_type": "text/markdown",
-                "content": content,
-            }],
-            "manifest": {"content_path": "SKILL.md"},
-            "content_path": "SKILL.md",
-            "content": content,
-            "content_sha256": hashlib.sha256(
-                json.dumps(
-                    [{"path": "SKILL.md", "media_type": "text/markdown", "content": content}],
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest(),
-            "byte_size": len(content.encode()),
-            "previous_artifact_id": None,
-            "promoted": False,
-            "created_at": "2026-08-23T00:00:01Z",
-        }],
-    })
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Artifact v2",
+                    "config": _config(),
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+            "artifacts": [
+                {
+                    "artifact_id": "artifact-skill-v2",
+                    "project_id": project_id,
+                    "session_id": task_id,
+                    "run_id": None,
+                    "target_id": "skill_bundle",
+                    "artifact_type": "skill_bundle",
+                    "method": "skill_bundle_reflector",
+                    "renderer_kind": "file_bundle",
+                    "documents": [
+                        {
+                            "path": "SKILL.md",
+                            "media_type": "text/markdown",
+                            "content": content,
+                        }
+                    ],
+                    "manifest": {"content_path": "SKILL.md"},
+                    "content_path": "SKILL.md",
+                    "content": content,
+                    "content_sha256": hashlib.sha256(
+                        json.dumps(
+                            [
+                                {
+                                    "path": "SKILL.md",
+                                    "media_type": "text/markdown",
+                                    "content": content,
+                                }
+                            ],
+                            ensure_ascii=True,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
+                    "byte_size": len(content.encode()),
+                    "previous_artifact_id": None,
+                    "promoted": False,
+                    "created_at": "2026-08-23T00:00:01Z",
+                }
+            ],
+        }
+    )
     original = web.DevelopmentDaemonClient
     web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
     try:
@@ -1378,16 +1481,20 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> No
 
     fake = FakeDaemonClient()
     project_id = "project-evolution-v2"
-    fake.state.update({
-        "active_project_id": project_id,
-        "projects": [{
-            "project_id": project_id,
-            "display_name": "Evolution v2",
-            "config": _config(),
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-    })
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Evolution v2",
+                    "config": _config(),
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+        }
+    )
     original = web.DevelopmentDaemonClient
     web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
     try:
@@ -1408,12 +1515,14 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> No
         "action_id": "action-evolution-v2",
         "project_id": project_id,
         "source_task_ids": ["task-evolution-v2"],
-        "selections": [{
-            "schema_version": "2",
-            "target_id": "text_memory",
-            "method": "text_memory_reflector",
-            "config": {},
-        }],
+        "selections": [
+            {
+                "schema_version": "2",
+                "target_id": "text_memory",
+                "method": "text_memory_reflector",
+                "config": {},
+            }
+        ],
     }
     root = "/desktop/v2/development/evolution-runs"
     with TestClient(app) as client:
@@ -1423,9 +1532,7 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_run_authority() -> No
         assert created.json()["action_id"] == creation["action_id"]
         run_id = created.json()["run_id"]
 
-        inventory = client.get(
-            f"{root}?project_id={project_id}&limit=25", headers=headers
-        )
+        inventory = client.get(f"{root}?project_id={project_id}&limit=25", headers=headers)
         assert inventory.status_code == 200
         assert inventory.json()["items"][0]["run_id"] == run_id
 
@@ -1451,66 +1558,76 @@ def test_http_layer_uses_authenticated_daemon_v2_evolution_job_authority() -> No
     project_id = "development-project-job-v2"
     task_id = "development-task-job-v2"
     job_id = "development-job-v2"
-    fake.state.update({
-        "active_project_id": project_id,
-        "projects": [{
-            "project_id": project_id,
-            "display_name": "Evolution Job v2",
-            "config": _config(),
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-        "sessions": [{
-            "session_id": task_id,
-            "project_id": project_id,
-            "task_title": "Retry failed method",
-            "instruction": "Produce reusable context.",
-            "response": "Captured evidence.",
-            "model": "test",
-            "state": "completed",
-            "duration_ms": 1,
-            "logs": [],
-            "selected_evolution": [],
-            "evolution_errors": [],
-            "workspace_changes": [],
-            "context_artifact_ids": [],
-            "runtime_activation": None,
-            "error": None,
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-        "evolution_jobs": [{
-            "job_id": job_id,
-            "session_id": task_id,
-            "run_id": None,
-            "target_id": "text_memory",
-            "method_id": "text_memory_reflector",
-            "requested_method_id": "text_memory_reflector",
-            "resolver_input_artifact_ids": [],
-            "previous_artifact_id": None,
-            "config": {},
-            "state": "failed",
-            "artifact_ids": [],
-            "error": "temporary failure",
-            "attempts": [{
-                "attempt_id": f"{job_id}-attempt-1",
-                "job_id": job_id,
-                "ordinal": 1,
-                "state": "failed",
-                "stage": "method_execution",
-                "artifact_ids": [],
-                "error_code": "method_execution_failed",
-                "error_message": "temporary failure",
-                "logs": ["Evolution attempt failed."],
-                "created_at": "2026-08-23T00:00:00Z",
-                "started_at": "2026-08-23T00:00:00Z",
-                "completed_at": "2026-08-23T00:00:00Z",
-                "updated_at": "2026-08-23T00:00:00Z",
-            }],
-            "created_at": "2026-08-23T00:00:00Z",
-            "updated_at": "2026-08-23T00:00:00Z",
-        }],
-    })
+    fake.state.update(
+        {
+            "active_project_id": project_id,
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Evolution Job v2",
+                    "config": _config(),
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": task_id,
+                    "project_id": project_id,
+                    "task_title": "Retry failed method",
+                    "instruction": "Produce reusable context.",
+                    "response": "Captured evidence.",
+                    "model": "test",
+                    "state": "completed",
+                    "duration_ms": 1,
+                    "logs": [],
+                    "selected_evolution": [],
+                    "evolution_errors": [],
+                    "workspace_changes": [],
+                    "context_artifact_ids": [],
+                    "runtime_activation": None,
+                    "error": None,
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+            "evolution_jobs": [
+                {
+                    "job_id": job_id,
+                    "session_id": task_id,
+                    "run_id": None,
+                    "target_id": "text_memory",
+                    "method_id": "text_memory_reflector",
+                    "requested_method_id": "text_memory_reflector",
+                    "resolver_input_artifact_ids": [],
+                    "previous_artifact_id": None,
+                    "config": {},
+                    "state": "failed",
+                    "artifact_ids": [],
+                    "error": "temporary failure",
+                    "attempts": [
+                        {
+                            "attempt_id": f"{job_id}-attempt-1",
+                            "job_id": job_id,
+                            "ordinal": 1,
+                            "state": "failed",
+                            "stage": "method_execution",
+                            "artifact_ids": [],
+                            "error_code": "method_execution_failed",
+                            "error_message": "temporary failure",
+                            "logs": ["Evolution attempt failed."],
+                            "created_at": "2026-08-23T00:00:00Z",
+                            "started_at": "2026-08-23T00:00:00Z",
+                            "completed_at": "2026-08-23T00:00:00Z",
+                            "updated_at": "2026-08-23T00:00:00Z",
+                        }
+                    ],
+                    "created_at": "2026-08-23T00:00:00Z",
+                    "updated_at": "2026-08-23T00:00:00Z",
+                }
+            ],
+        }
+    )
     original = web.DevelopmentDaemonClient
     web.DevelopmentDaemonClient = lambda endpoint, token: fake  # type: ignore[assignment]
     try:
@@ -1680,6 +1797,65 @@ def test_provider_projects_capabilities_for_a_self_deployed_project() -> None:
     assert projection.capabilities.evaluated_profile.execution_mode == "self_deployed"
 
 
+def test_provider_validation_uses_daemon_project_readiness() -> None:
+    fake = FakeDaemonClient()
+    config = _config()
+    fake.state.update(
+        {
+            "active_project_id": "project-subscription",
+            "projects": [
+                {
+                    "project_id": "project-subscription",
+                    "display_name": "Subscription project",
+                    "config": config,
+                    "created_at": "2026-09-03T00:00:00Z",
+                    "updated_at": "2026-09-03T00:00:00Z",
+                }
+            ],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    validation = provider.invoke(
+        "validateDesktopProjectV2",
+        {"project_id": "project-subscription"},
+    )
+
+    assert validation.valid is True
+    assert validation.checks[0].check_id == "codex_subscription_login"
+    assert validation.checks[0].status == "passed"
+    assert validation.checks[0].action == "none"
+
+
+def test_provider_validation_reports_subscription_login_failure() -> None:
+    fake = FakeDaemonClient()
+    fake.project_readiness_status = "failed"
+    fake.state.update(
+        {
+            "active_project_id": "project-subscription",
+            "projects": [
+                {
+                    "project_id": "project-subscription",
+                    "display_name": "Subscription project",
+                    "config": _config(),
+                    "created_at": "2026-09-03T00:00:00Z",
+                    "updated_at": "2026-09-03T00:00:00Z",
+                }
+            ],
+        }
+    )
+    provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
+
+    validation = provider.invoke(
+        "validateDesktopProjectV2",
+        {"project_id": "project-subscription"},
+    )
+
+    assert validation.valid is False
+    assert validation.checks[0].status == "failed"
+    assert validation.checks[0].action == "administrator_action"
+
+
 def test_provider_recovers_a_durable_project_create_operation_after_restart() -> None:
     fake = FakeDaemonClient()
     action_id = "project-create-restart-recovery-0001"
@@ -1775,26 +1951,30 @@ def test_provider_projects_daemon_project_heads_without_session_count_synthesis(
     fake.state.update(
         {
             "active_project_id": project_id,
-            "projects": [{
-                "project_id": project_id,
-                "display_name": "Durable Head project",
-                "config": _config(),
-                "created_at": "2026-08-22T00:00:00Z",
-                "updated_at": "2026-08-22T00:00:00Z",
-            }],
-            "project_heads": [{
-                "project_head_id": f"{project_id}-head-4",
-                "project_id": project_id,
-                "generation": 4,
-                "predecessor_project_head_id": f"{project_id}-head-3",
-                "source_evolution_run_id": "evolution-run-4",
-                "artifact_ids": ["artifact-memory-4"],
-                "workspace_manifest_sha256": "b" * 64,
-                "workspace_entry_count": 3,
-                "workspace_byte_size": 128,
-                "manifest_sha256": "c" * 64,
-                "created_at": "2026-08-22T00:04:00Z",
-            }],
+            "projects": [
+                {
+                    "project_id": project_id,
+                    "display_name": "Durable Head project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "project_heads": [
+                {
+                    "project_head_id": f"{project_id}-head-4",
+                    "project_id": project_id,
+                    "generation": 4,
+                    "predecessor_project_head_id": f"{project_id}-head-3",
+                    "source_evolution_run_id": "evolution-run-4",
+                    "artifact_ids": ["artifact-memory-4"],
+                    "workspace_manifest_sha256": "b" * 64,
+                    "workspace_entry_count": 3,
+                    "workspace_byte_size": 128,
+                    "manifest_sha256": "c" * 64,
+                    "created_at": "2026-08-22T00:04:00Z",
+                }
+            ],
         }
     )
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
@@ -1817,24 +1997,28 @@ def test_provider_submits_session_against_selected_historical_project_head() -> 
     fake.state.update(
         {
             "active_project_id": "project-1",
-            "projects": [{
-                "project_id": "project-1",
-                "display_name": "Development project",
-                "config": _config(),
-                "created_at": "2026-08-22T00:00:00Z",
-                "updated_at": "2026-08-22T00:00:00Z",
-            }],
-            "sessions": [{
-                "session_id": "session-1",
-                "project_id": "project-1",
-                "project_head_id": "project-1-head-0",
-                "task_title": "Historical task",
-                "instruction": "Use the genesis context.",
-                "state": "completed",
-                "logs": ["completed"],
-                "created_at": "2026-08-22T00:01:00Z",
-                "updated_at": "2026-08-22T00:02:00Z",
-            }],
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "display_name": "Development project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": "session-1",
+                    "project_id": "project-1",
+                    "project_head_id": "project-1-head-0",
+                    "task_title": "Historical task",
+                    "instruction": "Use the genesis context.",
+                    "state": "completed",
+                    "logs": ["completed"],
+                    "created_at": "2026-08-22T00:01:00Z",
+                    "updated_at": "2026-08-22T00:02:00Z",
+                }
+            ],
         }
     )
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
@@ -1867,23 +2051,27 @@ def test_provider_cancels_task_through_daemon_v2_authority() -> None:
     fake.state.update(
         {
             "active_project_id": "project-1",
-            "projects": [{
-                "project_id": "project-1",
-                "display_name": "Development project",
-                "config": _config(),
-                "created_at": "2026-08-22T00:00:00Z",
-                "updated_at": "2026-08-22T00:00:00Z",
-            }],
-            "sessions": [{
-                "session_id": "session-1",
-                "project_id": "project-1",
-                "task_title": "Long-running task",
-                "instruction": "Keep working until cancelled.",
-                "state": "running",
-                "logs": ["started"],
-                "created_at": "2026-08-22T00:01:00Z",
-                "updated_at": "2026-08-22T00:01:00Z",
-            }],
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "display_name": "Development project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": "session-1",
+                    "project_id": "project-1",
+                    "task_title": "Long-running task",
+                    "instruction": "Keep working until cancelled.",
+                    "state": "running",
+                    "logs": ["started"],
+                    "created_at": "2026-08-22T00:01:00Z",
+                    "updated_at": "2026-08-22T00:01:00Z",
+                }
+            ],
         }
     )
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
@@ -1916,23 +2104,27 @@ def test_provider_reads_terminal_agent_result_from_daemon_v2_logs() -> None:
     fake.state.update(
         {
             "active_project_id": "project-1",
-            "projects": [{
-                "project_id": "project-1",
-                "display_name": "Development project",
-                "config": _config(),
-                "created_at": "2026-08-22T00:00:00Z",
-                "updated_at": "2026-08-22T00:00:00Z",
-            }],
-            "sessions": [{
-                "session_id": "session-1",
-                "project_id": "project-1",
-                "state": "completed",
-                "logs": ["completed"],
-                "response": "Authoritative v2 answer.",
-                "error": None,
-                "created_at": "2026-08-22T00:01:00Z",
-                "updated_at": "2026-08-22T00:02:00Z",
-            }],
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "display_name": "Development project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": "session-1",
+                    "project_id": "project-1",
+                    "state": "completed",
+                    "logs": ["completed"],
+                    "response": "Authoritative v2 answer.",
+                    "error": None,
+                    "created_at": "2026-08-22T00:01:00Z",
+                    "updated_at": "2026-08-22T00:02:00Z",
+                }
+            ],
         }
     )
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)
@@ -1952,21 +2144,25 @@ def test_provider_projects_daemon_v2_timeline_into_bound_desktop_events() -> Non
     fake.state.update(
         {
             "active_project_id": "project-1",
-            "projects": [{
-                "project_id": "project-1",
-                "display_name": "Development project",
-                "config": _config(),
-                "created_at": "2026-08-22T00:00:00Z",
-                "updated_at": "2026-08-22T00:00:00Z",
-            }],
-            "sessions": [{
-                "session_id": "session-1",
-                "project_id": "project-1",
-                "state": "running",
-                "logs": ["started"],
-                "created_at": "2026-08-22T00:01:00Z",
-                "updated_at": "2026-08-22T00:01:00Z",
-            }],
+            "projects": [
+                {
+                    "project_id": "project-1",
+                    "display_name": "Development project",
+                    "config": _config(),
+                    "created_at": "2026-08-22T00:00:00Z",
+                    "updated_at": "2026-08-22T00:00:00Z",
+                }
+            ],
+            "sessions": [
+                {
+                    "session_id": "session-1",
+                    "project_id": "project-1",
+                    "state": "running",
+                    "logs": ["started"],
+                    "created_at": "2026-08-22T00:01:00Z",
+                    "updated_at": "2026-08-22T00:01:00Z",
+                }
+            ],
         }
     )
     provider = DevelopmentAgentDesktopV2Provider(fake, source_commit="a" * 40)

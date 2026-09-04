@@ -175,6 +175,20 @@ class DevelopmentProjectActivateV2(StrictDevelopmentModelV2):
     action_id: core.OpaqueId
 
 
+class DevelopmentProjectReadinessCheckV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    check_id: core.OpaqueId
+    status: Literal["passed", "failed", "unavailable"]
+
+
+class DevelopmentProjectReadinessV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    project_id: core.OpaqueId
+    execution_mode: core.ExecutionModeV2
+    ready: bool
+    checks: list[DevelopmentProjectReadinessCheckV2] = Field(max_length=16)
+
+
 class DevelopmentCapabilitiesV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     authority: Literal["development_catalog_unverified"]
@@ -231,6 +245,27 @@ class DevelopmentModelV2(StrictDevelopmentModelV2):
 class DevelopmentModelListV2(StrictDevelopmentModelV2):
     schema_version: Literal["2"] = "2"
     items: list[DevelopmentModelV2] = Field(max_length=256)
+
+
+class DevelopmentModelRuntimeV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    runtime_id: Literal["vllm"] = "vllm"
+    image_ref: str = Field(min_length=1, max_length=512)
+    state: Literal["queued", "checking", "downloading", "ready", "failed"]
+    error: str | None = Field(default=None, max_length=4_000)
+    created_at: core.UtcTimestamp
+    updated_at: core.UtcTimestamp
+
+    @model_validator(mode="after")
+    def _validate_runtime_state(self) -> "DevelopmentModelRuntimeV2":
+        if self.state == "failed" and not self.error:
+            raise ValueError("failed model runtime must include an error")
+        return self
+
+
+class DevelopmentModelRuntimeRetryV2(StrictDevelopmentModelV2):
+    schema_version: Literal["2"] = "2"
+    action_id: core.OpaqueId
 
 
 class DevelopmentModelRegisterV2(StrictDevelopmentModelV2):
@@ -581,6 +616,8 @@ __all__ = [
     "DevelopmentEvolutionJobRetryV2",
     "DevelopmentEvolutionJobV2",
     "DevelopmentModelListV2",
+    "DevelopmentModelRuntimeRetryV2",
+    "DevelopmentModelRuntimeV2",
     "DevelopmentModelRegisterV2",
     "DevelopmentModelRetryV2",
     "DevelopmentModelV2",
@@ -589,6 +626,8 @@ __all__ = [
     "DevelopmentProjectActivateV2",
     "DevelopmentProjectAuthorityV2",
     "DevelopmentProjectCreateV2",
+    "DevelopmentProjectReadinessCheckV2",
+    "DevelopmentProjectReadinessV2",
     "DevelopmentProjectUpdateV2",
     "DevelopmentResourceDeleteReceiptV2",
     "DevelopmentResourceDeleteRequestV2",

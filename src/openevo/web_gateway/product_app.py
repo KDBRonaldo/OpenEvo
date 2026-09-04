@@ -59,6 +59,8 @@ from openevo.daemon.contracts import (
     DevelopmentModelListV2,
     DevelopmentModelRegisterV2,
     DevelopmentModelRetryV2,
+    DevelopmentModelRuntimeRetryV2,
+    DevelopmentModelRuntimeV2,
     DevelopmentModelV2,
     DevelopmentTaskObservationPageV2,
     DevelopmentTaskObservationV2,
@@ -68,6 +70,7 @@ from openevo.daemon.contracts import (
     DevelopmentTaskPresentationV2,
     DevelopmentProjectActivateV2,
     DevelopmentProjectCreateV2,
+    DevelopmentProjectReadinessV2,
     DevelopmentProjectUpdateV2,
     DevelopmentResourceDeleteReceiptV2,
     DevelopmentResourceDeleteRequestV2,
@@ -284,11 +287,14 @@ class DevelopmentAgentDesktopV2Provider:
         self._state_cache_deadline = 0.0
         self._state_lock = threading.RLock()
         self._project_projection_lock = threading.Lock()
-        self._project_projection_cache: tuple[
-            list[core.ProjectV2],
-            list[DevelopmentTaskObservationV2],
-            dict[str, list[core.ProjectHeadRefV2]],
-        ] | None = None
+        self._project_projection_cache: (
+            tuple[
+                list[core.ProjectV2],
+                list[DevelopmentTaskObservationV2],
+                dict[str, list[core.ProjectHeadRefV2]],
+            ]
+            | None
+        ) = None
         self._project_projection_cache_state_sha256: str | None = None
         self._project_projection_cache_deadline = 0.0
         self._project_projection_generation = 0
@@ -546,9 +552,7 @@ class DevelopmentAgentDesktopV2Provider:
         project_id = str(raw["project_id"])
         generation = int(raw["generation"])
         artifact_ids = [str(item) for item in raw.get("artifact_ids", [])]
-        evolution_manifest = _canonical_digest(
-            [project_id, generation, "evolution", artifact_ids]
-        )
+        evolution_manifest = _canonical_digest([project_id, generation, "evolution", artifact_ids])
         revision_id = f"{project_id}-evolution-{generation}"
         return core.ProjectHeadRefV2.model_validate(
             {
@@ -594,9 +598,7 @@ class DevelopmentAgentDesktopV2Provider:
                     "capture_mode": config.execution.capture_mode,
                     "token_level_metrics_available": config.execution.token_level_metrics_available,
                     "producer_id": "development-daemon",
-                    "snapshot_sha256": _canonical_digest(
-                        [project_id, generation, "execution"]
-                    ),
+                    "snapshot_sha256": _canonical_digest([project_id, generation, "execution"]),
                 },
                 "registry_sha256": DIGEST,
                 "manifest_sha256": raw["manifest_sha256"],
@@ -620,11 +622,7 @@ class DevelopmentAgentDesktopV2Provider:
             if durable_heads:
                 active_head_id = raw.get("active_project_head_id")
                 active_head = next(
-                    (
-                        head
-                        for head in durable_heads
-                        if head.project_head_id == active_head_id
-                    ),
+                    (head for head in durable_heads if head.project_head_id == active_head_id),
                     max(durable_heads, key=lambda head: head.generation),
                 )
             else:
@@ -660,11 +658,14 @@ class DevelopmentAgentDesktopV2Provider:
         effective_state = state if state is not None else self._remote_state()
         state_sha256 = _canonical_digest(effective_state)
 
-        def cached() -> tuple[
-            list[core.ProjectV2],
-            list[DevelopmentTaskObservationV2],
-            dict[str, list[core.ProjectHeadRefV2]],
-        ] | None:
+        def cached() -> (
+            tuple[
+                list[core.ProjectV2],
+                list[DevelopmentTaskObservationV2],
+                dict[str, list[core.ProjectHeadRefV2]],
+            ]
+            | None
+        ):
             with self._state_lock:
                 if (
                     self._project_projection_cache is not None
@@ -690,9 +691,7 @@ class DevelopmentAgentDesktopV2Provider:
             projects = self._project_models(effective_state, observations)
             raw_heads = list(effective_state.get("project_heads", []))
             heads = {
-                project.project_id: self._available_project_heads(
-                    project, observations, raw_heads
-                )
+                project.project_id: self._available_project_heads(project, observations, raw_heads)
                 for project in projects
             }
             result = (projects, observations, heads)
@@ -1024,9 +1023,7 @@ class DevelopmentAgentDesktopV2Provider:
     def _tasks(self, arguments: Mapping[str, object]) -> core.TaskPageV2:
         tasks = self._all_tasks()
         project_id = arguments.get("project_id")
-        filtered = [
-            task for task in tasks if project_id is None or task.project_id == project_id
-        ]
+        filtered = [task for task in tasks if project_id is None or task.project_id == project_id]
         limit = int(arguments.get("limit", 50))
         if not 1 <= limit <= 100:
             raise HTTPException(
@@ -1042,9 +1039,7 @@ class DevelopmentAgentDesktopV2Provider:
                 None,
             )
             if cursor_index is None:
-                raise HTTPException(
-                    status_code=410, detail="task cursor is no longer available"
-                )
+                raise HTTPException(status_code=410, detail="task cursor is no longer available")
             start = cursor_index + 1
 
         items = filtered[start : start + limit]
@@ -1117,7 +1112,10 @@ class DevelopmentAgentDesktopV2Provider:
             )
         self._invalidate_state()
         task = self._task({"task_id": presentation.task_id})
-        if task.admission.predecessor_project_head.project_head_id != selected_head.project_head_id:
+        if (
+            task.admission.predecessor_project_head.project_head_id
+            != selected_head.project_head_id
+        ):
             raise HTTPException(
                 status_code=503,
                 detail="development daemon did not preserve the selected Project Head",
@@ -1325,8 +1323,7 @@ class DevelopmentAgentDesktopV2Provider:
         project = self._find_project(arguments.get("project_id"))
         payload = DevelopmentCapabilitiesV2.model_validate(
             self._client.request_v2(
-                "/development/capabilities?project_id="
-                f"{quote(project.project_id, safe='')}"
+                f"/development/capabilities?project_id={quote(project.project_id, safe='')}"
             )
         )
         capabilities = payload.capabilities
@@ -1341,11 +1338,44 @@ class DevelopmentAgentDesktopV2Provider:
 
     def _validate(self, arguments: Mapping[str, object]) -> m.ProjectValidationV2:
         project = self._find_project(arguments.get("project_id"))
+        try:
+            readiness = DevelopmentProjectReadinessV2.model_validate(
+                self._client.request_v2(
+                    f"/development/projects/{quote(project.project_id, safe='')}/readiness"
+                )
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon returned invalid Project readiness",
+            ) from exc
+        if (
+            readiness.project_id != project.project_id
+            or readiness.execution_mode != project.config.execution.mode
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="development daemon Project readiness crossed Project authority",
+            )
+        capabilities = self._capabilities(arguments)
         return m.ProjectValidationV2(
             project_id=project.project_id,
-            valid=True,
-            registry_sha256=self._capabilities(arguments).registry_sha256,
-            checks=[],
+            valid=readiness.ready,
+            registry_sha256=capabilities.registry_sha256,
+            checks=[
+                {
+                    "check_id": check.check_id,
+                    "status": check.status,
+                    "action": (
+                        "none"
+                        if check.status == "passed"
+                        else "administrator_action"
+                        if check.check_id == "codex_subscription_login"
+                        else "correct_project"
+                    ),
+                }
+                for check in readiness.checks
+            ],
             validated_at=_now(),
         )
 
@@ -1691,9 +1721,7 @@ def create_development_agent_web_app(
     )
     async def delete_development_task(task_id: str, request: Request) -> Response:
         try:
-            deletion = DevelopmentResourceDeleteRequestV2.model_validate(
-                await request.json()
-            )
+            deletion = DevelopmentResourceDeleteRequestV2.model_validate(await request.json())
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="invalid Task deletion request") from exc
         status, payload, headers = provider._client.proxy_v2(
@@ -1727,11 +1755,11 @@ def create_development_agent_web_app(
     )
     async def delete_development_project(project_id: str, request: Request) -> Response:
         try:
-            deletion = DevelopmentResourceDeleteRequestV2.model_validate(
-                await request.json()
-            )
+            deletion = DevelopmentResourceDeleteRequestV2.model_validate(await request.json())
         except (ValidationError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail="invalid Project deletion request") from exc
+            raise HTTPException(
+                status_code=422, detail="invalid Project deletion request"
+            ) from exc
         status, payload, headers = provider._client.proxy_v2(
             f"development/projects/{quote(project_id, safe='')}",
             query="",
@@ -1776,6 +1804,56 @@ def create_development_agent_web_app(
                 raise HTTPException(
                     status_code=503,
                     detail="development daemon returned an invalid model inventory",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.get(
+        "/desktop/v2/development/model-runtime",
+        include_in_schema=False,
+    )
+    async def development_model_runtime() -> Response:
+        status, payload, headers = provider._client.proxy_v2(
+            "development/model-runtime",
+            query="",
+            method="GET",
+            body=b"",
+            content_type=None,
+        )
+        if status == HTTPStatus.OK:
+            try:
+                validated = DevelopmentModelRuntimeV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid model runtime state",
+                ) from exc
+            payload = validated.model_dump_json().encode("utf-8")
+        return Response(content=payload, status_code=status, headers=dict(headers))
+
+    @app.post(
+        "/desktop/v2/development/model-runtime/retry",
+        include_in_schema=False,
+    )
+    async def retry_development_model_runtime(request: Request) -> Response:
+        try:
+            retry = DevelopmentModelRuntimeRetryV2.model_validate(await request.json())
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="invalid model runtime retry") from exc
+        status, payload, headers = provider._client.proxy_v2(
+            "development/model-runtime/retry",
+            query="",
+            method="POST",
+            body=retry.model_dump_json().encode("utf-8"),
+            content_type="application/json",
+        )
+        if status == HTTPStatus.ACCEPTED:
+            try:
+                validated = DevelopmentModelRuntimeV2.model_validate_json(payload)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="development daemon returned invalid model runtime retry state",
                 ) from exc
             payload = validated.model_dump_json().encode("utf-8")
         return Response(content=payload, status_code=status, headers=dict(headers))
@@ -2025,8 +2103,7 @@ def create_development_agent_web_app(
                 )
                 if (
                     base_head.project_id != creation.project_id
-                    or base_head.manifest_sha256
-                    != creation.base_project_head_manifest_sha256
+                    or base_head.manifest_sha256 != creation.base_project_head_manifest_sha256
                 ):
                     raise HTTPException(
                         status_code=409,

@@ -106,7 +106,21 @@ class CodexAgentRunner:
     def runtime_capabilities(self) -> dict[str, Any]:
         return self._adapter.runtime_capabilities()
 
+    def check_cli_ready(self) -> None:
+        try:
+            self._adapter.check_cli_ready()
+        except HarnessRunError as exc:
+            raise AgentRunError(str(exc)) from exc
+
+    def check_subscription_ready(self) -> None:
+        try:
+            self._adapter.check_subscription_ready()
+        except HarnessRunError as exc:
+            raise AgentRunError(str(exc)) from exc
+
     def check_ready(self) -> None:
+        """Retain the historical subscription readiness entry point."""
+
         try:
             self._adapter.check_ready()
         except HarnessRunError as exc:
@@ -183,7 +197,7 @@ class AgentSessionExecutor:
                 ):
                     self._store.append_session_log(
                         session_id,
-                        "Preparing the Project's self-deployed model runtime.",
+                        "Starting the selected self-deployed model service.",
                     )
                 inference = self._execution_preparer(request)
                 if inference is not None:

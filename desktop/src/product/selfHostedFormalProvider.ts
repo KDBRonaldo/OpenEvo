@@ -195,6 +195,7 @@ export function combineSelfHostedProviders(
         "deleteWorkspaceFile",
         "registerModelResource",
         "retryModelResource",
+        "retryModelRuntime",
       ].includes(String(property))) {
         const mutation = Reflect.get(presentation, property);
         if (typeof mutation !== "function") return mutation;
@@ -206,6 +207,7 @@ export function combineSelfHostedProviders(
       }
       if (property === "downloadWorkspaceFile") return presentation.downloadWorkspaceFile?.bind(presentation);
       if (property === "listModelResources") return presentation.listModelResources?.bind(presentation);
+      if (property === "getModelRuntime") return presentation.getModelRuntime?.bind(presentation);
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },

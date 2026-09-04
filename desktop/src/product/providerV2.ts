@@ -48,6 +48,15 @@ export interface DevelopmentModelResourceV2 {
   readonly updated_at: string;
 }
 
+export interface DevelopmentModelRuntimeV2 {
+  readonly runtime_id: "vllm";
+  readonly image_ref: string;
+  readonly state: "queued" | "checking" | "downloading" | "ready" | "failed";
+  readonly error: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
 export type ProductStreamStateV2 =
   | { readonly status: "fresh"; readonly epoch: number; readonly lastEventId: string | null }
   | { readonly status: "stale"; readonly epoch: number; readonly reason: "event_gap" | "refresh_pending" }
@@ -379,6 +388,8 @@ export interface DesktopProductProviderV2 {
     intent: ProductMutationIntentV2,
   ): Promise<void>;
   listModelResources?(): Promise<readonly DevelopmentModelResourceV2[]>;
+  getModelRuntime?(): Promise<DevelopmentModelRuntimeV2>;
+  retryModelRuntime?(intent: ProductMutationIntentV2): Promise<DevelopmentModelRuntimeV2>;
   registerModelResource?(
     repositoryId: string,
     revision: string,

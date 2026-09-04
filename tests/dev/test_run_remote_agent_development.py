@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import shutil
 import socket
 import subprocess
@@ -258,7 +259,56 @@ def test_remote_runtime_can_activate_an_installed_release() -> None:
     assert 'runtime_marker="$state_root/runtime-release-v1"' in script
     assert 'runtime_environment="$state_root/runtimes/$release_id"' in script
     assert 'export PYTHONDONTWRITEBYTECODE=1' in script
-    assert "sync --frozen --no-dev --python 3.11" in script
+    assert "sync --frozen --no-dev --no-install-project --python 3.11" in script
+    assert '"PYTHONPATH=$source_root/src"' in script
+
+
+def test_remote_prerequisites_are_installed_without_an_interactive_sudo_prompt() -> None:
+    release_script = remote_launcher.build_remote_prerequisite_script(include_git=False)
+    source_script = remote_launcher.build_remote_prerequisite_script(include_git=True)
+
+    for command in ("python3", "curl", "timeout", "sha256sum"):
+        assert command in release_script
+    for package_manager in ("apt-get", "dnf", "yum", "apk"):
+        assert package_manager in release_script
+    assert "sudo -n" in release_script
+    assert "passwordless sudo" in release_script
+    assert " git" not in release_script
+    assert "git" in source_script
+
+
+def test_gpu_host_setup_is_automatic_only_for_detected_nvidia_hardware() -> None:
+    script = remote_launcher.build_remote_host_setup_script(include_git=False)
+
+    assert "/sys/bus/pci/devices/*/vendor" in script
+    assert 'vendor_id" = "0x10de' in script
+    assert "No NVIDIA GPU detected; skipping" in script
+    assert "ubuntu-drivers install --gpgpu" in script
+    assert "timeout 15 docker info" in script
+    assert "apt-get install -y docker.io" in script
+    assert "https://nvidia.github.io/libnvidia-container/gpgkey" in script
+    assert "apt-get install -y nvidia-container-toolkit" in script
+    assert "nvidia-ctk runtime configure --runtime=docker" in script
+    assert 'usermod -aG docker "$(id -un)"' in script
+    assert "nvidia-container-cli info" in script
+    assert "This is a containerized GPU server" in script
+    assert "EvoLab did not install GPU packages, start services" in script
+    assert script.index("This is a containerized GPU server") < script.index(
+        "Installing Docker for the self-deployed model runtime"
+    )
+    assert "service docker start" not in script
+    assert "curl | sh" not in script
+
+    shell = shutil.which("sh")
+    if shell is not None:
+        syntax = subprocess.run(
+            [shell, "-n"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert syntax.returncode == 0, syntax.stderr
 
 
 def test_release_install_uses_verified_bundle_without_checkout_delivery(
@@ -288,7 +338,7 @@ def test_release_install_uses_verified_bundle_without_checkout_delivery(
     monkeypatch.setattr(
         remote_launcher,
         "_run_remote",
-        lambda _ssh, _connection, script: remote_scripts.append(script),
+        lambda _ssh, _connection, script, **_kwargs: remote_scripts.append(script),
     )
     monkeypatch.setattr(
         remote_launcher,
@@ -311,10 +361,11 @@ def test_release_install_uses_verified_bundle_without_checkout_delivery(
 
     assert result == 0
     assert uploaded == [receipt]
-    assert len(remote_scripts) == 2
-    assert receipt.release_id in remote_scripts[0]
-    assert "delivery_mode=release" in remote_scripts[1]
-    assert "start_services=0" in remote_scripts[1]
+    assert len(remote_scripts) == 3
+    assert "NVIDIA GPU detected" in remote_scripts[0]
+    assert receipt.release_id in remote_scripts[1]
+    assert "delivery_mode=release" in remote_scripts[2]
+    assert "start_services=0" in remote_scripts[2]
 
 
 @pytest.mark.parametrize("action", ["auto", "install", "update", "start"])
@@ -626,9 +677,14 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
     assert script.index('"$HOME/.local/bin/uv"') < script.index("https://astral.sh/uv/install.sh")
     assert 'timeout 300 "$uv_bin" sync --frozen --python 3.11' in script
     assert '"$uv_bin" run --frozen --no-sync --python 3.11 python' in script
+    assert '"PYTHONPATH=$source_root/src"' in script
     assert 'runtime_marker="$state_root/runtime-commit-v1"' in script
     assert "curl --connect-timeout 15 --max-time 120" in script
     assert "timeout 30 env" in script
+    assert remote_launcher.CODEX_INSTALL_URL in script
+    assert remote_launcher.CODEX_DEVICE_AUTH_URL in script
+    assert '"$codex_bin" login --device-auth' in script
+    assert 'timeout 600 env "PATH=$codex_dir:$PATH"' in script
     assert "curl --connect-timeout 1 --max-time 2" in script
     assert "bash -lc 'command -v codex'" in script
     assert '"$HOME/.npm-global/bin/codex"' in script
@@ -766,6 +822,44 @@ def test_remote_script_transport_uses_lf_bytes_on_every_platform(
     assert "text" not in observed
 
 
+def test_remote_output_opens_device_login_page_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(
+        remote_launcher,
+        "open_browser",
+        lambda url: opened.append(url) or True,
+    )
+    output = io.BytesIO(
+        (
+            f"Open {remote_launcher.CODEX_DEVICE_AUTH_URL}\n"
+            f"Again {remote_launcher.CODEX_DEVICE_AUTH_URL}\n"
+        ).encode()
+    )
+
+    remote_launcher._relay_remote_output(output, open_device_auth=True)
+
+    assert opened == [remote_launcher.CODEX_DEVICE_AUTH_URL]
+    assert remote_launcher.CODEX_DEVICE_AUTH_URL in capsys.readouterr().out
+
+
+def test_non_interactive_remote_script_does_not_wait_for_device_login() -> None:
+    script = remote_launcher.build_remote_script(
+        branch="stable",
+        expected_commit="a" * 40,
+        token="daemon-token",
+        remote_port=8787,
+        evolution_model="gpt-5.5",
+        allow_device_auth=False,
+    )
+
+    assert "allow_device_auth=0" in script
+    assert 'if [ "$allow_device_auth" -ne 1 ]; then' in script
+    assert "Run interactively without --non-interactive" in script
+
+
 def test_remote_script_can_only_install_source_without_starting_services() -> None:
     script = remote_launcher.build_remote_script(
         branch="stable",
@@ -782,6 +876,9 @@ def test_remote_script_can_only_install_source_without_starting_services() -> No
     assert 'if [ "$start_services" -ne 1 ]; then' in script
     assert script.index('if [ "$start_services" -ne 1 ]; then') > script.index(
         'timeout 300 "$uv_bin" sync --frozen --python 3.11'
+    )
+    assert script.index('if [ "$start_services" -ne 1 ]; then') > script.index(
+        '"$codex_bin" login --device-auth'
     )
 
 

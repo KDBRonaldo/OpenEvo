@@ -27,6 +27,16 @@ const modelResourcePageV2Schema = z.object({
   items: z.array(modelResourceV2Schema).max(100),
 }).strict();
 
+const modelRuntimeV2Schema = z.object({
+  schema_version: z.literal("2"),
+  runtime_id: z.literal("vllm"),
+  image_ref: z.string().min(1),
+  state: z.enum(["queued", "checking", "downloading", "ready", "failed"]),
+  error: z.string().nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
 const artifactSchema = z.object({
   artifact_id: z.string().min(1),
   project_id: z.string().min(1),
@@ -1074,6 +1084,15 @@ export function createDevelopmentAgentProvider(
       const page = modelResourcePageV2Schema.parse(await requestPresentationV2("/models"));
       return page.items;
     },
+    getModelRuntime: async () => modelRuntimeV2Schema.parse(
+      await requestPresentationV2("/model-runtime"),
+    ),
+    retryModelRuntime: async (actionId) => modelRuntimeV2Schema.parse(
+      await requestPresentationV2(
+        "/model-runtime/retry",
+        jsonRequest("POST", { schema_version: "2", action_id: actionId }),
+      ),
+    ),
     registerModelResource: async (repositoryId, revision, actionId) => modelResourceV2Schema.parse(
       await requestPresentationV2("/models", jsonRequest("POST", {
         schema_version: "2",

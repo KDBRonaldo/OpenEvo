@@ -69,11 +69,22 @@ current committed tree and does not require `git push`.
 
 ## Server requirements
 
-- a reachable Linux SSH account;
-- Python 3 and standard POSIX utilities on the server;
-- Codex CLI installed and authenticated for that exact remote account.
+For the complete distinction between hard server prerequisites and components
+that the launcher installs automatically, see
+[`self-deployed-server-requirements.md`](self-deployed-server-requirements.md).
 
-For a headless server, connect as the same SSH user configured above and run:
+- a reachable Linux SSH account;
+- root or passwordless `sudo` with `apt-get`, `dnf`, `yum`, or `apk`;
+- outbound HTTPS access to download Codex and complete ChatGPT authentication.
+
+On first run, EvoLab automatically installs missing Python, curl, certificates,
+core utilities, and the official Codex CLI. If Codex is not logged in, the
+terminal prints a one-time device code and EvoLab opens the ChatGPT verification
+page on the user's computer. Enter that code in the browser; the login is stored
+on the server for the exact SSH user EvoLab invokes. There is no need to open a
+separate server shell or prepare packages manually.
+
+For diagnostics only, the equivalent manual checks are:
 
 ```bash
 command -v codex
@@ -82,14 +93,27 @@ codex login status
 ```
 
 Logging in as another server user does not authenticate the account EvoLab
-will invoke.
+will invoke. Device-code login must be enabled in personal ChatGPT security
+settings or by the ChatGPT workspace administrator.
 
 Public Hugging Face models can be registered from a Project's **Execution
-model** settings. Self-deployed execution additionally requires Docker, an
-NVIDIA GPU, enough disk/VRAM for the selected vLLM-compatible safetensors
-model, and server access to Hugging Face (or an administrator-configured
-`HF_ENDPOINT` mirror). Model files remain in the daemon's private state root;
-the browser receives only model identity and progress records.
+model** settings. Self-deployed execution requires an NVIDIA GPU and enough
+disk/VRAM for the selected vLLM-compatible safetensors model. On Ubuntu GPU
+servers, the launcher automatically installs a missing recommended NVIDIA
+compute driver, Docker, and NVIDIA Container Toolkit and configures access for
+the SSH user. If a new driver requires a reboot, reboot once and rerun the same
+`evolab webui` command; preparation then resumes automatically. CPU-only
+servers skip the GPU container stack. On container-style GPU rentals, the
+launcher does not change GPU drivers, Docker configuration, services, or user
+permissions. These rentals must already expose a user-accessible Docker daemon
+with the NVIDIA runtime; otherwise use a Docker-enabled container or a full
+Ubuntu GPU virtual machine. GPU setup needs access to Docker Hub and
+NVIDIA's signed package repository, and model download needs access to Hugging
+Face (or an administrator-configured `HF_ENDPOINT` mirror). Model files remain
+in the daemon's private state root; the browser receives only model identity
+and progress records. If a model download receives no new data for 90 seconds,
+EvoLab marks it as stalled and offers **Resume download** in Project setup.
+Matching partial files are preserved and reused by the retry.
 
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,

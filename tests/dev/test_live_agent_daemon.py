@@ -19,9 +19,9 @@ from openevo.daemon import product_app as MODULE
 
 
 def test_legacy_daemon_script_is_only_a_thin_compatibility_launcher() -> None:
-    script = (
-        Path(__file__).parents[2] / "scripts" / "dev" / "live_agent_daemon.py"
-    ).read_text(encoding="utf-8")
+    script = (Path(__file__).parents[2] / "scripts" / "dev" / "live_agent_daemon.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "from openevo.daemon.product_app import" in script
     assert len(script.splitlines()) < 30
@@ -164,12 +164,108 @@ def test_project_and_session_deletions_are_durable_filtered_tombstones(
     assert snapshot["sessions"] == []
     assert (tmp_path / "workspaces" / "project-delete").is_dir()
     with pytest.raises(KeyError):
-        restarted.update_project(
-            "project-delete", {"display_name": "Still deleted", "config": {}}
-        )
+        restarted.update_project("project-delete", {"display_name": "Still deleted", "config": {}})
     assert restarted.delete_project("project-delete", "delete-project-action") == "project-keep"
     with pytest.raises(KeyError):
         restarted.delete_project("project-delete", "different-project-action")
+
+
+def test_project_execution_mode_is_immutable(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project(
+        {
+            "project_id": "project-fixed-execution",
+            "display_name": "Fixed execution",
+            "config": {"execution": {"mode": "codex_subscription_transcript"}},
+        }
+    )
+
+    with pytest.raises(MODULE.StateConflictError, match="execution mode is immutable"):
+        store.update_project(
+            "project-fixed-execution",
+            {
+                "display_name": "Fixed execution",
+                "config": {"execution": {"mode": "self-deployed"}},
+            },
+        )
+
+
+def test_project_readiness_uses_only_the_selected_execution_mode(tmp_path: Path) -> None:
+    revision = "a" * 40
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project(
+        {
+            "project_id": "project-self-deployed",
+            "display_name": "Self deployed",
+            "config": {
+                "execution": {
+                    "mode": "self-deployed",
+                    "model_resource_id": "model-ready",
+                    "repository_id": "OpenEvo/Fixture-0.1B",
+                    "model_revision": revision,
+                }
+            },
+        }
+    )
+
+    class Runner:
+        def check_subscription_ready(self) -> None:
+            raise AssertionError("self-deployed readiness must not check Codex login")
+
+    class Models:
+        def get(self, model_resource_id: str) -> dict[str, object]:
+            assert model_resource_id == "model-ready"
+            return {
+                "state": "ready",
+                "repository_id": "OpenEvo/Fixture-0.1B",
+                "resolved_revision": revision,
+            }
+
+        def runtime_status(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+    coordinator = MODULE.DevelopmentSessionCoordinator(
+        runner=Runner(),
+        store=store,
+        evolution_runner=None,
+        model_manager=Models(),
+    )
+
+    readiness = coordinator.project_readiness("project-self-deployed")
+
+    assert readiness.ready is True
+    assert readiness.execution_mode == "self-deployed"
+    assert readiness.checks[0].check_id == "self_deployed_model"
+    assert readiness.checks[0].status == "passed"
+    assert readiness.checks[1].check_id == "self_deployed_runtime"
+    assert readiness.checks[1].status == "passed"
+
+
+def test_subscription_project_readiness_reports_expired_login(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project(
+        {
+            "project_id": "project-subscription",
+            "display_name": "Subscription",
+            "config": {"execution": {"mode": "codex_subscription_transcript"}},
+        }
+    )
+
+    class Runner:
+        def check_subscription_ready(self) -> None:
+            raise MODULE.AgentRunError("Codex is not logged in")
+
+    coordinator = MODULE.DevelopmentSessionCoordinator(
+        runner=Runner(),
+        store=store,
+        evolution_runner=None,
+    )
+
+    readiness = coordinator.project_readiness("project-subscription")
+
+    assert readiness.ready is False
+    assert readiness.checks[0].check_id == "codex_subscription_login"
+    assert readiness.checks[0].status == "failed"
 
 
 def test_extract_event_logs_ignores_agent_message_content() -> None:
@@ -260,7 +356,28 @@ def test_codex_readiness_accepts_login_status_written_to_stderr(
             stderr="Logged in using ChatGPT\n",
         ),
     )
-    MODULE.CodexRunner("codex", 30, None).check_ready()
+    MODULE.CodexRunner("codex", 30, None).check_subscription_ready()
+
+
+def test_codex_cli_readiness_does_not_require_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[list[str]] = []
+
+    def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        captured.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="codex-cli 1.0\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    MODULE.CodexRunner("codex", 30, None).check_cli_ready()
+
+    assert captured == [["codex", "--version"]]
 
 
 def test_codex_runner_materializes_core_runtime_contributions_for_the_next_session(
@@ -371,6 +488,7 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert "--output-schema" in captured["args"]
     assert captured["args"][captured["args"].index("--model") + 1] == "OpenEvo/Fixture-0.1B"
     assert 'model_provider="openevo_self_deployed"' in captured["args"]
+    assert "model_providers.openevo_self_deployed.requires_openai_auth=false" in captured["args"]
     assert any("http://127.0.0.1:18432/v1" in value for value in captured["args"])
     assert captured["env"]["OPENAI_API_KEY"] == "openevo-local"
     assert result["model"] == "OpenEvo/Fixture-0.1B"
@@ -951,28 +1069,29 @@ def test_store_repairs_duplicate_active_head_targets_with_immutable_successor(
             artifact_type="agent_system",
             method_id="agent_system_reflector",
             renderer_kind="markdown",
-            documents=[{
-                "path": "agent-system.md",
-                "media_type": "text/markdown",
-                "content": f"# Agent system {ordinal}",
-            }],
+            documents=[
+                {
+                    "path": "agent-system.md",
+                    "media_type": "text/markdown",
+                    "content": f"# Agent system {ordinal}",
+                }
+            ],
             manifest={"content_path": "agent-system.md"},
-            previous_artifact_id=(
-                None if ordinal == 1 else "duplicate-agent-system-1"
-            ),
+            previous_artifact_id=(None if ordinal == 1 else "duplicate-agent-system-1"),
             promoted=True,
         )
 
     invalid_head_id = store.active_project_head(project_id)["project_head_id"]
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "UPDATE development_project_heads SET artifact_ids_json = ? "
-            "WHERE project_head_id = ?",
+            "UPDATE development_project_heads SET artifact_ids_json = ? WHERE project_head_id = ?",
             (
-                json.dumps([
-                    "duplicate-agent-system-1",
-                    "duplicate-agent-system-2",
-                ]),
+                json.dumps(
+                    [
+                        "duplicate-agent-system-1",
+                        "duplicate-agent-system-2",
+                    ]
+                ),
                 invalid_head_id,
             ),
         )
@@ -1117,12 +1236,8 @@ def test_session_project_head_reuses_its_pinned_evolution_context(tmp_path: Path
     sessions = {item["session_id"]: item for item in store.snapshot()["sessions"]}
 
     assert sessions["head-session-2"]["context_artifact_ids"] == ["memory-head-2"]
-    assert sessions["head-session-historical"]["project_head_id"] == (
-        f"{project_id}-head-1"
-    )
-    assert sessions["head-session-historical"]["context_artifact_ids"] == [
-        "memory-head-1"
-    ]
+    assert sessions["head-session-historical"]["project_head_id"] == (f"{project_id}-head-1")
+    assert sessions["head-session-historical"]["context_artifact_ids"] == ["memory-head-1"]
 
 
 def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> None:
@@ -1367,10 +1482,22 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
             self.calls.append(("retry", model_resource_id, action_id))
             return self.record
 
+        def runtime_status(self) -> dict[str, object]:
+            return {
+                "runtime_id": "vllm",
+                "image_ref": "docker.io/vllm/vllm-openai@sha256:fixture",
+                "state": "downloading",
+                "error": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+        def retry_runtime(self, *, action_id: str) -> dict[str, object]:
+            self.calls.append(("retry-runtime", action_id))
+            return {**self.runtime_status(), "state": "queued"}
+
     models = Models()
-    server = MODULE.DevelopmentAgentServer(
-        ("127.0.0.1", 0), token, object(), store, None, models
-    )
+    server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store, None, models)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}/v2/development/models"
@@ -1402,13 +1529,24 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
             detail = json.loads(response.read())
         retry = urllib.request.Request(
             f"{base}/model-fixture/retry",
-            data=json.dumps(
-                {"schema_version": "2", "action_id": "retry-model"}
-            ).encode(),
+            data=json.dumps({"schema_version": "2", "action_id": "retry-model"}).encode(),
             method="POST",
             headers=headers,
         )
         with urllib.request.urlopen(retry, timeout=5) as response:
+            assert response.status == 202
+        runtime_base = base.replace("/models", "/model-runtime")
+        with urllib.request.urlopen(
+            urllib.request.Request(runtime_base, headers=headers), timeout=5
+        ) as response:
+            runtime = json.loads(response.read())
+        retry_runtime = urllib.request.Request(
+            f"{runtime_base}/retry",
+            data=json.dumps({"schema_version": "2", "action_id": "retry-runtime"}).encode(),
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(retry_runtime, timeout=5) as response:
             assert response.status == 202
     finally:
         server.shutdown()
@@ -1418,6 +1556,7 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
     assert registered["model_resource_id"] == "model-fixture"
     assert registered["downloaded_bytes"] == 32
     assert inventory["items"] == [detail]
+    assert runtime["state"] == "downloading"
     assert models.calls == [
         (
             "register",
@@ -1428,6 +1567,7 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
             },
         ),
         ("retry", "model-fixture", "retry-model"),
+        ("retry-runtime", "retry-runtime"),
     ]
 
 
@@ -1468,9 +1608,7 @@ def test_daemon_v2_capabilities_follow_the_persisted_project_execution_mode(
             }
 
     evolution = Evolution()
-    server = MODULE.DevelopmentAgentServer(
-        ("127.0.0.1", 0), token, object(), store, evolution
-    )
+    server = MODULE.DevelopmentAgentServer(("127.0.0.1", 0), token, object(), store, evolution)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}/v2/development/capabilities"
@@ -1496,9 +1634,7 @@ def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(
     token = "d" * 32
     store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
     for project_id in ("project-keep", "project-delete"):
-        store.create_project(
-            {"project_id": project_id, "display_name": project_id, "config": {}}
-        )
+        store.create_project({"project_id": project_id, "display_name": project_id, "config": {}})
     store.start_session(
         "task-delete",
         {
@@ -1547,9 +1683,7 @@ def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(
             "active_project_id": "project-delete",
         }
         assert delete("/v2/development/tasks/task-delete", "delete-task") == task_receipt
-        project_receipt = delete(
-            "/v2/development/projects/project-delete", "delete-project"
-        )
+        project_receipt = delete("/v2/development/projects/project-delete", "delete-project")
     finally:
         server.shutdown()
         server.server_close()
@@ -1557,9 +1691,7 @@ def test_daemon_v2_project_and_task_delete_routes_return_idempotent_receipts(
 
     assert project_receipt["resource_kind"] == "project"
     assert project_receipt["active_project_id"] == "project-keep"
-    assert [project["project_id"] for project in store.snapshot()["projects"]] == [
-        "project-keep"
-    ]
+    assert [project["project_id"] for project in store.snapshot()["projects"]] == ["project-keep"]
 
 
 def test_daemon_v2_workspace_is_digest_verified_paginated_and_restart_safe(
@@ -2395,10 +2527,7 @@ def test_development_capabilities_are_projected_from_the_core_catalog(tmp_path: 
 
     assert payload["authority"] == "development_catalog_unverified"
     assert payload["capabilities"]["evaluated_profile"]["execution_mode"] == "subscription"
-    assert (
-        self_deployed["capabilities"]["evaluated_profile"]["execution_mode"]
-        == "self_deployed"
-    )
+    assert self_deployed["capabilities"]["evaluated_profile"]["execution_mode"] == "self_deployed"
     assert (
         self_deployed["capabilities"]["registry_digest"]
         == payload["capabilities"]["registry_digest"]

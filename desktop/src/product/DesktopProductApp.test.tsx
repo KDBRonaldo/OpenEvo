@@ -2509,6 +2509,11 @@ describe("Desktop v2 product renderer", () => {
     expect(dialog()?.textContent).toContain("Edit project");
     expect(dialog()?.textContent).not.toContain("Task title");
     expect(dialog()?.textContent).not.toContain("Task objective");
+    expect(dialog()?.textContent).toContain("Execution mode is fixed for this Project");
+    expect(
+      Array.from(dialog()?.querySelectorAll<HTMLButtonElement>('[role="radio"]') ?? [])
+        .every((choice) => choice.disabled),
+    ).toBe(true);
 
     setInput("Project name", "Renamed protein study");
     await click("Save changes");
@@ -3152,12 +3157,29 @@ describe("Desktop v2 product renderer", () => {
         created_at: NOW,
         updated_at: NOW,
       }]),
+      getModelRuntime: vi.fn(async () => ({
+        runtime_id: "vllm" as const,
+        image_ref: "docker.io/vllm/vllm-openai@sha256:fixture",
+        state: "ready" as const,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      })),
+      retryModelRuntime: vi.fn(async () => ({
+        runtime_id: "vllm" as const,
+        image_ref: "docker.io/vllm/vllm-openai@sha256:fixture",
+        state: "ready" as const,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      })),
     } satisfies DesktopProductProviderV2;
     root = await render(provider);
 
     await click("New project");
     await act(async () => Promise.resolve());
     await click("Hugging FaceDownloaded and served on this server");
+    expect(document.body.textContent).toContain("Ready. Sessions will never download this image in the chat.");
     await click("OpenEvo/Fixture-0.1Baaaaaaaaaa");
     await click("Create project");
 
@@ -3175,6 +3197,128 @@ describe("Desktop v2 product renderer", () => {
       }),
       expect.anything(),
     );
+  });
+
+  it("shows vLLM image setup separately and blocks project creation until ready", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles", "huggingface_model_management_v2"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      listModelResources: vi.fn(async () => [{
+        model_resource_id: "model-ready",
+        repository_id: "OpenEvo/Fixture-0.1B",
+        requested_revision: "main",
+        resolved_revision: "a".repeat(40),
+        manifest_sha256: DIGEST,
+        state: "ready" as const,
+        downloaded_bytes: 128,
+        total_bytes: 128,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      }]),
+      getModelRuntime: vi.fn(async () => ({
+        runtime_id: "vllm" as const,
+        image_ref: "docker.io/vllm/vllm-openai@sha256:fixture",
+        state: "downloading" as const,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      })),
+      retryModelRuntime: vi.fn(async () => { throw new Error("not failed"); }),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    await act(async () => Promise.resolve());
+    await click("Hugging FaceDownloaded and served on this server");
+    await click("OpenEvo/Fixture-0.1Baaaaaaaaaa");
+
+    expect(document.body.textContent).toContain(
+      "Downloading the one-time vLLM image. This is server setup, not model inference.",
+    );
+    expect(button("Create project").disabled).toBe(true);
+  });
+
+  it("shows a stalled model download and lets the user resume it", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const stalledModel = {
+      model_resource_id: "model-stalled",
+      repository_id: "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
+      requested_revision: "main",
+      resolved_revision: "a".repeat(40),
+      manifest_sha256: DIGEST,
+      state: "failed" as const,
+      downloaded_bytes: 2_458_010_826,
+      total_bytes: 5_582_381_127,
+      error: "Model download stalled without receiving new data. The partial files were preserved.",
+      created_at: NOW,
+      updated_at: NOW,
+    };
+    const retryModelResource = vi.fn(async () => ({
+      ...stalledModel,
+      state: "queued" as const,
+      error: null,
+    }));
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles", "huggingface_model_management_v2"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      listModelResources: vi.fn(async () => [stalledModel]),
+      getModelRuntime: vi.fn(async () => ({
+        runtime_id: "vllm" as const,
+        image_ref: "docker.io/vllm/vllm-openai@sha256:fixture",
+        state: "ready" as const,
+        error: null,
+        created_at: NOW,
+        updated_at: NOW,
+      })),
+      retryModelRuntime: vi.fn(async () => { throw new Error("not failed"); }),
+      retryModelResource,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    await act(async () => Promise.resolve());
+    await click("Hugging FaceDownloaded and served on this server");
+
+    expect(document.body.textContent).toContain("Stalled");
+    expect(document.body.textContent).toContain("partial files were preserved");
+    expect(button("Resume download").disabled).toBe(false);
+    await click("Resume download");
+    await vi.waitFor(() => expect(retryModelResource).toHaveBeenCalledWith(
+        "model-stalled",
+        expect.objectContaining({ actionId: expect.any(String) }),
+      ));
   });
 
   it("closes project setup after HTTP 202 while work continues silently", async () => {

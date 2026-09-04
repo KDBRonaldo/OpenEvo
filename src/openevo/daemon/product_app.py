@@ -91,11 +91,15 @@ from openevo.daemon.contracts import (
     DevelopmentModelListV2,
     DevelopmentModelRegisterV2,
     DevelopmentModelRetryV2,
+    DevelopmentModelRuntimeRetryV2,
+    DevelopmentModelRuntimeV2,
     DevelopmentModelV2,
     DevelopmentProjectActivateV2,
     DevelopmentProjectAuthorityV2,
     DevelopmentProjectCreateV2,
     DevelopmentProjectHeadV2,
+    DevelopmentProjectReadinessCheckV2,
+    DevelopmentProjectReadinessV2,
     DevelopmentProjectUpdateV2,
     DevelopmentResourceDeleteReceiptV2,
     DevelopmentResourceDeleteRequestV2,
@@ -160,15 +164,20 @@ DAEMON_V2_DEVELOPMENT_STATE_PATH = "/v2/development/state"
 DAEMON_V2_DEVELOPMENT_CAPABILITIES_PATH = "/v2/development/capabilities"
 DAEMON_V2_DEVELOPMENT_PROJECTS_PATH = "/v2/development/projects"
 DAEMON_V2_DEVELOPMENT_MODELS_PATH = "/v2/development/models"
-DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN = re.compile(
-    r"^/v2/development/models/([^/]+)$"
+DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_PATH = "/v2/development/model-runtime"
+DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_RETRY_PATH = (
+    "/v2/development/model-runtime/retry"
 )
+DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN = re.compile(r"^/v2/development/models/([^/]+)$")
 DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN = re.compile(
     r"^/v2/development/models/([^/]+)/retry$"
 )
 DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN = re.compile(r"^/v2/development/projects/([^/]+)$")
 DAEMON_V2_DEVELOPMENT_PROJECT_ACTIVATE_PATH_PATTERN = re.compile(
     r"^/v2/development/projects/([^/]+)/activate$"
+)
+DAEMON_V2_DEVELOPMENT_PROJECT_READINESS_PATH_PATTERN = re.compile(
+    r"^/v2/development/projects/([^/]+)/readiness$"
 )
 DAEMON_V2_ARTIFACT_CONTENT_PATH_PATTERN = re.compile(r"^/v2/artifacts/([^/]+)/content$")
 DAEMON_V2_ARTIFACT_PATH_PATTERN = re.compile(r"^/v2/artifacts/([^/]+)$")
@@ -740,9 +749,7 @@ class DevelopmentStateStore:
             "manifest_sha256": snapshot["manifest_sha256"],
             "entry_count": len(snapshot["entries"]),
             "byte_size": sum(
-                entry["byte_size"]
-                for entry in snapshot["entries"]
-                if entry["kind"] == "file"
+                entry["byte_size"] for entry in snapshot["entries"] if entry["kind"] == "file"
             ),
         }
 
@@ -820,9 +827,7 @@ class DevelopmentStateStore:
             "workspace_entry_count": workspace["entry_count"],
             "workspace_byte_size": workspace["byte_size"],
         }
-        manifest_sha256 = hashlib.sha256(
-            canonical_json(authority).encode("utf-8")
-        ).hexdigest()
+        manifest_sha256 = hashlib.sha256(canonical_json(authority).encode("utf-8")).hexdigest()
         connection.execute(
             """
             INSERT INTO development_project_heads(
@@ -853,8 +858,7 @@ class DevelopmentStateStore:
         workspace = self._workspace_head_authority(project_id)
         with self._lock, self._connection(emit_event=False) as connection:
             existing = connection.execute(
-                "SELECT * FROM development_project_heads WHERE project_id = ? "
-                "ORDER BY generation",
+                "SELECT * FROM development_project_heads WHERE project_id = ? ORDER BY generation",
                 (project_id,),
             ).fetchall()
             if not existing:
@@ -881,7 +885,10 @@ class DevelopmentStateStore:
                     ):
                         contexts.setdefault(
                             int(head_id[len(prefix) :]),
-                            (json.loads(session["context_artifact_ids_json"]), session["created_at"]),
+                            (
+                                json.loads(session["context_artifact_ids_json"]),
+                                session["created_at"],
+                            ),
                         )
                 completed_count = connection.execute(
                     "SELECT COUNT(*) AS count FROM development_sessions "
@@ -918,9 +925,7 @@ class DevelopmentStateStore:
                             artifact_ids=inherited,
                         )
                     ]
-                    created_at = contexts.get(
-                        generation, ([], project_row["created_at"])
-                    )[1]
+                    created_at = contexts.get(generation, ([], project_row["created_at"]))[1]
                     record = self._insert_project_head(
                         connection,
                         project_id=project_id,
@@ -974,9 +979,8 @@ class DevelopmentStateStore:
                     artifact_ids=artifact_ids,
                 )
             ]
-            if (
-                len(normalized_ids) == len(artifact_ids)
-                and set(normalized_ids) == set(artifact_ids)
+            if len(normalized_ids) == len(artifact_ids) and set(normalized_ids) == set(
+                artifact_ids
             ):
                 return
             next_generation = connection.execute(
@@ -1329,7 +1333,10 @@ class DevelopmentStateStore:
         )
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
-        return self.project_catalog.update(project_id, request).as_dict()
+        try:
+            return self.project_catalog.update(project_id, request).as_dict()
+        except ProjectCatalogConflictError as exc:
+            raise StateConflictError(str(exc)) from exc
 
     def activate_project(self, project_id: str) -> None:
         self.project_catalog.activate(project_id)
@@ -1392,17 +1399,13 @@ class DevelopmentStateStore:
     def start_session(self, session_id: str, request: dict[str, str]) -> None:
         requested_head_id = request.get("project_head_id")
         if requested_head_id is not None:
-            self._materialize_legacy_requested_head(
-                request["project_id"], requested_head_id
-            )
+            self._materialize_legacy_requested_head(request["project_id"], requested_head_id)
         try:
             self.session_store.start(session_id, request)
         except SessionConflictError as exc:
             raise StateConflictError(str(exc)) from exc
 
-    def _materialize_legacy_requested_head(
-        self, project_id: str, project_head_id: str
-    ) -> None:
+    def _materialize_legacy_requested_head(self, project_id: str, project_head_id: str) -> None:
         """Accept the former next-completed-Session Head during wire migration."""
 
         prefix = f"{project_id}-head-"
@@ -1411,10 +1414,13 @@ class DevelopmentStateStore:
         generation = int(project_head_id[len(prefix) :])
         workspace = self._workspace_head_authority(project_id)
         with self._lock, self._connection() as connection:
-            if connection.execute(
-                "SELECT 1 FROM development_project_heads WHERE project_head_id = ?",
-                (project_head_id,),
-            ).fetchone() is not None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM development_project_heads WHERE project_head_id = ?",
+                    (project_head_id,),
+                ).fetchone()
+                is not None
+            ):
                 return
             active = connection.execute(
                 "SELECT head.* FROM development_project_head_streams AS stream "
@@ -1550,9 +1556,7 @@ class DevelopmentStateStore:
         limit: int = MAX_DAEMON_V2_TASK_PRESENTATION_PAGE,
     ) -> DevelopmentTaskPresentationPageV2:
         with self._lock, self._connection() as connection:
-            if (
-                not self.project_catalog.exists(connection, project_id)
-            ):
+            if not self.project_catalog.exists(connection, project_id):
                 raise KeyError(project_id)
             rows = connection.execute(
                 "SELECT session.* FROM development_sessions AS session "
@@ -1823,8 +1827,7 @@ class DevelopmentStateStore:
                     record["project_id"] != request["project_id"]
                     or (
                         request.get("base_project_head_id") is not None
-                        and record["base_project_head_id"]
-                        != request["base_project_head_id"]
+                        and record["base_project_head_id"] != request["base_project_head_id"]
                     )
                     or (
                         request.get("base_project_head_manifest_sha256") is not None
@@ -1851,8 +1854,7 @@ class DevelopmentStateStore:
                 request.get("base_project_head_id") or active_head["project_head_id"]
             )
             base_project_head_manifest_sha256 = (
-                request.get("base_project_head_manifest_sha256")
-                or active_head["manifest_sha256"]
+                request.get("base_project_head_manifest_sha256") or active_head["manifest_sha256"]
             )
             base_head = connection.execute(
                 "SELECT * FROM development_project_heads WHERE project_head_id = ?",
@@ -2106,10 +2108,7 @@ class DevelopmentStateStore:
                 for artifact in base_artifacts
                 if artifact["target_id"] not in replaced_target_ids
             ]
-            runtime_artifact_ids = [
-                item["artifact_id"]
-                for item in runtime_artifacts
-            ]
+            runtime_artifact_ids = [item["artifact_id"] for item in runtime_artifacts]
             next_artifact_ids = [
                 artifact["artifact_id"]
                 for artifact in self._normalized_runtime_artifacts(
@@ -2821,9 +2820,7 @@ class DevelopmentStateStore:
             "run_id": row["run_id"],
             "project_id": row["project_id"],
             "base_project_head_id": row["base_project_head_id"],
-            "base_project_head_manifest_sha256": row[
-                "base_project_head_manifest_sha256"
-            ],
+            "base_project_head_manifest_sha256": row["base_project_head_manifest_sha256"],
             "applied_project_head_id": row["applied_project_head_id"],
             "source_session_ids": json.loads(row["source_session_ids_json"]),
             "selections": normalize_selected_evolution(json.loads(row["selections_json"])),
@@ -2848,9 +2845,7 @@ class DevelopmentStateStore:
                 "action_id": record["action_id"],
                 "project_id": record["project_id"],
                 "base_project_head_id": record["base_project_head_id"],
-                "base_project_head_manifest_sha256": record[
-                    "base_project_head_manifest_sha256"
-                ],
+                "base_project_head_manifest_sha256": record["base_project_head_manifest_sha256"],
                 "applied_project_head_id": record["applied_project_head_id"],
                 "source_task_ids": record["source_session_ids"],
                 "selections": [
@@ -3353,6 +3348,7 @@ class DevelopmentSessionCoordinator:
         model_manager: HuggingFaceModelManager | None = None,
     ) -> None:
         self._store = store
+        self._runner = runner
         self._evolution_runner = evolution_runner
         self._model_manager = model_manager
         self._turn_lock = threading.Lock()
@@ -3375,12 +3371,111 @@ class DevelopmentSessionCoordinator:
     def submit(self, request: dict[str, str], *, session_id: str | None = None) -> str:
         try:
             project_config = self._store.project_config(request["project_id"])
+            execution = project_config.get("execution")
+            if isinstance(execution, dict) and execution.get("mode") in {
+                "codex_subscription_transcript",
+                "self-deployed",
+            }:
+                self.require_project_ready(request["project_id"], project_config=project_config)
             return self._session_runtime.submit(
                 {**request, "execution": project_config.get("execution", {})},
                 session_id=session_id,
             )
         except SessionExecutionConflictError as exc:
             raise StateConflictError(str(exc)) from exc
+
+    def project_readiness(
+        self,
+        project_id: str,
+        *,
+        project_config: dict[str, Any] | None = None,
+    ) -> DevelopmentProjectReadinessV2:
+        config = project_config or self._store.project_config(project_id)
+        execution = config.get("execution")
+        if not isinstance(execution, dict):
+            raise StateConflictError("project execution configuration is unavailable")
+        mode = execution.get("mode")
+        if mode == "codex_subscription_transcript":
+            status = "passed"
+            try:
+                self._runner.check_subscription_ready()
+            except AgentRunError:
+                status = "failed"
+            checks = [
+                DevelopmentProjectReadinessCheckV2(
+                    check_id="codex_subscription_login",
+                    status=status,
+                )
+            ]
+        elif mode == "self-deployed":
+            checks = [
+                DevelopmentProjectReadinessCheckV2(
+                    check_id="self_deployed_model",
+                    status=self._self_deployed_model_status(execution),
+                ),
+                DevelopmentProjectReadinessCheckV2(
+                    check_id="self_deployed_runtime",
+                    status=self._self_deployed_runtime_status(),
+                ),
+            ]
+        else:
+            raise StateConflictError("project execution mode is unavailable")
+        return DevelopmentProjectReadinessV2(
+            project_id=project_id,
+            execution_mode=mode,
+            ready=all(check.status == "passed" for check in checks),
+            checks=checks,
+        )
+
+    def _self_deployed_model_status(self, execution: dict[str, Any]) -> str:
+        if self._model_manager is None:
+            return "unavailable"
+        model_resource_id = execution.get("model_resource_id")
+        repository_id = execution.get("repository_id")
+        model_revision = execution.get("model_revision")
+        if not all(
+            isinstance(value, str) and value
+            for value in (model_resource_id, repository_id, model_revision)
+        ):
+            return "failed"
+        try:
+            model = self._model_manager.get(model_resource_id)
+        except (KeyError, StateConflictError):
+            return "failed"
+        return (
+            "passed"
+            if model["state"] == "ready"
+            and model["repository_id"] == repository_id
+            and model["resolved_revision"] == model_revision
+            else "failed"
+        )
+
+    def _self_deployed_runtime_status(self) -> str:
+        if self._model_manager is None:
+            return "unavailable"
+        try:
+            runtime = self._model_manager.runtime_status()
+        except StateConflictError:
+            return "unavailable"
+        return "passed" if runtime["state"] == "ready" else "failed"
+
+    def require_project_ready(
+        self,
+        project_id: str,
+        *,
+        project_config: dict[str, Any] | None = None,
+    ) -> None:
+        readiness = self.project_readiness(project_id, project_config=project_config)
+        if readiness.ready:
+            return
+        if readiness.execution_mode == "codex_subscription_transcript":
+            raise StateConflictError(
+                "Project execution is not ready because the Codex subscription is not logged in"
+            )
+        raise StateConflictError(
+            "Project execution is not ready because its self-deployed model or vLLM "
+            "server runtime is unavailable"
+        )
 
     def _prepare_execution(self, request: dict[str, Any]) -> dict[str, str] | None:
         execution = request.get("execution")
@@ -3389,19 +3484,17 @@ class DevelopmentSessionCoordinator:
         model_resource_id = execution.get("model_resource_id")
         repository_id = execution.get("repository_id")
         model_revision = execution.get("model_revision")
-        if not all(isinstance(value, str) and value for value in (
-            model_resource_id, repository_id, model_revision
-        )):
+        if not all(
+            isinstance(value, str) and value
+            for value in (model_resource_id, repository_id, model_revision)
+        ):
             raise AgentRunError(
                 "This legacy self-deployed profile is not available through model management"
             )
         if self._model_manager is None:
             raise AgentRunError("Hugging Face model management is unavailable")
         model = self._model_manager.get(model_resource_id)
-        if (
-            model["repository_id"] != repository_id
-            or model["resolved_revision"] != model_revision
-        ):
+        if model["repository_id"] != repository_id or model["resolved_revision"] != model_revision:
             raise AgentRunError("Project model identity no longer matches daemon authority")
         return self._model_manager.prepare_inference(model_resource_id)
 
@@ -4179,17 +4272,13 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                     if set(parameters) - {"project_id"} or any(
                         len(values) != 1 for values in parameters.values()
                     ):
-                        raise RequestError(
-                            "capabilities query contains unsupported parameters"
-                        )
+                        raise RequestError("capabilities query contains unsupported parameters")
                     project_id = parameters.get("project_id", [None])[0]
                     execution_mode = "codex_subscription_transcript"
                     if project_id is not None:
                         if not ID_PATTERN.fullmatch(project_id):
                             raise RequestError("project_id is invalid")
-                        execution = self.server.store.project_config(project_id).get(
-                            "execution"
-                        )
+                        execution = self.server.store.project_config(project_id).get("execution")
                         if not isinstance(execution, dict) or not isinstance(
                             execution.get("mode"), str
                         ):
@@ -4203,13 +4292,9 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                         capabilities=legacy["capabilities"],
                     )
                 except (RequestError, ValueError) as exc:
-                    self._json_error_v2(
-                        HTTPStatus.BAD_REQUEST, "invalid_request", str(exc)
-                    )
+                    self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
                 except KeyError:
-                    self._json_error_v2(
-                        HTTPStatus.NOT_FOUND, "not_found", "project not found"
-                    )
+                    self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
                 except (EvolutionRunError, StateConflictError) as exc:
                     self._json_error_v2(
                         HTTPStatus.SERVICE_UNAVAILABLE,
@@ -4235,9 +4320,42 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 )
                 self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
-        model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN.fullmatch(
+        if parsed_path.path == DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_PATH:
+            if self.server.model_manager is None:
+                self._json_error_v2(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "model_runtime_unavailable",
+                    "development model runtime is unavailable",
+                )
+            else:
+                response = DevelopmentModelRuntimeV2.model_validate(
+                    self.server.model_manager.runtime_status()
+                )
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
+        project_readiness_match = DAEMON_V2_DEVELOPMENT_PROJECT_READINESS_PATH_PATTERN.fullmatch(
             parsed_path.path
         )
+        if project_readiness_match:
+            project_id = project_readiness_match.group(1)
+            try:
+                if not ID_PATTERN.fullmatch(project_id):
+                    raise RequestError("project_id is invalid")
+                response = self.server.sessions.project_readiness(project_id)
+            except RequestError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            except StateConflictError as exc:
+                self._json_error_v2(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "project_readiness_unavailable",
+                    str(exc),
+                )
+            else:
+                self._json(HTTPStatus.OK, response.model_dump(mode="json"))
+            return
+        model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN.fullmatch(parsed_path.path)
         if model_v2_match:
             model_resource_id = model_v2_match.group(1)
             try:
@@ -4253,9 +4371,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "model not found")
             except StateConflictError as exc:
-                self._json_error_v2(
-                    HTTPStatus.SERVICE_UNAVAILABLE, "models_unavailable", str(exc)
-                )
+                self._json_error_v2(HTTPStatus.SERVICE_UNAVAILABLE, "models_unavailable", str(exc))
             else:
                 self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
@@ -4395,9 +4511,22 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
             return
-        retry_model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN.fullmatch(
-            self.path
-        )
+        if self.path == DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_RETRY_PATH:
+            try:
+                request = DevelopmentModelRuntimeRetryV2.model_validate(self._read_json())
+                if self.server.model_manager is None:
+                    raise StateConflictError("development model manager is unavailable")
+                response = DevelopmentModelRuntimeV2.model_validate(
+                    self.server.model_manager.retry_runtime(action_id=request.action_id)
+                )
+            except ValidationError as exc:
+                self._json_error_v2(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except StateConflictError as exc:
+                self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, response.model_dump(mode="json"))
+            return
+        retry_model_v2_match = DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN.fullmatch(self.path)
         if retry_model_v2_match:
             model_resource_id = retry_model_v2_match.group(1)
             try:
@@ -4818,23 +4947,19 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed_path = urlsplit(self.path)
-        project_match = (
-            DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
-            or PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
-        )
-        task_match = (
-            DAEMON_V2_DEVELOPMENT_TASK_PATH_PATTERN.fullmatch(parsed_path.path)
-            or SESSION_PATH_PATTERN.fullmatch(parsed_path.path)
-        )
+        project_match = DAEMON_V2_DEVELOPMENT_PROJECT_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        ) or PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
+        task_match = DAEMON_V2_DEVELOPMENT_TASK_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        ) or SESSION_PATH_PATTERN.fullmatch(parsed_path.path)
         if project_match or task_match:
             resource_kind = "project" if project_match else "task"
             resource_id = (project_match or task_match).group(1)  # type: ignore[union-attr]
             try:
                 if not ID_PATTERN.fullmatch(resource_id):
                     raise RequestError(f"{resource_kind}_id is invalid")
-                request = DevelopmentResourceDeleteRequestV2.model_validate(
-                    self._read_json()
-                )
+                request = DevelopmentResourceDeleteRequestV2.model_validate(self._read_json())
                 if resource_kind == "project":
                     active_project_id = self.server.sessions.delete_project(
                         resource_id, request.action_id
@@ -4862,10 +4987,9 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, receipt.model_dump(mode="json"))
             return
-        workspace_match = (
-            DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
-            or WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
-        )
+        workspace_match = DAEMON_V2_WORKSPACE_FILES_PATH_PATTERN.fullmatch(
+            parsed_path.path
+        ) or WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
         if not workspace_match:
             self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
             return
@@ -5089,7 +5213,7 @@ def create_product_daemon(
         raise ValueError(f"Codex executable was not found: {codex_binary}")
 
     runner = CodexRunner(resolved_codex_binary, timeout_seconds, model)
-    runner.check_ready()
+    runner.check_cli_ready()
     resolved_state_path = state_path.expanduser().resolve()
     store = DevelopmentStateStore(resolved_state_path)
     model_manager = HuggingFaceModelManager(
@@ -5104,9 +5228,10 @@ def create_product_daemon(
         model_resource_id = execution.get("model_resource_id")
         repository_id = execution.get("repository_id")
         model_revision = execution.get("model_revision")
-        if not all(isinstance(value, str) and value for value in (
-            model_resource_id, repository_id, model_revision
-        )):
+        if not all(
+            isinstance(value, str) and value
+            for value in (model_resource_id, repository_id, model_revision)
+        ):
             raise EvolutionRunError(
                 "This legacy self-deployed profile is not available through model management"
             )
@@ -5117,6 +5242,7 @@ def create_product_daemon(
         ):
             raise EvolutionRunError("Project model identity no longer matches daemon authority")
         return model_manager.prepare_inference(model_resource_id)
+
     resolved_evolution_model = evolution_model or model or "gpt-5.5"
     evolution_runner = DocumentEvolutionRunner(
         state_root=resolved_state_path.parent,

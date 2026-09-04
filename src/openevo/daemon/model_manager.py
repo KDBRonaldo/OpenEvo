@@ -13,6 +13,8 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable
@@ -30,6 +32,8 @@ MODEL_REVISION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 MODEL_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 MAX_MODEL_SNAPSHOT_BYTES = 256 * 1024**3
 MODEL_METADATA_TIMEOUT_SECONDS = 30
+MODEL_DOWNLOAD_STALL_TIMEOUT_SECONDS = 90
+MODEL_DOWNLOAD_POLL_SECONDS = 2
 _SAFE_MODEL_SUFFIXES = (
     ".json",
     ".safetensors",
@@ -87,8 +91,15 @@ class VllmModelRuntime:
             self._stop_locked()
             docker = shutil.which("docker")
             if docker is None:
-                raise StateConflictError("Docker is required to serve a downloaded model")
-            self._ensure_image(docker)
+                raise StateConflictError(
+                    "Docker is required to serve a downloaded model; EvoLab installs it "
+                    "automatically when NVIDIA GPU hardware is detected during launcher setup"
+                )
+            if not self._image_available(docker):
+                raise StateConflictError(
+                    "the pinned vLLM server image is not ready; prepare the self-deployed "
+                    "model runtime before starting a Session"
+                )
             self._cleanup_stale(docker)
             gpu_index = self._select_gpu(docker)
             context_window = self._model_context_window(snapshot_path)
@@ -158,7 +169,29 @@ class VllmModelRuntime:
             self._stop_locked()
             raise StateConflictError(f"vLLM did not become ready before timeout: {logs}")
 
-    def _ensure_image(self, docker: str) -> None:
+    def image_available(self) -> bool:
+        """Return whether the pinned image is already local without downloading it."""
+
+        with self._lock:
+            docker = shutil.which("docker")
+            if docker is None:
+                raise StateConflictError(
+                    "Docker is required to prepare the self-deployed model runtime"
+                )
+            return self._image_available(docker)
+
+    def prepare_image(self) -> None:
+        """Download the pinned image outside Session execution."""
+
+        with self._lock:
+            docker = shutil.which("docker")
+            if docker is None:
+                raise StateConflictError(
+                    "Docker is required to prepare the self-deployed model runtime"
+                )
+            self._ensure_image(docker)
+
+    def _image_available(self, docker: str) -> bool:
         try:
             inspect = self._run(
                 [docker, "image", "inspect", VLLM_IMAGE],
@@ -166,7 +199,10 @@ class VllmModelRuntime:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StateConflictError(f"could not inspect the pinned vLLM image: {exc}") from exc
-        if inspect.returncode == 0:
+        return inspect.returncode == 0
+
+    def _ensure_image(self, docker: str) -> None:
+        if self._image_available(docker):
             return
         try:
             pulled = self._run(
@@ -565,6 +601,8 @@ class HuggingFaceModelManager:
         api_factory: Callable[[], Any] | None = None,
         snapshot_download: Callable[..., str] | None = None,
         runtime: VllmModelRuntime | None = None,
+        download_stall_timeout_seconds: float = MODEL_DOWNLOAD_STALL_TIMEOUT_SECONDS,
+        download_poll_seconds: float = MODEL_DOWNLOAD_POLL_SECONDS,
     ) -> None:
         self.state_path = state_path
         self.root = root.resolve(strict=False)
@@ -572,11 +610,17 @@ class HuggingFaceModelManager:
         self.staging_root = self.root / "staging"
         self._api_factory = api_factory
         self._snapshot_download = snapshot_download
+        self._download_stall_timeout_seconds = download_stall_timeout_seconds
+        self._download_poll_seconds = download_poll_seconds
+        if self._download_stall_timeout_seconds <= 0 or self._download_poll_seconds <= 0:
+            raise ValueError("model download monitoring intervals must be positive")
         self._runtime = runtime or VllmModelRuntime(
             owner_id=hashlib.sha256(os.fspath(self.state_path.resolve()).encode()).hexdigest()[:16]
         )
         self._lock = threading.RLock()
         self._workers: dict[str, threading.Thread] = {}
+        self._download_processes: dict[str, subprocess.Popen[bytes]] = {}
+        self._runtime_worker: threading.Thread | None = None
         for directory in (self.root, self.snapshots_root, self.staging_root):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
@@ -586,6 +630,8 @@ class HuggingFaceModelManager:
             except OSError:
                 pass
         self._initialize()
+        if self.list():
+            self._start_runtime_worker(force_check=True)
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.state_path, timeout=30)
@@ -621,7 +667,40 @@ class HuggingFaceModelManager:
                     action_kind TEXT NOT NULL CHECK (action_kind IN ('register', 'retry')),
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS development_model_runtime (
+                    runtime_id TEXT PRIMARY KEY CHECK (runtime_id = 'vllm'),
+                    image_ref TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN ('queued', 'checking', 'downloading', 'ready', 'failed')
+                    ),
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS development_model_runtime_actions (
+                    action_id TEXT PRIMARY KEY,
+                    runtime_id TEXT NOT NULL REFERENCES development_model_runtime(runtime_id),
+                    action_kind TEXT NOT NULL CHECK (action_kind = 'retry'),
+                    created_at TEXT NOT NULL
+                );
                 """
+            )
+            now = _utc_now()
+            connection.execute(
+                "INSERT OR IGNORE INTO development_model_runtime(runtime_id, image_ref, state, "
+                "created_at, updated_at) VALUES ('vllm', ?, 'queued', ?, ?)",
+                (VLLM_IMAGE, now, now),
+            )
+            connection.execute(
+                "UPDATE development_model_runtime SET image_ref = ?, state = 'queued', "
+                "error = NULL, updated_at = ? WHERE runtime_id = 'vllm' AND image_ref != ?",
+                (VLLM_IMAGE, now, VLLM_IMAGE),
+            )
+            connection.execute(
+                "UPDATE development_model_runtime SET state = 'queued', "
+                "error = 'Runtime preparation was interrupted by a daemon restart.', "
+                "updated_at = ? WHERE state IN ('checking', 'downloading')",
+                (now,),
             )
             connection.execute(
                 "UPDATE development_models SET state = 'failed', "
@@ -705,6 +784,7 @@ class HuggingFaceModelManager:
                     start_worker = True
         if start_worker:
             self._start_worker(model_resource_id)
+        self._start_runtime_worker()
         return self.get(model_resource_id)
 
     def retry(self, model_resource_id: str, *, action_id: str) -> dict[str, Any]:
@@ -742,7 +822,50 @@ class HuggingFaceModelManager:
                     start_worker = True
         if start_worker:
             self._start_worker(model_resource_id)
+        self._start_runtime_worker()
         return self.get(model_resource_id)
+
+    def runtime_status(self) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_model_runtime WHERE runtime_id = 'vllm'"
+            ).fetchone()
+        if row is None:
+            raise StateConflictError("self-deployed model runtime status is unavailable")
+        return {
+            "runtime_id": row["runtime_id"],
+            "image_ref": row["image_ref"],
+            "state": row["state"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def retry_runtime(self, *, action_id: str) -> dict[str, Any]:
+        start_worker = False
+        with self._lock, self._connection() as connection:
+            action = connection.execute(
+                "SELECT runtime_id FROM development_model_runtime_actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if action is None:
+                now = _utc_now()
+                connection.execute(
+                    "INSERT INTO development_model_runtime_actions(action_id, runtime_id, "
+                    "action_kind, created_at) VALUES (?, 'vllm', 'retry', ?)",
+                    (action_id, now),
+                )
+                connection.execute(
+                    "UPDATE development_model_runtime SET state = 'queued', error = NULL, "
+                    "updated_at = ? WHERE runtime_id = 'vllm'",
+                    (now,),
+                )
+                start_worker = True
+            elif action["runtime_id"] != "vllm":
+                raise StateConflictError("runtime action_id is bound to another runtime")
+        if start_worker:
+            self._start_runtime_worker()
+        return self.runtime_status()
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
@@ -773,6 +896,10 @@ class HuggingFaceModelManager:
         model = self.get(model_resource_id)
         if model["state"] != "ready":
             raise StateConflictError("the selected model has not finished downloading")
+        if self.runtime_status()["state"] != "ready":
+            raise StateConflictError(
+                "the self-deployed model runtime has not finished preparing"
+            )
         return self._runtime.ensure_running(
             model_resource_id=model_resource_id,
             repository_id=model["repository_id"],
@@ -780,11 +907,15 @@ class HuggingFaceModelManager:
         )
 
     def close(self) -> None:
+        with self._lock:
+            processes = list(self._download_processes.values())
+        for process in processes:
+            self._terminate_download_process(process)
         self._runtime.close()
 
     def _record(self, row: sqlite3.Row) -> dict[str, Any]:
         downloaded = int(row["downloaded_bytes"])
-        if row["state"] == "downloading":
+        if row["state"] in {"downloading", "failed"}:
             downloaded = max(downloaded, self._tree_size(self._staging_path(row["model_resource_id"])))
         return {
             "model_resource_id": row["model_resource_id"],
@@ -813,6 +944,46 @@ class HuggingFaceModelManager:
             )
             self._workers[model_resource_id] = thread
             thread.start()
+
+    def _start_runtime_worker(self, *, force_check: bool = False) -> None:
+        with self._lock:
+            if self._runtime_worker is not None and self._runtime_worker.is_alive():
+                return
+            current_state = self.runtime_status()["state"]
+            if current_state == "ready" and not force_check:
+                return
+            if current_state == "ready":
+                self._set_runtime_state("queued")
+            thread = threading.Thread(
+                target=self._prepare_runtime,
+                name="openevo-vllm-image",
+                daemon=True,
+            )
+            self._runtime_worker = thread
+            thread.start()
+
+    def _prepare_runtime(self) -> None:
+        try:
+            self._set_runtime_state("checking")
+            if not self._runtime.image_available():
+                self._set_runtime_state("downloading")
+                self._runtime.prepare_image()
+            self._set_runtime_state("ready")
+        except Exception as exc:
+            self._set_runtime_state("failed", error=str(exc))
+        finally:
+            with self._lock:
+                self._runtime_worker = None
+            if self.runtime_status()["state"] == "queued":
+                self._start_runtime_worker()
+
+    def _set_runtime_state(self, state: str, *, error: str | None = None) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "UPDATE development_model_runtime SET state = ?, error = ?, updated_at = ? "
+                "WHERE runtime_id = 'vllm'",
+                (state, (error[:4_000] if error else None), _utc_now()),
+            )
 
     def _download(self, model_resource_id: str) -> None:
         staging = self._staging_path(model_resource_id)
@@ -855,8 +1026,15 @@ class HuggingFaceModelManager:
                     total_bytes=self._tree_size(final),
                 )
                 return
-            self._discard_staging(staging)
-            staging.mkdir(mode=0o700, parents=True)
+            can_resume = (
+                staging.is_dir()
+                and not staging.is_symlink()
+                and model.get("resolved_revision") == resolved_revision
+                and model.get("manifest_sha256") == manifest_sha256
+            )
+            if not can_resume:
+                self._discard_staging(staging)
+            staging.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._set_state(
                 model_resource_id,
                 "downloading",
@@ -864,18 +1042,26 @@ class HuggingFaceModelManager:
                 manifest_sha256=manifest_sha256,
                 total_bytes=total_bytes,
             )
-            download = self._snapshot_download_function()
-            downloaded_path = Path(
-                download(
+            if self._snapshot_download is not None:
+                downloaded_path = Path(
+                    self._snapshot_download(
+                        repo_id=model["repository_id"],
+                        revision=resolved_revision,
+                        local_dir=staging,
+                        token=False,
+                        etag_timeout=MODEL_METADATA_TIMEOUT_SECONDS,
+                        max_workers=4,
+                        allow_patterns=[f"*{suffix}" for suffix in _SAFE_MODEL_SUFFIXES],
+                    )
+                ).resolve(strict=True)
+            else:
+                self._download_snapshot_in_subprocess(
+                    model_resource_id=model_resource_id,
                     repo_id=model["repository_id"],
                     revision=resolved_revision,
-                    local_dir=staging,
-                    token=False,
-                    etag_timeout=MODEL_METADATA_TIMEOUT_SECONDS,
-                    max_workers=4,
-                    allow_patterns=[f"*{suffix}" for suffix in _SAFE_MODEL_SUFFIXES],
+                    staging=staging,
                 )
-            ).resolve(strict=True)
+                downloaded_path = staging.resolve(strict=True)
             if downloaded_path != staging.resolve(strict=True):
                 raise RequestError("Hugging Face returned an unexpected model snapshot path")
             self._verify_downloaded_files(staging, files)
@@ -900,12 +1086,94 @@ class HuggingFaceModelManager:
 
         return HfApi()
 
-    def _snapshot_download_function(self) -> Callable[..., str]:
-        if self._snapshot_download is not None:
-            return self._snapshot_download
-        from huggingface_hub import snapshot_download
+    def _download_snapshot_in_subprocess(
+        self,
+        *,
+        model_resource_id: str,
+        repo_id: str,
+        revision: str,
+        staging: Path,
+    ) -> None:
+        command = [
+            sys.executable,
+            "-m",
+            "openevo.daemon.model_download_worker",
+            "--repo-id",
+            repo_id,
+            "--revision",
+            revision,
+            "--local-dir",
+            os.fspath(staging),
+        ]
+        for suffix in _SAFE_MODEL_SUFFIXES:
+            command.extend(("--allow-pattern", f"*{suffix}"))
+        environment = os.environ.copy()
+        environment.setdefault("HF_HUB_DISABLE_XET", "1")
+        environment.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+        environment.setdefault("HF_HUB_ETAG_TIMEOUT", str(MODEL_METADATA_TIMEOUT_SECONDS))
+        environment.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            with self._lock:
+                self._download_processes[model_resource_id] = process
+            last_size = self._tree_size(staging)
+            last_progress = time.monotonic()
+            self._set_download_progress(model_resource_id, last_size)
+            try:
+                while process.poll() is None:
+                    time.sleep(self._download_poll_seconds)
+                    current_size = self._tree_size(staging)
+                    if current_size != last_size:
+                        last_size = current_size
+                        last_progress = time.monotonic()
+                        self._set_download_progress(model_resource_id, current_size)
+                    elif time.monotonic() - last_progress >= self._download_stall_timeout_seconds:
+                        self._terminate_download_process(process)
+                        raise StateConflictError(
+                            "Model download stalled without receiving new data. "
+                            "The partial files were preserved."
+                        )
+                self._set_download_progress(model_resource_id, self._tree_size(staging))
+                if process.returncode != 0:
+                    output.seek(0, os.SEEK_END)
+                    length = output.tell()
+                    output.seek(max(0, length - 4_000))
+                    detail = output.read().decode("utf-8", errors="replace").strip()
+                    raise StateConflictError(
+                        f"Hugging Face model download failed: {detail or 'download worker exited'}"
+                    )
+            finally:
+                with self._lock:
+                    if self._download_processes.get(model_resource_id) is process:
+                        self._download_processes.pop(model_resource_id, None)
 
-        return snapshot_download
+    @staticmethod
+    def _terminate_download_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _set_download_progress(self, model_resource_id: str, downloaded_bytes: int) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "UPDATE development_models SET downloaded_bytes = ?, updated_at = ? "
+                "WHERE model_resource_id = ? AND state = 'downloading'",
+                (downloaded_bytes, _utc_now(), model_resource_id),
+            )
 
     @staticmethod
     def _safe_file_manifest(siblings: object) -> list[dict[str, Any]]:
@@ -1038,11 +1306,18 @@ class HuggingFaceModelManager:
             )
 
     def _fail_download(self, model_resource_id: str, error: str) -> None:
+        downloaded_bytes = self._tree_size(self._staging_path(model_resource_id))
         with self._lock, self._connection() as connection:
             connection.execute(
-                "UPDATE development_models SET state = 'failed', error = ?, updated_at = ? "
+                "UPDATE development_models SET state = 'failed', downloaded_bytes = MAX("
+                "downloaded_bytes, ?), error = ?, updated_at = ? "
                 "WHERE model_resource_id = ?",
-                (error[:4_000] or "model download failed", _utc_now(), model_resource_id),
+                (
+                    downloaded_bytes,
+                    error[:4_000] or "model download failed",
+                    _utc_now(),
+                    model_resource_id,
+                ),
             )
 
     def _staging_path(self, model_resource_id: str) -> Path:

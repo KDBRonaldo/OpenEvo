@@ -18,8 +18,8 @@ def test_product_composition_initializes_all_authoritative_services(
         def __init__(self, binary: str, timeout: int, model: str | None) -> None:
             observed["runner"] = (binary, timeout, model)
 
-        def check_ready(self) -> None:
-            observed["runner_ready"] = True
+        def check_cli_ready(self) -> None:
+            observed["runner_cli_ready"] = True
 
     class Store:
         def __init__(self, path: Path) -> None:
@@ -62,7 +62,7 @@ def test_product_composition_initializes_all_authoritative_services(
     )
 
     assert observed["runner"] == ("/usr/bin/codex", 300, "codex-model")
-    assert observed["runner_ready"] is True
+    assert observed["runner_cli_ready"] is True
     assert observed["evolution_ready"] is True
     assert observed["state_path"] == (tmp_path / "state.sqlite3").resolve()
     assert observed["models"] == {

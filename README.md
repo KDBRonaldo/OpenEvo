@@ -22,15 +22,22 @@ GitHub's automatically generated source-code archives; they are repository
 snapshots, not EvoLab installers.
 
 The release page contains the complete first-install guide. In short, the Mac
-needs Python 3.11+ and system OpenSSH, while the remote Linux server needs
-Python 3, standard POSIX tools, and an authenticated Codex CLI for the exact
-SSH user EvoLab will use. Then install the downloaded archive:
+needs Python 3.11+ and system OpenSSH. The remote Linux account needs root or
+passwordless `sudo` and a supported package manager (`apt-get`, `dnf`, `yum`,
+or `apk`); EvoLab installs missing server tools itself. Then install the downloaded archive:
 
 ```bash
 unzip evolab-launcher.zip
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
+
+On the first run, EvoLab installs the official Codex CLI on the server when it
+is missing, along with Python, curl, certificates, and core utilities when
+needed. If that remote SSH user is not authenticated, the launcher starts Codex
+device-code login, opens the verification page on the user's computer, and
+prints the one-time code in the same terminal. The user never needs to SSH into
+the server to prepare dependencies or log in to Codex manually.
 
 The release preserves `openevo webui` as a compatibility command. A maintainer
 can build the deterministic macOS archive from an exact commit:
@@ -83,7 +90,8 @@ The formal launcher compares the server's managed checkout with the current
 committed local branch head. If they differ, it creates a verified Git bundle
 locally and uploads it through SSH; the server never fetches OpenEvo source from GitHub.
 When the commits already match, source delivery is skipped. The launcher then
-starts the remote processes, opens the SSH tunnel, and serves the React UI.
+ensures Codex is installed and authenticated for the exact SSH user, starts the
+remote processes, opens the SSH tunnel, and serves the React UI.
 
 Installation, update, and start can also be run separately:
 
@@ -132,13 +140,24 @@ revision to an immutable commit, verifies content-addressed safetensors, and
 stores the model in the daemon's private model cache. Projects pin the managed
 model resource and commit rather than a mutable branch name.
 
-Serving requires Docker and an NVIDIA GPU on the daemon computer. The first
-Session pulls the release-pinned vLLM image, starts it on daemon loopback, and
-uses the selected model for both Sessions and supported Evolution reflectors.
-Only one managed model server is kept active at a time. The server must be able
-to reach Hugging Face; administrators in mirrored environments can set the
-standard `HF_ENDPOINT` variable before launching EvoLab. Private, gated,
-PyTorch pickle, and remote-code-only repositories are rejected.
+Serving requires an NVIDIA GPU on the daemon computer. During launcher setup,
+EvoLab detects NVIDIA hardware and, on Ubuntu GPU servers, automatically
+installs a missing recommended compute driver, Docker, and NVIDIA Container
+Toolkit, configures Docker GPU access, and grants the SSH user Docker access.
+A newly installed driver can require one server reboot; after reboot, rerun the
+same `evolab webui` command and setup resumes automatically. CPU-only servers
+skip this container stack. On container-style GPU rentals, the launcher never
+changes GPU drivers, Docker configuration, services, or user permissions: they
+must already expose a user-accessible Docker daemon with the NVIDIA runtime, or
+the launcher stops with guidance to use a Docker-enabled container or a full
+Ubuntu GPU virtual machine. The first Session pulls the release-pinned vLLM
+image, starts it on daemon loopback, and uses the selected model for both
+Sessions and supported Evolution reflectors. Only one managed model server is
+kept active at a time. The server must be able to reach Hugging Face, Docker
+Hub, and NVIDIA's signed package repository; administrators in mirrored
+environments can set the standard `HF_ENDPOINT` variable before launching
+EvoLab. Private, gated, PyTorch pickle, and remote-code-only repositories are
+rejected.
 
 ## Build and install a release bundle
 

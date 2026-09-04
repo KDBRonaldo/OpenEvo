@@ -5524,6 +5524,18 @@ pre.json {
 .project-model-list small,
 .project-model-guidance { color: var(--muted); }
 .project-model-manager { display: grid; gap: 10px; margin-top: 12px; }
+.project-model-runtime { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.project-model-runtime > span:not(.project-model-runtime-icon),
+.project-model-runtime strong,
+.project-model-runtime small { display: block; }
+.project-model-runtime small { margin-top: 2px; color: var(--muted); }
+.project-model-runtime-icon { color: var(--muted); }
+.project-model-runtime.downloading,
+.project-model-runtime.checking { border-color: var(--accent); background: var(--accent-soft); }
+.project-model-runtime.ready .project-model-runtime-icon { color: var(--accent); }
+.project-model-runtime.failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.project-model-runtime.failed .project-model-runtime-icon,
+.project-model-runtime.failed small { color: var(--danger); }
 .project-model-register { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(90px, .35fr) auto; gap: 8px; }
 .project-model-register input { min-width: 0; }
 .project-model-list { display: grid; gap: 7px; max-height: 190px; overflow: auto; }
@@ -5532,9 +5544,12 @@ pre.json {
 .project-model-list .project-model-retry { position: absolute; top: 8px; right: 8px; min-height: 28px; }
 .project-model-list .model-state { font-style: normal; text-transform: capitalize; color: var(--muted); }
 .project-model-list .model-state.ready { color: var(--accent); }
+.project-model-list .model-state.stalled,
 .project-model-list .model-state.failed,
 .project-model-list .model-error { color: var(--danger); }
-.project-model-list .model-error { grid-column: 1 / -1; }
+.project-model-list .model-error,
+.project-model-list .model-stall-message { grid-column: 1 / -1; }
+.project-model-list .model-stall-message { color: var(--danger); }
 
 .project-setup-footer {
   display: flex;

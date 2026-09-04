@@ -15,6 +15,7 @@ import {
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
   type DevelopmentModelResourceV2,
+  type DevelopmentModelRuntimeV2,
   type ProductSubscriptionSignalV2,
 } from "./providerV2";
 
@@ -218,6 +219,8 @@ export interface DevelopmentAgentBackend {
   ): Promise<{ readonly fileName: string; readonly mediaType: string; readonly data: Blob }>;
   deleteWorkspaceFile(projectId: string, path: string): Promise<void>;
   listModelResources?(): Promise<readonly DevelopmentModelResourceV2[]>;
+  getModelRuntime?(): Promise<DevelopmentModelRuntimeV2>;
+  retryModelRuntime?(actionId: string): Promise<DevelopmentModelRuntimeV2>;
   registerModelResource?(repositoryId: string, revision: string, actionId: string): Promise<DevelopmentModelResourceV2>;
   retryModelResource?(modelResourceId: string, actionId: string): Promise<DevelopmentModelResourceV2>;
 }
@@ -312,6 +315,14 @@ function createRemoteBackedDesktopProductProvider(
       return () => subscribers.delete(listener);
     },
     listModelResources: async () => options.developmentBackend.listModelResources?.() ?? [],
+    getModelRuntime: async () => {
+      if (!options.developmentBackend.getModelRuntime) throw new Error("Model runtime status is unavailable.");
+      return options.developmentBackend.getModelRuntime();
+    },
+    retryModelRuntime: async (intent) => {
+      if (!options.developmentBackend.retryModelRuntime) throw new Error("Model runtime preparation is unavailable.");
+      return options.developmentBackend.retryModelRuntime(intent.actionId);
+    },
     registerModelResource: async (repositoryId, revision, intent) => {
       if (!options.developmentBackend.registerModelResource) throw new Error("Model management is unavailable.");
       return options.developmentBackend.registerModelResource(repositoryId, revision, intent.actionId);

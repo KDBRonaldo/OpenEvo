@@ -63,6 +63,7 @@ import {
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
   type DevelopmentModelResourceV2,
+  type DevelopmentModelRuntimeV2,
   type ProductMutationIntentV2,
   type WorkspaceFileDownloadV2,
 } from "./providerV2";
@@ -687,7 +688,20 @@ export function DesktopProductApp({
         intentFor(currentSnapshot, "validate-project"),
       );
       if (!validation.valid) {
-        setActionError("The active remote registry rejected this project configuration. Correct the failed checks before running.");
+        const failedCheckIds = new Set(
+          validation.checks
+            .filter((check) => check.status !== "passed")
+            .map((check) => check.check_id),
+        );
+        setActionError(
+          failedCheckIds.has("codex_subscription_login")
+            ? "This Project uses Codex Subscription. Log in to Codex on the server, then try again."
+            : failedCheckIds.has("self_deployed_runtime")
+              ? "This server's vLLM runtime is still being prepared. Open Project settings to view or retry it."
+              : failedCheckIds.has("self_deployed_model")
+              ? "This Project's self-deployed model is not ready on the server."
+              : "The active remote registry rejected this project configuration. Correct the failed checks before running.",
+        );
         return false;
       }
       // Project validation is itself an authoritative remote mutation and can
@@ -1588,6 +1602,17 @@ function NewProjectDialogV2({
   readonly onCreated: () => Promise<void>;
   readonly onError: (error: unknown) => void;
 }) {
+  const modelDownloadAppearsStalled = (model: DevelopmentModelResourceV2): boolean => {
+    if (model.state !== "downloading") return false;
+    const lastProgressAt = Date.parse(model.updated_at);
+    return Number.isFinite(lastProgressAt) && Date.now() - lastProgressAt >= 90_000;
+  };
+  const modelDownloadCanResume = (model: DevelopmentModelResourceV2): boolean => (
+    model.state === "failed"
+    && model.downloaded_bytes > 0
+    && model.resolved_revision !== null
+    && model.manifest_sha256 !== null
+  );
   const [displayName, setDisplayName] = useState(project?.display_name ?? "New research project");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">(project?.config.workspace.kind ?? "scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState(project?.config.workspace.display_name ?? "Research workspace");
@@ -1599,6 +1624,7 @@ function NewProjectDialogV2({
     project?.config.execution.mode === "self-deployed" ? "huggingface" : "subscription",
   );
   const [models, setModels] = useState<readonly DevelopmentModelResourceV2[]>([]);
+  const [modelRuntime, setModelRuntime] = useState<DevelopmentModelRuntimeV2 | null>(null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(
     project?.config.execution.mode === "self-deployed"
       ? project.config.execution.model_resource_id ?? null
@@ -1616,11 +1642,14 @@ function NewProjectDialogV2({
     && provider.featureFlags.includes(BROWSER_FOLDER_SNAPSHOT_FEATURE)
     && provider.uploadWorkspaceFile !== undefined;
   const modelManagementAvailable = provider.featureFlags.includes("huggingface_model_management_v2")
-    && provider.listModelResources !== undefined;
+    && provider.listModelResources !== undefined
+    && provider.getModelRuntime !== undefined
+    && provider.retryModelRuntime !== undefined;
   const browserFolderBytes = browserFolderUploads.reduce((total, upload) => total + upload.file.size, 0);
   const baseDraftValid = displayName.trim() !== "";
   const selectedModel = models.find((model) => model.model_resource_id === selectedModelId) ?? null;
-  const executionValid = executionMode === "subscription" || selectedModel?.state === "ready";
+  const executionValid = executionMode === "subscription"
+    || (selectedModel?.state === "ready" && modelRuntime?.state === "ready");
   const valid = baseDraftValid && executionValid
     && (workspaceKind === "scratch" || sourceActionId !== null || browserFolderUploads.length > 0 || project !== null);
 
@@ -1642,6 +1671,9 @@ function NewProjectDialogV2({
     if (selectedModel?.state !== "ready" || selectedModel.resolved_revision === null) {
       throw new Error("Wait for the selected Hugging Face model to finish downloading.");
     }
+    if (modelRuntime?.state !== "ready") {
+      throw new Error("Wait for this server's vLLM runtime image to finish preparing.");
+    }
     return {
       mode: "self-deployed",
       capture_mode: "transcript",
@@ -1661,14 +1693,18 @@ function NewProjectDialogV2({
   }, [onError]);
 
   useEffect(() => {
-    if (!modelManagementAvailable || !provider.listModelResources) return;
+    if (!modelManagementAvailable || !provider.listModelResources || !provider.getModelRuntime) return;
     let stopped = false;
     let timer: ReturnType<typeof globalThis.setTimeout> | null = null;
     const load = async () => {
       try {
-        const next = await provider.listModelResources!();
+        const [next, runtime] = await Promise.all([
+          provider.listModelResources!(),
+          provider.getModelRuntime!(),
+        ]);
         if (stopped) return;
         setModels(next);
+        setModelRuntime(runtime);
         timer = globalThis.setTimeout(() => void load(), 1_500);
       } catch (error) {
         if (!stopped) onErrorRef.current(error);
@@ -1708,6 +1744,20 @@ function NewProjectDialogV2({
       );
       setModels((current) => [...current.filter((item) => item.model_resource_id !== model.model_resource_id), model]);
       setSelectedModelId(model.model_resource_id);
+    } catch (error) {
+      onError(error);
+    } finally {
+      setModelMutationBusy(false);
+    }
+  };
+
+  const retryModelRuntime = async (): Promise<void> => {
+    if (!provider.retryModelRuntime) return;
+    setModelMutationBusy(true);
+    try {
+      setModelRuntime(await provider.retryModelRuntime(
+        intentFor(snapshot, "retry-model-runtime"),
+      ));
     } catch (error) {
       onError(error);
     } finally {
@@ -1927,11 +1977,30 @@ function NewProjectDialogV2({
           <section className="project-setup-section project-model-section">
             <div className="project-setup-section-heading"><div><h3>Execution model</h3><p>Use your Codex subscription or a public vLLM-compatible Hugging Face model hosted by this server.</p></div></div>
             <div className="project-model-mode" role="radiogroup" aria-label="Execution model source">
-              <button type="button" role="radio" aria-checked={executionMode === "subscription"} className={executionMode === "subscription" ? "selected" : ""} onClick={() => setExecutionMode("subscription")}><ShieldCheck size={16} /><span><strong>Codex Subscription</strong><small>No local GPU model required</small></span></button>
-              {modelManagementAvailable ? <button type="button" role="radio" aria-checked={executionMode === "huggingface"} className={executionMode === "huggingface" ? "selected" : ""} onClick={() => setExecutionMode("huggingface")}><Server size={16} /><span><strong>Hugging Face</strong><small>Downloaded and served on this server</small></span></button> : null}
+              <button type="button" role="radio" aria-checked={executionMode === "subscription"} disabled={project !== null} className={executionMode === "subscription" ? "selected" : ""} onClick={() => setExecutionMode("subscription")}><ShieldCheck size={16} /><span><strong>Codex Subscription</strong><small>No local GPU model required</small></span></button>
+              {modelManagementAvailable ? <button type="button" role="radio" aria-checked={executionMode === "huggingface"} disabled={project !== null} className={executionMode === "huggingface" ? "selected" : ""} onClick={() => setExecutionMode("huggingface")}><Server size={16} /><span><strong>Hugging Face</strong><small>Downloaded and served on this server</small></span></button> : null}
             </div>
+            {project !== null ? <p className="project-model-guidance">Execution mode is fixed for this Project. Create a new Project to use another mode.</p> : null}
             {executionMode === "huggingface" ? (
               <div className="project-model-manager">
+                <div className={`project-model-runtime ${modelRuntime?.state ?? "queued"}`} role="status">
+                  <span className="project-model-runtime-icon">
+                    {modelRuntime?.state === "ready" ? <CheckCircle2 size={17} /> : modelRuntime?.state === "failed" ? <AlertCircle size={17} /> : <LoaderCircle className="spin" size={17} />}
+                  </span>
+                  <span>
+                    <strong>Server runtime · vLLM</strong>
+                    <small>{modelRuntime?.state === "downloading"
+                      ? "Downloading the one-time vLLM image. This is server setup, not model inference."
+                      : modelRuntime?.state === "checking"
+                        ? "Checking whether this server already has the vLLM image."
+                        : modelRuntime?.state === "ready"
+                          ? "Ready. Sessions will never download this image in the chat."
+                          : modelRuntime?.state === "failed"
+                            ? modelRuntime.error ?? "Runtime preparation failed."
+                            : "The image will be prepared automatically when a model is registered."}</small>
+                  </span>
+                  {modelRuntime?.state === "failed" ? <button type="button" className="text-button" disabled={modelMutationBusy} onClick={() => void retryModelRuntime()}>Retry runtime</button> : null}
+                </div>
                 <div className="project-model-register">
                   <input aria-label="Hugging Face repository" placeholder="owner/model" value={repositoryId} onChange={(event) => setRepositoryId(event.target.value)} />
                   <input aria-label="Hugging Face revision" placeholder="main" value={modelRevision} onChange={(event) => setModelRevision(event.target.value)} />
@@ -1942,17 +2011,27 @@ function NewProjectDialogV2({
                     const progress = model.total_bytes && model.total_bytes > 0
                       ? Math.min(100, Math.round(model.downloaded_bytes / model.total_bytes * 100))
                       : null;
+                    const stoppingStalledDownload = modelDownloadAppearsStalled(model);
+                    const resumableDownload = modelDownloadCanResume(model);
+                    const failedFromStall = model.state === "failed" && model.error?.startsWith("Model download stalled") === true;
+                    const stateLabel = stoppingStalledDownload || failedFromStall
+                      ? "Stalled"
+                      : model.state === "downloading" && progress !== null
+                        ? `${progress}%`
+                        : model.state;
                     return <div key={model.model_resource_id} className="project-model-entry">
                       <button type="button" role="radio" aria-checked={selectedModelId === model.model_resource_id} className={`project-model-option ${selectedModelId === model.model_resource_id ? "selected" : ""}`} onClick={() => setSelectedModelId(model.model_resource_id)}>
                         <span><strong>{model.repository_id}</strong><small>{model.resolved_revision?.slice(0, 10) ?? model.requested_revision}</small></span>
-                        <em className={`model-state ${model.state}`}>{model.state === "downloading" && progress !== null ? `${progress}%` : model.state}</em>
+                        <em className={`model-state ${stoppingStalledDownload || failedFromStall ? "stalled" : model.state}`}>{stateLabel}</em>
+                        {stoppingStalledDownload ? <small className="model-stall-message">No download progress for 90 seconds. The server is stopping this attempt so it can be resumed safely.</small> : null}
                         {model.error ? <small className="model-error">{model.error}</small> : null}
                       </button>
-                      {model.state === "failed" ? <button type="button" className="text-button project-model-retry" disabled={modelMutationBusy} onClick={() => void retryModel(model.model_resource_id)}>Retry</button> : null}
+                      {model.state === "failed" ? <button type="button" className="text-button project-model-retry" disabled={modelMutationBusy} onClick={() => void retryModel(model.model_resource_id)}>{resumableDownload ? "Resume download" : "Retry"}</button> : null}
                     </div>;
                   })}
                 </div>
                 {selectedModel !== null && selectedModel.state !== "ready" ? <p className="project-model-guidance">The project can be saved after this model reaches Ready.</p> : null}
+                {selectedModel?.state === "ready" && modelRuntime?.state !== "ready" ? <p className="project-model-guidance">The model is downloaded. Waiting only for the server's vLLM image setup; no Session inference has started.</p> : null}
               </div>
             ) : null}
           </section>

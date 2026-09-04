@@ -22,23 +22,13 @@ You do **not** need Git, uv, Node.js, npm, or an OpenEvo/EvoLab source checkout.
 
 ## 2. Prepare the remote Linux server
 
-The server must be reachable over SSH and have Python 3 plus standard POSIX tools. Install the Codex CLI on the server if it is not already available:
+The server must be reachable over SSH, provide `apt-get`, `dnf`, `yum`, or `apk`, and allow the selected account to use root or passwordless `sudo`. It also needs outbound HTTPS access to install dependencies, download Codex, and complete ChatGPT authentication. EvoLab automatically installs missing Python, curl, certificates, and core utilities.
 
-```bash
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+On full Ubuntu virtual machines with an NVIDIA GPU, EvoLab also automatically installs a missing recommended NVIDIA compute driver, Docker, and NVIDIA Container Toolkit, configures Docker GPU access, and grants the SSH user access. A newly installed driver can require one reboot; reboot the server once and run the same `evolab webui` command again. CPU-only servers skip these GPU packages. On container-style GPU rentals, EvoLab does not change GPU drivers, Docker configuration, services, or user permissions; these rentals must already expose a user-accessible Docker daemon with the NVIDIA runtime. GPU model serving requires enough disk and VRAM plus outbound access to Docker Hub, NVIDIA's signed package repository, and Hugging Face.
 
-Then log in as the **exact same SSH user that EvoLab will use** and authenticate Codex:
+You do not need to install or log in to Codex on the server manually. On the first `evolab webui` run, EvoLab installs the official Codex CLI for the **exact same SSH user that EvoLab will use**. It then prints a one-time device code in the terminal and opens the ChatGPT verification page on this computer. Enter the displayed code in the browser; EvoLab continues automatically after login succeeds.
 
-```bash
-ssh evolab-server
-command -v codex
-codex login --device-auth
-codex login status
-exit
-```
-
-EvoLab checks Codex authentication for this same remote user; logging in as `root` does not authenticate `ubuntu`, and vice versa.
+Device-code login must be enabled in your personal ChatGPT security settings or by your ChatGPT workspace administrator. Authentication belongs to the selected server user: logging in as `root` does not authenticate `ubuntu`, and vice versa.
 
 ## 3. Configure SSH locally
 
@@ -81,8 +71,9 @@ evolab webui
 
 - **No server is listed:** confirm `Host evolab-server` exists in `~/.ssh/config` and is not a wildcard-only entry.
 - **SSH connection fails:** run `ssh evolab-server` and fix the host, port, user, key, or server firewall first.
-- **Remote Codex is missing:** SSH to the server and check `command -v codex`.
-- **Codex is not logged in:** run `codex login --device-auth` and `codex login status` as the same SSH user configured above.
+- **Automatic preparation fails:** confirm the SSH account has root/passwordless `sudo`, a supported package manager, and outbound HTTPS access, then retry `evolab webui`.
+- **A GPU driver was installed:** reboot the GPU server once, reconnect if its public IP changed, and rerun the same `evolab webui` command. Docker and NVIDIA runtime setup will continue automatically.
+- **The device code is rejected:** enable device-code login in ChatGPT security/workspace settings and retry. Use `command -v codex`, `codex login --device-auth`, and `codex login status` as the same SSH user only for diagnostics.
 - **Python is too old:** confirm Python 3.11+ locally with `python3 --version`.
 
 ## Changes in this release

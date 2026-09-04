@@ -58,6 +58,10 @@ class HarnessAdapter(Protocol):
     @property
     def harness_id(self) -> str: ...
 
+    def check_cli_ready(self) -> None: ...
+
+    def check_subscription_ready(self) -> None: ...
+
     def check_ready(self) -> None: ...
 
     def runtime_capabilities(self) -> dict[str, Any]: ...
@@ -161,14 +165,31 @@ class CodexHarnessAdapter:
     def runtime_capabilities(self) -> dict[str, Any]:
         return {"schema_version": "1", **self._runtime_adapter.capabilities.to_dict()}
 
-    def check_ready(self) -> None:
+    def check_cli_ready(self) -> None:
+        try:
+            result = subprocess.run(
+                [self._codex_binary, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HarnessRunError(f"could not check the Codex CLI: {exc}") from exc
+        if result.returncode != 0:
+            detail = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+            raise HarnessRunError(
+                f"Codex CLI readiness failed: {detail[:500] or 'version check failed'}"
+            )
+
+    def check_subscription_ready(self) -> None:
         try:
             result = subprocess.run(
                 [self._codex_binary, "login", "status"],
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise HarnessRunError(f"could not check Codex login status: {exc}") from exc
@@ -176,6 +197,11 @@ class CodexHarnessAdapter:
         if result.returncode != 0 or "Logged in" not in status_output:
             detail = status_output.strip()[:500]
             raise HarnessRunError(f"Codex is not logged in: {detail or 'login status failed'}")
+
+    def check_ready(self) -> None:
+        """Retain the historical subscription readiness entry point."""
+
+        self.check_subscription_ready()
 
     @staticmethod
     def _canonical_json(value: object) -> str:
@@ -208,13 +234,18 @@ class CodexHarnessAdapter:
         try:
             plan = json.loads(raw_response)
         except json.JSONDecodeError as exc:
-            raise HarnessRunError("Codex returned an invalid structured workspace response") from exc
+            raise HarnessRunError(
+                "Codex returned an invalid structured workspace response"
+            ) from exc
         if not isinstance(plan, dict) or set(plan) != {"answer", "file_writes", "delete_paths"}:
             raise HarnessRunError("Codex returned an invalid structured workspace response")
         answer = plan.get("answer")
         if not isinstance(answer, str) or not answer.strip():
             raise HarnessRunError("Harness model returned an empty answer")
-        mutations = {"file_writes": plan.get("file_writes"), "delete_paths": plan.get("delete_paths")}
+        mutations = {
+            "file_writes": plan.get("file_writes"),
+            "delete_paths": plan.get("delete_paths"),
+        }
         if not isinstance(mutations["file_writes"], list) or not isinstance(
             mutations["delete_paths"], list
         ):
@@ -251,11 +282,19 @@ class CodexHarnessAdapter:
 
     @staticmethod
     def install_skills(runtime_context: Mapping[str, Any]) -> list[str]:
-        return [str(item) for item in runtime_context.get("activations", []) if "skill" in str(item).lower()]
+        return [
+            str(item)
+            for item in runtime_context.get("activations", [])
+            if "skill" in str(item).lower()
+        ]
 
     @staticmethod
     def apply_agent_system(runtime_context: Mapping[str, Any]) -> list[str]:
-        return [str(item) for item in runtime_context.get("activations", []) if "agent" in str(item).lower()]
+        return [
+            str(item)
+            for item in runtime_context.get("activations", [])
+            if "agent" in str(item).lower()
+        ]
 
     def spawn_agents(self, runtime_context: Mapping[str, Any]) -> Any:
         return self._runtime_adapter.reconcile(runtime_context.get("runtime_controls", []))
@@ -293,13 +332,22 @@ class CodexHarnessAdapter:
         if inference is not None:
             effective_model = inference["model"]
             provider_id = "openevo_self_deployed"
-            argv.extend((
-                "-c", f'model_provider="{provider_id}"',
-                "-c", f'model_providers.{provider_id}.name="OpenEvo Self-Deployed"',
-                "-c", f'model_providers.{provider_id}.base_url={json.dumps(inference["base_url"])}',
-                "-c", f'model_providers.{provider_id}.env_key="OPENAI_API_KEY"',
-                "-c", f'model_providers.{provider_id}.wire_api="responses"',
-            ))
+            argv.extend(
+                (
+                    "-c",
+                    f'model_provider="{provider_id}"',
+                    "-c",
+                    f'model_providers.{provider_id}.name="OpenEvo Self-Deployed"',
+                    "-c",
+                    f"model_providers.{provider_id}.base_url={json.dumps(inference['base_url'])}",
+                    "-c",
+                    f'model_providers.{provider_id}.env_key="OPENAI_API_KEY"',
+                    "-c",
+                    f"model_providers.{provider_id}.requires_openai_auth=false",
+                    "-c",
+                    f'model_providers.{provider_id}.wire_api="responses"',
+                )
+            )
         if effective_model:
             argv.extend(("--model", effective_model))
         argv.append("-")
@@ -414,28 +462,33 @@ class CodexHarnessAdapter:
             output_path = temporary_root / "last-message.txt"
             schema_path = temporary_root / "workspace-response.schema.json"
             schema_path.write_text(
-                self._canonical_json({
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "answer": {
-                            "type": "string",
-                            "minLength": 1,
-                            "description": "A direct, non-empty answer to the user's message.",
-                        },
-                        "file_writes": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                                "required": ["path", "content"],
+                self._canonical_json(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "answer": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "A direct, non-empty answer to the user's message.",
                             },
+                            "file_writes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "content": {"type": "string"},
+                                    },
+                                    "required": ["path", "content"],
+                                },
+                            },
+                            "delete_paths": {"type": "array", "items": {"type": "string"}},
                         },
-                        "delete_paths": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["answer", "file_writes", "delete_paths"],
-                }),
+                        "required": ["answer", "file_writes", "delete_paths"],
+                    }
+                ),
                 encoding="utf-8",
             )
             argv = self.build_command(
