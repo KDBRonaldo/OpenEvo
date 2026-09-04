@@ -128,7 +128,9 @@ Matching partial files are preserved and reused by the retry.
 
 Use `evolab webui --no-gpu` when the server has visible NVIDIA hardware but
 this EvoLab deployment must remain CPU/Codex-subscription only. The launcher
-then avoids NVIDIA probes, Docker setup, and local-model runtime changes.
+then disables self-deployed model management and avoids NVIDIA probes, Docker
+setup, and local-model runtime changes. Existing model files and unrelated
+containers are left untouched.
 
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,

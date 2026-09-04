@@ -595,6 +595,16 @@ def test_remote_lifecycle_scripts_are_bounded_and_shell_valid(action: str) -> No
         assert syntax.returncode == 0, syntax.stderr
 
 
+def test_remote_status_prefers_active_release_identity_over_stale_checkout() -> None:
+    script = remote_launcher.build_remote_lifecycle_script(action="status")
+
+    release_marker = 'if [ -f "$state_root/active-release-v1" ]; then'
+    checkout_marker = 'elif [ -d "$state_root/source/.git" ]; then'
+    assert release_marker in script
+    assert "active release: %.12s" in script
+    assert script.index(release_marker) < script.index(checkout_marker)
+
+
 @pytest.mark.parametrize("tail", [0, 2001])
 def test_remote_log_tail_is_bounded(tail: int) -> None:
     with pytest.raises(remote_launcher.LauncherError, match="--tail"):
@@ -1012,6 +1022,23 @@ def test_non_interactive_remote_script_does_not_wait_for_device_login() -> None:
     assert "allow_device_auth=0" in script
     assert 'if [ "$allow_device_auth" -ne 1 ]; then' in script
     assert "Run interactively without --non-interactive" in script
+
+
+def test_no_gpu_remote_script_disables_model_manager_during_daemon_start() -> None:
+    script = remote_launcher.build_remote_script(
+        branch="stable",
+        expected_commit="a" * 40,
+        token="daemon-token",
+        remote_port=8787,
+        evolution_model="gpt-5.5",
+        enable_self_deployed_models=False,
+    )
+
+    assert "disable_self_deployed_models=1" in script
+    assert (
+        '"OPENEVO_DISABLE_SELF_DEPLOYED_MODELS=$disable_self_deployed_models"'
+        in script
+    )
 
 
 def test_remote_script_can_only_install_source_without_starting_services() -> None:

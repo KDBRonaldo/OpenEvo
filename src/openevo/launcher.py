@@ -1556,7 +1556,13 @@ printf 'EvoLab remote development stack\\n'
 printf 'state: %s\\n' "$state_root"
 process_status "daemon" "$daemon_pid_file" "openevo.daemon.product_app" "$daemon_log_file" "scripts/dev/live_agent_daemon.py"
 process_status "web-layer" "$web_pid_file" "openevo.web_gateway.product_app" "$web_log_file" "scripts/dev/development_agent_web_layer.py"
-if [ -d "$state_root/source/.git" ]; then
+if [ -f "$state_root/active-release-v1" ]; then
+  active_release="$(cat "$state_root/active-release-v1" 2>/dev/null || true)"
+  case "$active_release" in
+    *[!0-9a-f]*|'') printf 'active release: invalid\n' ;;
+    *) printf 'active release: %.12s\n' "$active_release" ;;
+  esac
+elif [ -d "$state_root/source/.git" ]; then
   source_commit="$(git -C "$state_root/source" rev-parse --short=12 HEAD 2>/dev/null || true)"
   if [ -n "$source_commit" ]; then printf 'source commit: %s\\n' "$source_commit"; fi
 fi
@@ -1642,6 +1648,7 @@ def build_remote_script(
     browser_endpoint: str = "http://127.0.0.1:8765",
     release_id: str = "",
     allow_device_auth: bool = True,
+    enable_self_deployed_models: bool = True,
 ) -> str:
     values = {
         "branch": branch,
@@ -1659,6 +1666,7 @@ def build_remote_script(
         "release_id": release_id,
         "delivery_mode": "release" if release_id else "git",
         "allow_device_auth": "1" if allow_device_auth else "0",
+        "disable_self_deployed_models": "0" if enable_self_deployed_models else "1",
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
     prerequisite_script = build_remote_prerequisite_script(include_git=not release_id)
@@ -1738,6 +1746,7 @@ source_bundle_sha256={quoted['source_bundle_sha256']}
 prepare_runtime={quoted['prepare_runtime']}
 start_services={quoted['start_services']}
 allow_device_auth={quoted['allow_device_auth']}
+disable_self_deployed_models={quoted['disable_self_deployed_models']}
 agent_token={quoted['token']}
 remote_port={quoted['remote_port']}
 evolution_model={quoted['evolution_model']}
@@ -2048,6 +2057,7 @@ nohup env \
   "PATH=$codex_dir:$PATH" \
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
+  "OPENEVO_DISABLE_SELF_DEPLOYED_MODELS=$disable_self_deployed_models" \
   "$uv_bin" run --frozen --no-sync --python 3.11 python \
   -m openevo.daemon.product_app \
   --port "$remote_port" --codex-binary "$codex_bin" --timeout-seconds 900 \
@@ -2527,7 +2537,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-gpu",
         action="store_true",
-        help="skip NVIDIA, Docker, and local-model runtime setup on the Linux server",
+        help=(
+            "disable self-deployed models and skip NVIDIA, Docker, and local-model "
+            "runtime setup on the Linux server"
+        ),
     )
     parser.add_argument(
         "--state-root",
@@ -2771,6 +2784,7 @@ def main(argv: list[str] | None = None) -> int:
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
                 release_id=release_bundle.release_id,
                 allow_device_auth=not args.non_interactive,
+                enable_self_deployed_models=not args.no_gpu,
             ),
             open_device_auth=not args.no_open and not args.non_interactive,
         )
@@ -2806,6 +2820,7 @@ def main(argv: list[str] | None = None) -> int:
                 remote_web_port=args.remote_web_port,
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
                 allow_device_auth=not args.non_interactive,
+                enable_self_deployed_models=not args.no_gpu,
             )
             _run_remote(
                 ssh_binary,
@@ -2832,6 +2847,7 @@ def main(argv: list[str] | None = None) -> int:
             remote_web_port=args.remote_web_port,
             browser_endpoint=f"http://127.0.0.1:{args.local_port}",
             allow_device_auth=not args.non_interactive,
+            enable_self_deployed_models=not args.no_gpu,
         )
         _run_remote(
             ssh_binary,

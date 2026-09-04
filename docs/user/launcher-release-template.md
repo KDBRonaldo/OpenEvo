@@ -27,8 +27,9 @@ The server must be reachable over SSH, provide `apt-get`, `dnf`, `yum`, or `apk`
 On full Ubuntu virtual machines with an NVIDIA GPU, EvoLab also automatically installs a missing recommended NVIDIA compute driver, Docker, and NVIDIA Container Toolkit, configures Docker GPU access, and grants the SSH user access. A newly installed driver can require one reboot; reboot the server once and run the same `evolab webui` command again. CPU-only servers skip these GPU packages. On container-style GPU rentals, EvoLab does not change GPU drivers, Docker configuration, services, or user permissions; these rentals must already expose a user-accessible Docker daemon with the NVIDIA runtime. GPU model serving requires enough disk and VRAM plus outbound access to Docker Hub, NVIDIA's signed package repository, and Hugging Face.
 
 Pass `--no-gpu` for a CPU/Codex-subscription-only deployment on a host whose
-NVIDIA devices belong to other workloads. EvoLab then does not probe or modify
-the NVIDIA and Docker runtime.
+NVIDIA devices belong to other workloads. EvoLab then disables self-deployed
+model management and does not probe or modify the NVIDIA and Docker runtime.
+Existing model files and unrelated containers are left untouched.
 
 You do not need to install or log in to Codex on the server manually. On the first `evolab webui` run, EvoLab installs the official Codex CLI for the **exact same SSH user that EvoLab will use**. It then prints a one-time device code in the terminal and opens the ChatGPT verification page on this computer. Enter the displayed code in the browser; EvoLab continues automatically after login succeeds.
 
