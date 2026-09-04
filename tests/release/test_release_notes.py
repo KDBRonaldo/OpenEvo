@@ -22,7 +22,7 @@ def test_release_notes_make_the_supported_download_unambiguous() -> None:
     text = TEMPLATE.read_text(encoding="utf-8")
 
     assert "Supported local platforms" in text
-    assert "macOS and WSL" in text
+    assert "native Windows PowerShell, macOS, Linux, and WSL" in text
     assert "evolab-launcher.zip" in text
     assert "Do not download" in text
     assert "Source code (zip)" in text
@@ -75,9 +75,13 @@ def test_release_workflow_publishes_one_custom_launcher_asset() -> None:
     assert asset_lines == ["evolab-launcher.zip"]
     assert "macos-latest" in text
     assert "ubuntu-latest" in text
-    assert "windows-latest" not in text
+    assert "windows-latest" in text
     assert "wsl-install-smoke" in text
-    assert "needs: [build, macos-install-smoke, wsl-install-smoke]" in text
+    assert "windows-install-smoke" in text
+    assert (
+        "needs: [build, macos-install-smoke, wsl-install-smoke, windows-install-smoke]"
+        in text
+    )
     assert "--no-path-update" not in text
     assert "--notes-file" in text
     assert "--generate-notes" not in text
