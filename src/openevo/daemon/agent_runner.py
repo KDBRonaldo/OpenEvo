@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import threading
 from typing import Any, Protocol
 
 from openevo.backend.harness_adapter import (
@@ -21,6 +22,8 @@ from openevo.backend.harness_adapter import (
 )
 from openevo.daemon.errors import AgentRunError
 from openevo.daemon.workspace_store import ProjectWorkspaceStore
+
+_MODEL_START_PROGRESS_SECONDS = 30
 
 
 class AgentHarness(Protocol):
@@ -191,17 +194,48 @@ class AgentSessionExecutor:
                 "evolved_contexts": evolved_contexts,
             }
             if self._execution_preparer is not None:
-                if (
+                self_deployed = (
                     isinstance(request.get("execution"), dict)
                     and request["execution"].get("mode") == "self-deployed"
-                ):
+                )
+                progress_stop: threading.Event | None = None
+                progress_thread: threading.Thread | None = None
+                if self_deployed:
                     self._store.append_session_log(
                         session_id,
-                        "Starting the selected self-deployed model service.",
+                        "Starting or waiting for the selected self-deployed model service. "
+                        "Its first GPU load can take several minutes; later Sessions reuse it.",
                     )
-                inference = self._execution_preparer(request)
+                    progress_stop = threading.Event()
+
+                    def report_model_start_progress() -> None:
+                        assert progress_stop is not None
+                        while not progress_stop.wait(_MODEL_START_PROGRESS_SECONDS):
+                            self._store.append_session_log(
+                                session_id,
+                                "The self-deployed model is still loading on the GPU.",
+                            )
+
+                    progress_thread = threading.Thread(
+                        target=report_model_start_progress,
+                        name=f"openevo-model-progress-{session_id}",
+                        daemon=True,
+                    )
+                    progress_thread.start()
+                try:
+                    inference = self._execution_preparer(request)
+                finally:
+                    if progress_stop is not None:
+                        progress_stop.set()
+                    if progress_thread is not None:
+                        progress_thread.join(timeout=1)
                 if inference is not None:
                     execution_request["inference"] = inference
+                    if self_deployed:
+                        self._store.append_session_log(
+                            session_id,
+                            "The self-deployed model is ready; starting the Codex harness.",
+                        )
             result = self._runner.run(
                 execution_request,
                 cancellation=cancellation,

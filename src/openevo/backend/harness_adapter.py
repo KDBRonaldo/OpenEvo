@@ -9,6 +9,7 @@ session lifecycle on harness names.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+import hashlib
 import json
 import mimetypes
 import os
@@ -25,6 +26,13 @@ MAX_HARNESS_IMAGE_ATTACHMENTS = 8
 MAX_HARNESS_IMAGE_FILE_BYTES = 10 * 1024 * 1024
 MAX_HARNESS_IMAGE_BYTES = 32 * 1024 * 1024
 HARNESS_IMAGE_MEDIA_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
+_RUNTIME_PRIVATE_ROOTS = frozenset({".agents", ".git", ".openevo"})
+_RUNTIME_EPHEMERAL_PARTS = frozenset(
+    {".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__"}
+)
+_MAX_AGENT_MUTATIONS = 64
+_MAX_AGENT_WRITE_FILE_BYTES = 192 * 1024
+_MAX_AGENT_WRITE_BYTES = 256 * 1024
 
 
 class HarnessRunError(RuntimeError):
@@ -303,11 +311,12 @@ class CodexHarnessAdapter:
         self,
         *,
         runtime_context: Mapping[str, Any],
-        schema_path: Path,
+        schema_path: Path | None,
         output_path: Path,
         image_paths: list[Path] | None = None,
         inference: Mapping[str, str] | None = None,
     ) -> list[str]:
+        agentic = inference is not None
         argv = [
             self._codex_binary,
             "exec",
@@ -315,17 +324,20 @@ class CodexHarnessAdapter:
             "--ignore-user-config",
             "--ephemeral",
             "--sandbox",
-            "read-only",
-            "--disable",
-            "shell_tool",
+            "workspace-write" if agentic else "read-only",
             "--skip-git-repo-check",
             "--cd",
             os.fspath(runtime_context["workspace_path"]),
-            "--output-schema",
-            os.fspath(schema_path),
             "--output-last-message",
             os.fspath(output_path),
         ]
+        if agentic:
+            argv.extend(("-c", 'approval_policy="never"'))
+        else:
+            argv.extend(("--disable", "shell_tool"))
+            if schema_path is None:
+                raise HarnessRunError("structured Codex execution requires an output schema")
+            argv.extend(("--output-schema", os.fspath(schema_path)))
         for image_path in image_paths or []:
             argv.extend(("--image", os.fspath(image_path)))
         effective_model = self._model
@@ -346,6 +358,12 @@ class CodexHarnessAdapter:
                     f"model_providers.{provider_id}.requires_openai_auth=false",
                     "-c",
                     f'model_providers.{provider_id}.wire_api="responses"',
+                    "-c",
+                    f"model_providers.{provider_id}.request_max_retries=1",
+                    "-c",
+                    f"model_providers.{provider_id}.stream_max_retries=1",
+                    "-c",
+                    f"model_providers.{provider_id}.stream_idle_timeout_ms=120000",
                 )
             )
         if effective_model:
@@ -388,6 +406,7 @@ class CodexHarnessAdapter:
         stdout: str,
         stderr: str,
         output_path: Path,
+        structured: bool = True,
     ) -> tuple[dict[str, Any], list[str]]:
         if len(stdout.encode("utf-8")) + len(stderr.encode("utf-8")) > self._max_capture_bytes:
             raise HarnessRunError("Codex process output exceeded the development safety limit")
@@ -402,7 +421,129 @@ class CodexHarnessAdapter:
             raise HarnessRunError("Codex published an empty final response")
         if len(raw_response.encode("utf-8")) > self._max_response_bytes:
             raise HarnessRunError("Codex final response exceeded the development safety limit")
-        return self._parse_workspace_plan(raw_response), self._extract_event_logs(stdout)
+        if structured:
+            plan = self._parse_workspace_plan(raw_response)
+        else:
+            answer = raw_response
+            try:
+                maybe_plan = json.loads(raw_response)
+            except json.JSONDecodeError:
+                maybe_plan = None
+            if isinstance(maybe_plan, dict) and isinstance(maybe_plan.get("answer"), str):
+                answer = maybe_plan["answer"]
+            if not answer.strip():
+                raise HarnessRunError("Harness model returned an empty answer")
+            plan = {
+                "answer": answer.strip(),
+                "mutations": {"file_writes": [], "delete_paths": []},
+            }
+        return plan, self._extract_event_logs(stdout)
+
+    @staticmethod
+    def _is_runtime_private_path(relative: Path, protected_paths: set[str]) -> bool:
+        if not relative.parts:
+            return True
+        if relative.parts[0] in _RUNTIME_PRIVATE_ROOTS:
+            return True
+        if any(part in _RUNTIME_EPHEMERAL_PARTS for part in relative.parts):
+            return True
+        identity = relative.as_posix()
+        return any(
+            identity == protected or identity.startswith(f"{protected}/")
+            for protected in protected_paths
+        )
+
+    @classmethod
+    def _runtime_inventory(
+        cls,
+        workspace_path: Path,
+        protected_paths: set[str],
+    ) -> dict[str, tuple[int, str]]:
+        inventory: dict[str, tuple[int, str]] = {}
+        for candidate in sorted(workspace_path.rglob("*")):
+            relative = candidate.relative_to(workspace_path)
+            if cls._is_runtime_private_path(relative, protected_paths):
+                continue
+            if candidate.is_symlink():
+                raise HarnessRunError(
+                    f"Codex created an unsupported workspace symlink: {relative.as_posix()}"
+                )
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise HarnessRunError(
+                    f"Codex created an unsupported workspace entry: {relative.as_posix()}"
+                )
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with candidate.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        size += len(chunk)
+                        digest.update(chunk)
+            except OSError as exc:
+                raise HarnessRunError(
+                    f"could not inspect Codex workspace output: {relative.as_posix()}"
+                ) from exc
+            inventory[relative.as_posix()] = (size, digest.hexdigest())
+        return inventory
+
+    @classmethod
+    def _collect_runtime_mutations(
+        cls,
+        workspace_path: Path,
+        before: Mapping[str, tuple[int, str]],
+        protected_paths: set[str],
+    ) -> tuple[dict[str, list[Any]], list[str]]:
+        after = cls._runtime_inventory(workspace_path, protected_paths)
+        delete_paths = sorted(set(before) - set(after))
+        changed_paths = sorted(
+            path for path, identity in after.items() if before.get(path) != identity
+        )
+        if len(delete_paths) + len(changed_paths) > _MAX_AGENT_MUTATIONS:
+            raise HarnessRunError("Codex changed too many workspace files")
+
+        file_writes: list[dict[str, str]] = []
+        skipped_binary: list[str] = []
+        total_bytes = 0
+        for relative_path in changed_paths:
+            size = after[relative_path][0]
+            if size > _MAX_AGENT_WRITE_FILE_BYTES:
+                try:
+                    with (workspace_path / Path(relative_path)).open("rb") as stream:
+                        prefix = stream.read(8192)
+                    prefix.decode("utf-8")
+                except UnicodeDecodeError:
+                    skipped_binary.append(relative_path)
+                    continue
+                except OSError as exc:
+                    raise HarnessRunError(
+                        f"could not read Codex workspace output: {relative_path}"
+                    ) from exc
+                if b"\x00" in prefix:
+                    skipped_binary.append(relative_path)
+                    continue
+                raise HarnessRunError(
+                    f"Codex changed a workspace file that is too large: {relative_path}"
+                )
+            try:
+                payload = (workspace_path / Path(relative_path)).read_bytes()
+                if b"\x00" in payload:
+                    skipped_binary.append(relative_path)
+                    continue
+                content = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                skipped_binary.append(relative_path)
+                continue
+            except OSError as exc:
+                raise HarnessRunError(
+                    f"could not read Codex workspace output: {relative_path}"
+                ) from exc
+            total_bytes += len(payload)
+            if total_bytes > _MAX_AGENT_WRITE_BYTES:
+                raise HarnessRunError("Codex produced too much workspace output")
+            file_writes.append({"path": relative_path, "content": content})
+        return {"file_writes": file_writes, "delete_paths": delete_paths}, skipped_binary
 
     def run(
         self,
@@ -433,6 +574,7 @@ class CodexHarnessAdapter:
             workspace_context = self._workspace_context(request.get("workspace_snapshot"))
             image_paths = self._image_attachments(runtime_context)
             inference = request.get("inference")
+            agentic = isinstance(inference, Mapping)
             model_identity = ""
             if isinstance(inference, Mapping):
                 model_identity = (
@@ -440,56 +582,82 @@ class CodexHarnessAdapter:
                     "Use that exact identifier if the user asks which model is serving this "
                     "session. "
                 )
-            prompt = (
-                "You are planning changes for a persistent OpenEvo project workspace. "
-                "The trusted daemon, not you, applies file mutations after validating them. "
-                "Do not call shell, patch, or filesystem tools. The supplied workspace JSON is a "
-                "bounded index containing text and daemon-extracted document projections. Attached "
-                "workspace images are available as visual inputs. Solve the user's task and return "
-                "only the requested structured result. The answer field must contain a direct, "
-                "non-empty answer to the user's message. "
-                f"{model_identity}"
-                "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
-                "changed in file_writes. Put only regular files that must be removed in delete_paths. "
-                "Do not include unchanged files and do not use absolute paths or '..'. "
-                "Do not return OpenEvo runtime files under .openevo or injected skills under "
-                ".agents/skills as workspace mutations. If no file change is needed, return empty arrays.\n\n"
-                f"Project: {request['project_name']}\n"
-                f"Session: {request['task_title']}\n\n"
-                f"{memory_sections}Current workspace JSON:\n{workspace_context}\n\n"
-                f"User message:\n{request['instruction']}\n"
-            )
+            if agentic:
+                prompt = (
+                    "Work on the user's task as a normal coding agent. You are inside an isolated "
+                    "copy of the OpenEvo project workspace, so inspect files, run useful commands, "
+                    "and use apply_patch to create or edit text files when needed. OpenEvo will "
+                    "validate and commit your resulting text-file changes after the run. Do not access paths "
+                    "outside the workspace, and do not modify .git, .openevo, or .agents. Avoid "
+                    "leaving build artifacts or caches in the workspace. Finish with a concise, "
+                    "direct answer describing the completed result. "
+                    f"{model_identity}\n\n"
+                    f"Project: {request['project_name']}\n"
+                    f"Session: {request['task_title']}\n\n"
+                    f"{memory_sections}User message:\n{request['instruction']}\n"
+                )
+            else:
+                prompt = (
+                    "You are planning changes for a persistent OpenEvo project workspace. "
+                    "The trusted daemon, not you, applies file mutations after validating them. "
+                    "Do not call shell, patch, or filesystem tools. The supplied workspace JSON is a "
+                    "bounded index containing text and daemon-extracted document projections. Attached "
+                    "workspace images are available as visual inputs. Solve the user's task and return "
+                    "only the requested structured result. The answer field must contain a direct, "
+                    "non-empty answer to the user's message. "
+                    f"{model_identity}"
+                    "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
+                    "changed in file_writes. Put only regular files that must be removed in delete_paths. "
+                    "Do not include unchanged files and do not use absolute paths or '..'. "
+                    "Do not return OpenEvo runtime files under .openevo or injected skills under "
+                    ".agents/skills as workspace mutations. If no file change is needed, return empty arrays.\n\n"
+                    f"Project: {request['project_name']}\n"
+                    f"Session: {request['task_title']}\n\n"
+                    f"{memory_sections}Current workspace JSON:\n{workspace_context}\n\n"
+                    f"User message:\n{request['instruction']}\n"
+                )
             output_path = temporary_root / "last-message.txt"
-            schema_path = temporary_root / "workspace-response.schema.json"
-            schema_path.write_text(
-                self._canonical_json(
-                    {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "answer": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "A direct, non-empty answer to the user's message.",
-                            },
-                            "file_writes": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "path": {"type": "string"},
-                                        "content": {"type": "string"},
-                                    },
-                                    "required": ["path", "content"],
+            schema_path = None if agentic else temporary_root / "workspace-response.schema.json"
+            if schema_path is not None:
+                schema_path.write_text(
+                    self._canonical_json(
+                        {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "answer": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "A direct, non-empty answer to the user's message.",
                                 },
+                                "file_writes": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "path": {"type": "string"},
+                                            "content": {"type": "string"},
+                                        },
+                                        "required": ["path", "content"],
+                                    },
+                                },
+                                "delete_paths": {"type": "array", "items": {"type": "string"}},
                             },
-                            "delete_paths": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["answer", "file_writes", "delete_paths"],
-                    }
-                ),
-                encoding="utf-8",
+                            "required": ["answer", "file_writes", "delete_paths"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            protected_paths = {
+                str(path)
+                for path in runtime_context.get("protected_paths", [])
+                if isinstance(path, str) and path
+            }
+            runtime_before = (
+                self._runtime_inventory(runtime_context["workspace_path"], protected_paths)
+                if agentic
+                else {}
             )
             argv = self.build_command(
                 runtime_context=runtime_context,
@@ -525,6 +693,7 @@ class CodexHarnessAdapter:
                     stdout=completed.stdout,
                     stderr=completed.stderr,
                     output_path=output_path,
+                    structured=not agentic,
                 )
                 process = None
             else:
@@ -533,6 +702,7 @@ class CodexHarnessAdapter:
                     prompt=prompt,
                     environment=environment,
                     cancellation=cancellation,
+                    progress=emit,
                 )
                 stdout, stderr = process[1], process[2]
                 plan, event_logs = self.collect_transcript(
@@ -540,6 +710,12 @@ class CodexHarnessAdapter:
                     stdout=stdout,
                     stderr=stderr,
                     output_path=output_path,
+                    structured=not agentic,
+                )
+            skipped_binary: list[str] = []
+            if agentic:
+                plan["mutations"], skipped_binary = self._collect_runtime_mutations(
+                    runtime_context["workspace_path"], runtime_before, protected_paths
                 )
         duration_ms = round((time.monotonic() - started) * 1000)
         return {
@@ -563,6 +739,14 @@ class CodexHarnessAdapter:
                     for decision in runtime_activation.decisions
                 ],
                 *event_logs,
+                *(
+                    [
+                        "Codex produced non-text runtime artifacts that were not committed: "
+                        + ", ".join(skipped_binary[:8])
+                    ]
+                    if skipped_binary
+                    else []
+                ),
                 f"Codex completed the session in {duration_ms} ms.",
             ],
         }
@@ -574,6 +758,7 @@ class CodexHarnessAdapter:
         prompt: str,
         environment: Mapping[str, str],
         cancellation: HarnessCancellation,
+        progress: Callable[[str], None] | None = None,
     ) -> tuple[subprocess.Popen[str], str, str]:
         cancellation.raise_if_requested()
         try:
@@ -590,17 +775,31 @@ class CodexHarnessAdapter:
             raise HarnessRunError(f"Codex could not be started: {exc}") from exc
         cancellation.bind(process)
         try:
-            try:
-                stdout, stderr = process.communicate(prompt, timeout=self._timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                HarnessCancellation._terminate(process)
+            deadline = time.monotonic() + self._timeout_seconds
+            first_communicate = True
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    HarnessCancellation._terminate(process)
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise HarnessRunError(f"Codex exceeded the {self._timeout_seconds}s timeout")
                 try:
-                    process.wait(timeout=5)
+                    stdout, stderr = process.communicate(
+                        prompt if first_communicate else None,
+                        timeout=min(30, remaining),
+                    )
+                    break
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                raise HarnessRunError(
-                    f"Codex exceeded the {self._timeout_seconds}s timeout"
-                ) from exc
+                    first_communicate = False
+                    cancellation.raise_if_requested()
+                    if progress is not None:
+                        elapsed = round(self._timeout_seconds - remaining + min(30, remaining))
+                        progress(
+                            f"Codex is still working with the self-deployed model ({elapsed}s)."
+                        )
         finally:
             cancellation.release(process)
         cancellation.raise_if_requested()

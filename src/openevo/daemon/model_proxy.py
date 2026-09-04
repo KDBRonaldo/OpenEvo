@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import select
+import socket
 import threading
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -15,47 +17,7 @@ from openevo.gateway.transform.openai_responses import OpenAIResponsesTransforme
 
 _MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 32 * 1024 * 1024
-
-
-def _response_to_stream_chunk(response: dict[str, Any]) -> dict[str, Any]:
-    choices = response.get("choices") or [{}]
-    choice = choices[0]
-    message = choice.get("message", {}) or {}
-    tool_calls = []
-    for index, tool_call in enumerate(message.get("tool_calls") or []):
-        function = tool_call.get("function", {}) or {}
-        tool_calls.append(
-            {
-                "index": index,
-                "id": tool_call.get("id"),
-                "type": tool_call.get("type", "function"),
-                "function": {
-                    "name": function.get("name", ""),
-                    "arguments": function.get("arguments", ""),
-                },
-            }
-        )
-    delta: dict[str, Any] = {"role": "assistant"}
-    if message.get("content") is not None:
-        delta["content"] = message["content"]
-    if message.get("reasoning_content") is not None:
-        delta["reasoning_content"] = message["reasoning_content"]
-    if tool_calls:
-        delta["tool_calls"] = tool_calls
-    return {
-        "id": response.get("id"),
-        "object": "chat.completion.chunk",
-        "created": response.get("created"),
-        "model": response.get("model"),
-        "choices": [
-            {
-                "index": 0,
-                "delta": delta,
-                "finish_reason": choice.get("finish_reason"),
-            }
-        ],
-        "usage": response.get("usage"),
-    }
+_DEFAULT_MAX_TOKENS = 1024
 
 
 class ManagedModelProxy:
@@ -84,6 +46,7 @@ class ManagedModelProxy:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "OpenEvoModelProxy/1"
+            protocol_version = "HTTP/1.1"
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -143,14 +106,19 @@ class ManagedModelProxy:
                 transformed["_openevo_model_served"] = proxy._model
                 chat_request = transformer.transform_request(transformed)
                 chat_request["model"] = proxy._model
-                streaming = bool(chat_request.pop("stream", False))
+                streaming = bool(chat_request.get("stream", False))
+                chat_request.setdefault("temperature", 0.0)
+                chat_request.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
+                chat_request["parallel_tool_calls"] = False
+                if streaming:
+                    chat_request["stream"] = True
+                    chat_request["stream_options"] = {"include_usage": True}
+                    self._stream_responses(transformer, original, chat_request)
+                    return
                 chat_request.pop("stream_options", None)
                 chat_request["stream"] = False
-                chat_request.setdefault("temperature", 0.0)
                 try:
-                    status, payload = proxy._upstream(
-                        "POST", "/chat/completions", chat_request
-                    )
+                    status, payload = proxy._upstream("POST", "/chat/completions", chat_request)
                 except RuntimeError as exc:
                     self._json(502, {"error": {"message": str(exc)}})
                     return
@@ -164,20 +132,84 @@ class ManagedModelProxy:
                 except (json.JSONDecodeError, ValueError):
                     self._json(502, {"error": {"message": "Invalid vLLM response"}})
                     return
-                if not streaming:
-                    self._json(200, transformer.transform_response(response, original))
+                self._json(200, transformer.transform_response(response, original))
+
+            def _stream_responses(
+                self,
+                transformer: OpenAIResponsesTransformer,
+                original: dict[str, Any],
+                chat_request: dict[str, Any],
+            ) -> None:
+                try:
+                    response = proxy._open_upstream("POST", "/chat/completions", chat_request)
+                except HTTPError as exc:
+                    payload = exc.read(_MAX_RESPONSE_BYTES + 1)[:_MAX_RESPONSE_BYTES]
+                    self._raw(int(exc.code), payload, "application/json")
                     return
-                state = transformer.create_stream_state(original)
-                events = state.process_chunk(
-                    _response_to_stream_chunk(response), is_first=True
-                )
-                events.extend(state.finalize())
-                output = "".join(
-                    f"event: {event.get('type', 'unknown')}\n"
-                    f"data: {json.dumps(event, default=str)}\n\n"
-                    for event in events
-                ).encode("utf-8")
-                self._raw(200, output, "text/event-stream")
+                except (OSError, URLError):
+                    self._json(502, {"error": {"message": "vLLM is unavailable"}})
+                    return
+
+                with response:
+                    status = int(getattr(response, "status", 200))
+                    if status < 200 or status >= 300:
+                        payload = response.read(_MAX_RESPONSE_BYTES + 1)[:_MAX_RESPONSE_BYTES]
+                        self._raw(status, payload, "application/json")
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.close_connection = True
+                    state = transformer.create_stream_state(original)
+                    first = True
+                    try:
+                        for raw_line in response:
+                            if self._client_disconnected():
+                                return
+                            if isinstance(raw_line, str):
+                                line = raw_line.strip()
+                            else:
+                                line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(chunk, dict):
+                                continue
+                            events = state.process_chunk(chunk, is_first=first)
+                            first = False
+                            for event in events:
+                                self._write_sse(event)
+                        if first:
+                            for event in state.process_chunk({"choices": []}, is_first=True):
+                                self._write_sse(event)
+                        for event in state.finalize():
+                            self._write_sse(event)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        # Closing the upstream response propagates Codex cancellation to vLLM.
+                        return
+
+            def _client_disconnected(self) -> bool:
+                try:
+                    readable, _, _ = select.select([self.connection], [], [], 0)
+                    if not readable:
+                        return False
+                    return not self.connection.recv(1, socket.MSG_PEEK)
+                except (BlockingIOError, OSError, ValueError):
+                    return True
+
+            def _write_sse(self, event: dict[str, Any]) -> None:
+                event_type = event.get("type", "unknown")
+                payload = json.dumps(event, default=str, separators=(",", ":"))
+                self.wfile.write(f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
 
             def _json(self, status: int, body: dict[str, Any]) -> None:
                 self._raw(
@@ -191,7 +223,9 @@ class ManagedModelProxy:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
                 self.end_headers()
+                self.close_connection = True
                 self.wfile.write(body)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -217,12 +251,15 @@ class ManagedModelProxy:
                     "description": "OpenEvo daemon-managed Hugging Face model",
                     "base_instructions": (
                         "You are an OpenEvo coding agent. Work carefully in the user's "
-                        "workspace, use the provided tools when needed, preserve unrelated "
-                        "changes, and give a concise final answer when the task is complete."
+                        "workspace. Use exec_command to inspect files and run tests, and use "
+                        "apply_patch to create or edit text files. Preserve unrelated changes "
+                        "and give a concise final answer when the task is complete."
                     ),
                     "prefer_websockets": False,
                     "support_verbosity": False,
                     "default_verbosity": None,
+                    # The proxy adapts Codex's freeform patch call to a standard Chat function
+                    # for open-source providers, then restores the Responses custom-tool event.
                     "apply_patch_tool_type": "freeform",
                     "web_search_tool_type": "text_and_image",
                     "input_modalities": ["text"],
@@ -266,18 +303,9 @@ class ManagedModelProxy:
             ]
         }
 
-    def _upstream(
-        self, method: str, path: str, body: dict[str, Any] | None
-    ) -> tuple[int, bytes]:
-        data = None if body is None else json.dumps(body).encode("utf-8")
-        request = Request(
-            f"{self._upstream_base_url}{path}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method=method,
-        )
+    def _upstream(self, method: str, path: str, body: dict[str, Any] | None) -> tuple[int, bytes]:
         try:
-            response = self._opener(request, timeout=900)
+            response = self._open_upstream(method, path, body)
             with response:
                 payload = response.read(_MAX_RESPONSE_BYTES + 1)
                 if len(payload) > _MAX_RESPONSE_BYTES:
@@ -288,6 +316,16 @@ class ManagedModelProxy:
             return int(exc.code), payload[:_MAX_RESPONSE_BYTES]
         except (OSError, URLError) as exc:
             raise RuntimeError("vLLM is unavailable") from exc
+
+    def _open_upstream(self, method: str, path: str, body: dict[str, Any] | None) -> Any:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = Request(
+            f"{self._upstream_base_url}{path}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        return self._opener(request, timeout=900)
 
     def close(self) -> None:
         server, thread = self._server, self._thread

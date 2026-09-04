@@ -691,6 +691,7 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
     assert '"$HOME"/.nvm/versions/node/*/bin/codex' in script
     assert '"PATH=$codex_dir:$PATH"' in script
     assert '--codex-binary "$codex_bin"' in script
+    assert "--timeout-seconds 900" in script
     assert "-m openevo.daemon.product_app" in script
     assert "*scripts/dev/live_agent_daemon.py*" in script
     assert "Refusing to modify an unrecognized path" in script

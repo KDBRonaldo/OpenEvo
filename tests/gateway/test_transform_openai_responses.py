@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from openevo.gateway.transform.reasoning import encrypt_reasoning
 from openevo.gateway.transform.openai_responses import OpenAIResponsesTransformer
 
@@ -174,9 +176,7 @@ def test_responses_request_moves_image_function_output_to_user_message() -> None
         {"role": "tool", "tool_call_id": "call-1", "content": ""},
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": IMAGE_URL, "detail": "high"}}
-            ],
+            "content": [{"type": "image_url", "image_url": {"url": IMAGE_URL, "detail": "high"}}],
         },
     ]
 
@@ -195,6 +195,72 @@ def test_responses_request_drops_tool_choice_when_tools_are_empty() -> None:
     assert transformed["messages"] == [{"role": "user", "content": "hello"}]
     assert "tool_choice" not in transformed
     assert "tools" not in transformed
+
+
+def test_responses_request_adapts_apply_patch_custom_tool_and_history() -> None:
+    transformer = OpenAIResponsesTransformer()
+    transformed = transformer.transform_request(
+        {
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "patch-1",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "patch-1",
+                    "output": "Done!",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                }
+            ],
+        }
+    )
+
+    assert transformed["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a patch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": "Complete apply_patch patch text.",
+                        }
+                    },
+                    "required": ["input"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    assert transformed["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "patch-1",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": '{"input": "*** Begin Patch\\n*** End Patch"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "patch-1", "content": "Done!"},
+    ]
 
 
 def test_responses_request_converts_nested_function_schema_and_preserves_strict() -> None:
@@ -676,6 +742,52 @@ def test_responses_stream_state_emits_response_events_for_text_and_tools() -> No
     assert events[-1]["response"]["output"][1]["arguments"] == '{"q": "x"}'
 
 
+def test_responses_stream_state_restores_apply_patch_as_custom_tool_call() -> None:
+    transformer = OpenAIResponsesTransformer()
+    state = transformer.create_stream_state(
+        {
+            "model": "requested-model",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+        }
+    )
+    patch = "*** Begin Patch\n*** Add File: result.txt\n+ok\n*** End Patch"
+    events = state.process_chunk(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "patch-1",
+                                "function": {
+                                    "name": "apply_patch",
+                                    "arguments": json.dumps({"input": patch}),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+        is_first=True,
+    )
+    events.extend(state.finalize())
+
+    custom_done = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.done"
+        and event["item"]["type"] == "custom_tool_call"
+    ]
+    assert len(custom_done) == 1
+    assert custom_done[0]["item"]["call_id"] == "patch-1"
+    assert custom_done[0]["item"]["name"] == "apply_patch"
+    assert custom_done[0]["item"]["input"] == patch
+    assert events[-1]["response"]["output"] == [custom_done[0]["item"]]
+
+
 def test_responses_stream_state_emits_text_only_response() -> None:
     transformer = OpenAIResponsesTransformer()
     state = transformer.create_stream_state({"model": "requested-model"})
@@ -700,9 +812,7 @@ def test_responses_stream_state_emits_text_only_response() -> None:
     assert types.count("response.output_item.added") == 1
     assert types.count("response.output_item.done") == 1
     added_item_types = [
-        event["item"]["type"]
-        for event in events
-        if event["type"] == "response.output_item.added"
+        event["item"]["type"] for event in events if event["type"] == "response.output_item.added"
     ]
     assert added_item_types == ["message"]
     assert "response.reasoning_summary_text.delta" not in types
@@ -726,9 +836,7 @@ def test_responses_stream_state_emits_reasoning_only_response() -> None:
     events.extend(
         state.process_chunk(
             {
-                "choices": [
-                    {"delta": {"reasoning_content": "harder."}, "finish_reason": "stop"}
-                ],
+                "choices": [{"delta": {"reasoning_content": "harder."}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
             }
         )
@@ -747,9 +855,7 @@ def test_responses_stream_state_emits_reasoning_only_response() -> None:
     assert "response.function_call_arguments.delta" not in types
 
     added_item_types = [
-        event["item"]["type"]
-        for event in events
-        if event["type"] == "response.output_item.added"
+        event["item"]["type"] for event in events if event["type"] == "response.output_item.added"
     ]
     assert added_item_types == ["reasoning"]
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
+import openevo.daemon.agent_runner as agent_runner_module
 from openevo.backend.harness_adapter import (
     HarnessCancellation,
     HarnessRunCancelled,
@@ -103,6 +105,37 @@ def test_agent_session_executor_commits_workspace_and_result(tmp_path: Path) -> 
     assert (store.workspace_path("project-1") / "answer.txt").read_text(
         encoding="utf-8"
     ) == "persistent answer\n"
+
+
+def test_agent_session_executor_reports_self_deployed_model_start_progress(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    store = _Store(tmp_path)
+    monkeypatch.setattr(agent_runner_module, "_MODEL_START_PROGRESS_SECONDS", 0.01)
+
+    class Runner:
+        def run(self, request: dict[str, Any], **_: Any) -> dict[str, Any]:
+            assert request["inference"]["model"] == "local-model"
+            return {"response": "Done", "model": "local-model", "duration_ms": 5, "logs": []}
+
+    def prepare(_: dict[str, Any]) -> dict[str, str]:
+        time.sleep(0.04)
+        return {"base_url": "http://127.0.0.1:1/v1", "model": "local-model"}
+
+    AgentSessionExecutor(
+        store=store,
+        runner=Runner(),
+        execution_preparer=prepare,
+    ).execute(
+        "session-1",
+        {**REQUEST, "execution": {"mode": "self-deployed"}},
+        HarnessCancellation(),
+    )
+
+    assert store.logs[0].startswith("Starting or waiting")
+    assert "The self-deployed model is still loading on the GPU." in store.logs
+    assert store.logs[-1] == "The self-deployed model is ready; starting the Codex harness."
 
 
 def test_agent_session_executor_uses_project_head_pinned_context(tmp_path: Path) -> None:

@@ -388,6 +388,7 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "reference.png").write_bytes(b"small image fixture")
+    (workspace / "old.txt").write_text("remove me\n", encoding="utf-8")
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["prompt"] = str(kwargs["input"])
@@ -398,19 +399,14 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
         captured["skill_md"] = next(
             (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
         ).read_text(encoding="utf-8")
-        schema_path = Path(args[args.index("--output-schema") + 1])
-        captured["schema"] = json.loads(schema_path.read_text(encoding="utf-8"))
+        (runtime_workspace / "answer.py").write_text("print(4)\n", encoding="utf-8")
+        (runtime_workspace / "old.txt").unlink()
+        (runtime_workspace / "artifact.bin").write_bytes(b"\x00\x01\x02")
+        (runtime_workspace / ".pytest_cache").mkdir()
+        (runtime_workspace / ".pytest_cache" / "state").write_text("ignored")
+        (runtime_workspace / "AGENTS.md").write_text("runtime-only edit", encoding="utf-8")
         output_path = Path(args[args.index("--output-last-message") + 1])
-        output_path.write_text(
-            json.dumps(
-                {
-                    "answer": "The next answer used prior memory.",
-                    "file_writes": [{"path": "answer.py", "content": "print(4)\n"}],
-                    "delete_paths": [],
-                }
-            ),
-            encoding="utf-8",
-        )
+        output_path.write_text("The next answer used prior memory.", encoding="utf-8")
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -476,22 +472,29 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert captured["agents_md"] == "# Native evolved agent system\n\nFollow the project policy."
     assert captured["skill_md"].startswith("---\nname: skill-artifact-1\ndescription: ")
     assert "\n---\n\n# Native evolved skill\n" in captured["skill_md"]
-    assert "persistent OpenEvo project workspace" in captured["prompt"]
+    assert "normal coding agent" in captured["prompt"]
     assert "trusted runtime model identifier is OpenEvo/Fixture-0.1B" in captured["prompt"]
-    assert captured["schema"]["properties"]["answer"]["minLength"] == 1
-    assert "read-only" in captured["args"]
-    assert "shell_tool" in captured["args"]
+    assert captured["args"][captured["args"].index("--sandbox") + 1] == "workspace-write"
+    assert "shell_tool" not in captured["args"]
     assert "--image" in captured["args"]
     assert captured["args"][captured["args"].index("--image") + 1].endswith("/reference.png")
-    assert "daemon-extracted document projections" in captured["prompt"]
     assert "--ignore-rules" not in captured["args"]
-    assert "--output-schema" in captured["args"]
+    assert "--output-schema" not in captured["args"]
+    assert 'approval_policy="never"' in captured["args"]
     assert captured["args"][captured["args"].index("--model") + 1] == "OpenEvo/Fixture-0.1B"
     assert 'model_provider="openevo_self_deployed"' in captured["args"]
     assert "model_providers.openevo_self_deployed.requires_openai_auth=false" in captured["args"]
+    assert (
+        "model_providers.openevo_self_deployed.stream_idle_timeout_ms=120000" in captured["args"]
+    )
     assert any("http://127.0.0.1:18432/v1" in value for value in captured["args"])
     assert captured["env"]["OPENAI_API_KEY"] == "openevo-local"
     assert result["model"] == "OpenEvo/Fixture-0.1B"
+    assert result["file_mutations"] == {
+        "file_writes": [{"path": "answer.py", "content": "print(4)\n"}],
+        "delete_paths": ["old.txt"],
+    }
+    assert any("artifact.bin" in message for message in result["logs"])
     assert Path(captured["args"][captured["args"].index("--cd") + 1]) != workspace
     assert captured["env"]["OPENEVO_MEMORY_FILE"].endswith("/memory.md")
     assert captured["env"]["OPENEVO_SKILLS_DIR"].endswith("/.agents/skills")
@@ -1569,6 +1572,40 @@ def test_daemon_v2_model_routes_keep_download_authority_server_side(
         ("retry", "model-fixture", "retry-model"),
         ("retry-runtime", "retry-runtime"),
     ]
+
+
+def test_daemon_prewarms_a_ready_self_deployed_project_model(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    warmed = threading.Event()
+
+    class ReadyModels:
+        def get(self, model_resource_id: str) -> dict[str, object]:
+            assert model_resource_id == "model-ready"
+            return {"state": "ready"}
+
+        def runtime_status(self) -> dict[str, object]:
+            return {"state": "ready"}
+
+        def prepare_inference(self, model_resource_id: str) -> dict[str, str]:
+            assert model_resource_id == "model-ready"
+            warmed.set()
+            return {"model": "fixture/model", "base_url": "http://127.0.0.1:1/v1"}
+
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0), "p" * 32, object(), store, None, ReadyModels()
+    )
+    try:
+        server.warm_project_model(
+            {
+                "execution": {
+                    "mode": "self-deployed",
+                    "model_resource_id": "model-ready",
+                }
+            }
+        )
+        assert warmed.wait(2)
+    finally:
+        server.server_close()
 
 
 def test_daemon_v2_capabilities_follow_the_persisted_project_execution_mode(

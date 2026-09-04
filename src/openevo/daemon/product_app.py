@@ -165,9 +165,7 @@ DAEMON_V2_DEVELOPMENT_CAPABILITIES_PATH = "/v2/development/capabilities"
 DAEMON_V2_DEVELOPMENT_PROJECTS_PATH = "/v2/development/projects"
 DAEMON_V2_DEVELOPMENT_MODELS_PATH = "/v2/development/models"
 DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_PATH = "/v2/development/model-runtime"
-DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_RETRY_PATH = (
-    "/v2/development/model-runtime/retry"
-)
+DAEMON_V2_DEVELOPMENT_MODEL_RUNTIME_RETRY_PATH = "/v2/development/model-runtime/retry"
 DAEMON_V2_DEVELOPMENT_MODEL_PATH_PATTERN = re.compile(r"^/v2/development/models/([^/]+)$")
 DAEMON_V2_DEVELOPMENT_MODEL_RETRY_PATH_PATTERN = re.compile(
     r"^/v2/development/models/([^/]+)/retry$"
@@ -3304,12 +3302,22 @@ class DevelopmentRuntimeContextMaterializer:
             ):
                 activations.append(f"{output.target_id}: native harness instruction staged")
 
+        protected_paths: list[str] = []
+        for contribution_path in contribution_paths.values():
+            try:
+                relative = contribution_path.relative_to(runtime_workspace).as_posix()
+            except ValueError:
+                continue
+            if relative and relative.split("/", 1)[0] not in {".agents", ".openevo"}:
+                protected_paths.append(relative)
+
         return {
             "workspace_path": runtime_workspace,
             "instruction_sections": instructions,
             "environment": environment,
             "activations": activations,
             "runtime_controls": runtime_controls,
+            "protected_paths": sorted(set(protected_paths)),
         }
 
 
@@ -3780,6 +3788,10 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
         self.store = store
         self.evolution_runner = evolution_runner
         self.model_manager = model_manager
+        self._model_warm_lock = threading.Lock()
+        self._model_warm_target: str | None = None
+        self._model_warm_thread: threading.Thread | None = None
+        self._model_warm_closing = threading.Event()
         self.sessions = DevelopmentSessionCoordinator(
             runner=runner,
             store=store,
@@ -3787,7 +3799,64 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
             model_manager=model_manager,
         )
 
+    def warm_project_model(self, config: object) -> None:
+        """Best-effort prewarm of a Project's downloaded model outside Session latency."""
+
+        if self.model_manager is None or not isinstance(config, dict):
+            return
+        execution = config.get("execution")
+        if not isinstance(execution, dict) or execution.get("mode") != "self-deployed":
+            return
+        model_resource_id = execution.get("model_resource_id")
+        if not isinstance(model_resource_id, str) or not model_resource_id:
+            return
+        try:
+            if self.model_manager.get(model_resource_id)["state"] != "ready":
+                return
+        except (KeyError, StateConflictError):
+            return
+        with self._model_warm_lock:
+            self._model_warm_target = model_resource_id
+            if self._model_warm_thread is not None and self._model_warm_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._warm_project_model_worker,
+                name="openevo-model-prewarm",
+                daemon=True,
+            )
+            self._model_warm_thread = thread
+            thread.start()
+
+    def _warm_project_model_worker(self) -> None:
+        while not self._model_warm_closing.is_set():
+            with self._model_warm_lock:
+                model_resource_id = self._model_warm_target
+            if model_resource_id is None or self.model_manager is None:
+                return
+            while not self._model_warm_closing.is_set():
+                try:
+                    runtime_state = self.model_manager.runtime_status()["state"]
+                except StateConflictError:
+                    return
+                if runtime_state == "ready":
+                    break
+                if runtime_state == "failed":
+                    return
+                self._model_warm_closing.wait(2)
+            if self._model_warm_closing.is_set():
+                return
+            try:
+                self.model_manager.prepare_inference(model_resource_id)
+            except (KeyError, StateConflictError):
+                return
+            with self._model_warm_lock:
+                if self._model_warm_target == model_resource_id:
+                    self._model_warm_target = None
+                    self._model_warm_thread = None
+                    return
+
     def server_close(self) -> None:
+        self._model_warm_closing.set()
         try:
             close_models = getattr(self.model_manager, "close", None)
             if callable(close_models):
@@ -4570,6 +4639,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except StateConflictError as exc:
                 self._json_error_v2(HTTPStatus.CONFLICT, "state_conflict", str(exc))
             else:
+                self.server.warm_project_model(request.config.model_dump(mode="json"))
                 self._json(HTTPStatus.CREATED, response.model_dump(mode="json"))
             return
         activate_project_v2_match = DAEMON_V2_DEVELOPMENT_PROJECT_ACTIVATE_PATH_PATTERN.fullmatch(
@@ -4593,6 +4663,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except KeyError:
                 self._json_error_v2(HTTPStatus.NOT_FOUND, "not_found", "project not found")
             else:
+                self.server.warm_project_model(project["config"])
                 self._json(HTTPStatus.OK, response.model_dump(mode="json"))
             return
         if self.path == DAEMON_V2_DEVELOPMENT_TASKS_PATH:
@@ -4730,6 +4801,7 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except StateConflictError as exc:
                 self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
             else:
+                self.server.warm_project_model(project["config"])
                 self._json(HTTPStatus.CREATED, {"schema_version": "1", **project})
             return
         activate_match = ACTIVATE_PATH_PATTERN.fullmatch(self.path)
@@ -5261,6 +5333,9 @@ def create_product_daemon(
         evolution_runner,
         model_manager,
     )
+    active_project_id = store.state_v2().active_project_id
+    if active_project_id is not None:
+        server.warm_project_model(store.project_config(active_project_id))
     return ProductDaemonComposition(
         server=server,
         state_path=resolved_state_path,

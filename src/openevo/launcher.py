@@ -125,8 +125,9 @@ def ensure_local_ports_available(ports: list[int]) -> None:
     for port in sorted(set(ports)):
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            probe.settimeout(0.25)
-            if probe.connect_ex(("127.0.0.1", port)) == 0:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
                 unavailable.append(port)
         finally:
             probe.close()
@@ -1764,7 +1765,7 @@ nohup env \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
   "$uv_bin" run --frozen --no-sync --python 3.11 python \
   -m openevo.daemon.product_app \
-  --port "$remote_port" --codex-binary "$codex_bin" \
+  --port "$remote_port" --codex-binary "$codex_bin" --timeout-seconds 900 \
   >"$log_file" 2>&1 </dev/null &
 daemon_pid=$!
 printf '%s\n' "$daemon_pid" > "$pid_file"
@@ -2032,7 +2033,7 @@ def _run_local_self_hosted_webui(
         port=args.remote_port,
         token=daemon_token,
         codex_binary=codex_binary,
-        timeout_seconds=300,
+        timeout_seconds=900,
         state_path=state_root / "state.sqlite3",
         evolution_model=args.evolution_model,
     )
