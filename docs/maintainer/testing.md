@@ -50,7 +50,7 @@ uv run python scripts/release/build_self_hosted_bundle.py \
 
 The builder packages committed files, not dirty working-tree bytes.
 
-The repository-free local launcher and its per-user installer are covered by:
+The repository-free local launcher and its POSIX/PowerShell per-user installers are covered by:
 
 ```bash
 uv run pytest \
@@ -72,8 +72,7 @@ The online bootstrap is tested against a local HTTP release fixture, including
 checksum rejection. To publish a real release, update `project.version`, commit
 the exact tree, and push the matching `v<version>` tag. The
 `openevo-launcher-release.yml` workflow refuses mismatched tags and existing
-GitHub Releases. It installs the same archive on clean macOS and Ubuntu runners
-to cover macOS and the WSL-compatible POSIX path, then
+GitHub Releases. It installs the same archive on clean Windows, macOS, and Ubuntu runners, then
 publishes exactly one custom asset named `evolab-launcher.zip`. The
 Release body is rendered from the fixed first-install guide plus GitHub's
 generated changelog.

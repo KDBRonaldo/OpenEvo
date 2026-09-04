@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterator
+from typing import BinaryIO, Callable, Iterator, TypeAlias
 
 from openevo.release_bundle import (
     RELEASE_ID_PATTERN,
@@ -59,6 +59,7 @@ REMOTE_DEVELOPMENT_STATE_ROOT = "$HOME/.openevo/dev-agent"
 LOCAL_DEVELOPMENT_STATE_ROOT = Path("~/.openevo/dev-agent").expanduser()
 REMOTE_LIFECYCLE_ACTIONS = frozenset({"status", "logs", "stop"})
 SOURCE_ACTIONS = frozenset({"auto", "install", "update", "start"})
+SSH_CLIENTS = frozenset({"auto", "system", "wsl"})
 SSH_CONNECT_TIMEOUT_SECONDS = 15
 REMOTE_COMMAND_TIMEOUT_SECONDS = 1200
 REMOTE_HOST_SETUP_TIMEOUT_SECONDS = 3600
@@ -69,7 +70,10 @@ CODEX_DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 SSH_CONFIG_MAX_INCLUDE_DEPTH = 8
 SSH_CONFIG_MAX_FILES = 64
 LAUNCHER_PREFERENCES_SCHEMA_VERSION = 1
+WSL_DISTRIBUTION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}")
 _LOOPBACK_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+SshCommand: TypeAlias = str | tuple[str, ...]
 
 
 class LauncherError(RuntimeError):
@@ -92,6 +96,16 @@ class SshHostProfile:
     user: str | None
     port: int | None
     source: Path
+
+
+@dataclass(frozen=True)
+class SshClientEnvironment:
+    """One OpenSSH installation and the config catalog it owns."""
+
+    command: SshCommand
+    profiles: tuple[SshHostProfile, ...]
+    config_path: Path
+    label: str
 
 
 @dataclass(frozen=True)
@@ -172,7 +186,12 @@ def _default_preferences_path() -> Path:
     return Path.home() / ".openevo" / "launcher.json"
 
 
-def discover_ssh_hosts(config_path: Path | None = None) -> tuple[SshHostProfile, ...]:
+def discover_ssh_hosts(
+    config_path: Path | None = None,
+    *,
+    config_home: Path | None = None,
+    filesystem_root: Path | None = None,
+) -> tuple[SshHostProfile, ...]:
     """Return literal SSH aliases from config and bounded Include files.
 
     OpenSSH remains authoritative for resolving an alias.  Parsed connection fields
@@ -206,7 +225,14 @@ def discover_ssh_hosts(config_path: Path | None = None) -> tuple[SshHostProfile,
             values = tokens[1:]
             if keyword == "include":
                 for value in values:
-                    include = Path(value).expanduser()
+                    if config_home is not None and value in {"~", "~/"}:
+                        include = config_home
+                    elif config_home is not None and value.startswith("~/"):
+                        include = config_home / value[2:]
+                    elif filesystem_root is not None and value.startswith("/"):
+                        include = filesystem_root / value.lstrip("/")
+                    else:
+                        include = Path(value).expanduser()
                     if not include.is_absolute():
                         include = normalized.parent / include
                     for match in sorted(glob.glob(str(include))):
@@ -263,6 +289,136 @@ def discover_ssh_hosts(config_path: Path | None = None) -> tuple[SshHostProfile,
             source=value["source"] if isinstance(value["source"], Path) else root,
         )
         for alias, value in sorted(profiles.items(), key=lambda item: item[0].casefold())
+    )
+
+
+def _decode_subprocess_output(value: bytes) -> str:
+    """Decode ordinary output plus WSL's UTF-16 distribution listing."""
+
+    if b"\x00" in value[:256]:
+        return value.decode("utf-16-le", errors="replace").lstrip("\ufeff")
+    return value.decode("utf-8", errors="replace")
+
+
+def _validate_wsl_distribution(value: str) -> str:
+    distribution = value.strip()
+    if not WSL_DISTRIBUTION_PATTERN.fullmatch(distribution):
+        raise LauncherError("WSL distribution name contains unsupported characters")
+    return distribution
+
+
+def _resolve_wsl_distribution(wsl_binary: str, explicit: str | None) -> str:
+    if explicit:
+        return _validate_wsl_distribution(explicit)
+    try:
+        completed = subprocess.run(
+            [wsl_binary, "--list", "--quiet"],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LauncherError(f"could not enumerate WSL distributions: {exc}") from exc
+    if completed.returncode != 0:
+        detail = _decode_subprocess_output(completed.stderr).strip()
+        raise LauncherError(f"could not enumerate WSL distributions: {detail or completed.returncode}")
+    distributions = [
+        line.strip().rstrip("\x00")
+        for line in _decode_subprocess_output(completed.stdout).splitlines()
+        if line.strip().rstrip("\x00")
+        and not line.strip().rstrip("\x00").casefold().startswith("docker-desktop")
+    ]
+    ubuntu = next((item for item in distributions if item.casefold() == "ubuntu"), None)
+    if ubuntu is not None:
+        return _validate_wsl_distribution(ubuntu)
+    if len(distributions) == 1:
+        return _validate_wsl_distribution(distributions[0])
+    if not distributions:
+        raise LauncherError("no ordinary Linux WSL distribution is installed")
+    raise LauncherError(
+        "multiple WSL distributions are installed; pass --wsl-distribution with the one "
+        "that owns your SSH config"
+    )
+
+
+def _wsl_config_windows_path(
+    wsl_binary: str,
+    distribution: str,
+    linux_config_path: str | None,
+) -> Path:
+    if linux_config_path:
+        command = [
+            wsl_binary,
+            "-d",
+            distribution,
+            "--",
+            "sh",
+            "-c",
+            'wslpath -w -- "$1"',
+            "openevo-wsl-config",
+            linux_config_path,
+        ]
+    else:
+        command = [
+            wsl_binary,
+            "-d",
+            distribution,
+            "--",
+            "sh",
+            "-lc",
+            'wslpath -w "$HOME/.ssh/config"',
+        ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LauncherError(f"could not locate the {distribution} WSL SSH config: {exc}") from exc
+    if completed.returncode != 0:
+        detail = _decode_subprocess_output(completed.stderr).strip()
+        raise LauncherError(
+            f"could not locate the {distribution} WSL SSH config: "
+            f"{detail or completed.returncode}"
+        )
+    rendered = _decode_subprocess_output(completed.stdout).strip()
+    if not rendered:
+        raise LauncherError(f"{distribution} WSL returned an empty SSH config path")
+    return Path(rendered)
+
+
+def _system_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
+    ssh_binary = shutil.which("ssh")
+    if not ssh_binary:
+        raise LauncherError("system OpenSSH client was not found")
+    config_path = Path(args.ssh_config).expanduser() if args.ssh_config else _default_ssh_config_path()
+    return SshClientEnvironment(
+        command=ssh_binary,
+        profiles=discover_ssh_hosts(config_path),
+        config_path=config_path,
+        label="system OpenSSH",
+    )
+
+
+def _wsl_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
+    wsl_binary = shutil.which("wsl.exe") or shutil.which("wsl")
+    if not wsl_binary:
+        raise LauncherError("wsl.exe was not found; install WSL or use --ssh-client system")
+    distribution = _resolve_wsl_distribution(wsl_binary, args.wsl_distribution)
+    config_path = _wsl_config_windows_path(wsl_binary, distribution, args.ssh_config)
+    config_home = config_path.parent.parent
+    filesystem_root = Path(config_path.anchor)
+    return SshClientEnvironment(
+        command=(wsl_binary, "-d", distribution, "--", "ssh"),
+        profiles=discover_ssh_hosts(
+            config_path,
+            config_home=config_home,
+            filesystem_root=filesystem_root,
+        ),
+        config_path=config_path,
+        label=f"OpenSSH in WSL {distribution}",
     )
 
 
@@ -402,6 +558,122 @@ def resolve_ssh_connection(args: argparse.Namespace) -> SshConnection:
     )
 
 
+def _connection_with_config(
+    args: argparse.Namespace,
+    environment: SshClientEnvironment,
+) -> SshConnection:
+    connection = resolve_ssh_connection(args)
+    if not args.ssh_config:
+        return connection
+    return SshConnection(
+        options=("-F", args.ssh_config, *connection.options),
+        destination=connection.destination,
+        display_name=connection.display_name,
+    )
+
+
+def _select_connection_from_environment(
+    args: argparse.Namespace,
+    environment: SshClientEnvironment,
+) -> SshConnection:
+    if args.ssh_alias or args.host or args.user or args.ssh_port != 22:
+        return _connection_with_config(args, environment)
+    preferences_path = Path(args.preferences_file).expanduser() if args.preferences_file else None
+    last_alias = None if args.no_remember else load_last_ssh_alias(preferences_path)
+    alias = select_ssh_alias(
+        environment.profiles,
+        last_alias=last_alias,
+        interactive=not args.non_interactive and sys.stdin.isatty(),
+    )
+    args.ssh_alias = alias
+    if not args.no_remember:
+        save_last_ssh_alias(alias, preferences_path)
+    return _connection_with_config(args, environment)
+
+
+def resolve_launcher_ssh(args: argparse.Namespace) -> tuple[SshConnection, SshCommand]:
+    """Resolve the connection and the OpenSSH installation owning its config.
+
+    Native Windows can transparently use OpenSSH inside WSL. Linux key paths,
+    ProxyJump rules, agents, and known_hosts then remain in their configured
+    environment instead of being partially translated into Windows semantics.
+    """
+
+    requested_client = args.ssh_client
+    if os.name != "nt":
+        if requested_client == "wsl":
+            raise LauncherError("--ssh-client wsl is available only from native Windows")
+        environment = _system_ssh_environment(args)
+        return _select_connection_from_environment(args, environment), environment.command
+    if requested_client == "system":
+        environment = _system_ssh_environment(args)
+        return _select_connection_from_environment(args, environment), environment.command
+    if requested_client == "wsl":
+        environment = _wsl_ssh_environment(args)
+        return _select_connection_from_environment(args, environment), environment.command
+
+    # Direct endpoints do not require an alias catalog. Windows OpenSSH remains
+    # the historical default unless the caller explicitly requests WSL.
+    if args.host or args.user or args.ssh_port != 22:
+        environment = _system_ssh_environment(args)
+        return _select_connection_from_environment(args, environment), environment.command
+
+    system_environment: SshClientEnvironment | None = None
+    system_error: LauncherError | None = None
+    try:
+        system_environment = _system_ssh_environment(args)
+    except LauncherError as exc:
+        system_error = exc
+    wsl_environment: SshClientEnvironment | None = None
+    wsl_error: LauncherError | None = None
+    try:
+        wsl_environment = _wsl_ssh_environment(args)
+    except LauncherError as exc:
+        wsl_error = exc
+
+    if args.ssh_alias:
+        alias = validate_ssh_alias(args.ssh_alias)
+        for environment in (system_environment, wsl_environment):
+            if environment is not None and any(item.alias == alias for item in environment.profiles):
+                connection = _connection_with_config(args, environment)
+                print(f"Using {environment.label} for SSH alias {alias}.", flush=True)
+                return connection, environment.command
+        # Match and CanonicalizeHost rules need not appear as literal Host entries.
+        if system_environment is not None:
+            return _connection_with_config(args, system_environment), system_environment.command
+        if wsl_environment is not None:
+            return _connection_with_config(args, wsl_environment), wsl_environment.command
+
+    environments = [item for item in (system_environment, wsl_environment) if item is not None]
+    owners: dict[str, SshClientEnvironment] = {}
+    profiles: dict[str, SshHostProfile] = {}
+    for environment in environments:
+        for profile in environment.profiles:
+            if profile.alias not in profiles:
+                profiles[profile.alias] = profile
+                owners[profile.alias] = environment
+    if profiles:
+        preferences_path = Path(args.preferences_file).expanduser() if args.preferences_file else None
+        last_alias = None if args.no_remember else load_last_ssh_alias(preferences_path)
+        alias = select_ssh_alias(
+            tuple(sorted(profiles.values(), key=lambda item: item.alias.casefold())),
+            last_alias=last_alias,
+            interactive=not args.non_interactive and sys.stdin.isatty(),
+        )
+        args.ssh_alias = alias
+        if not args.no_remember:
+            save_last_ssh_alias(alias, preferences_path)
+        environment = owners[alias]
+        print(f"Using {environment.label} for SSH alias {alias}.", flush=True)
+        return _connection_with_config(args, environment), environment.command
+
+    details = "; ".join(str(error) for error in (system_error, wsl_error) if error is not None)
+    raise LauncherError(
+        "no literal Host aliases were found in the Windows or WSL SSH configs"
+        + (f": {details}" if details else "")
+    )
+
+
 def validate_branch(value: str) -> str:
     branch = value.strip()
     if (
@@ -483,6 +755,11 @@ def _ssh_transport_options() -> list[str]:
     ]
 
 
+def _ssh_argv(ssh_command: SshCommand, *arguments: str) -> list[str]:
+    prefix = [ssh_command] if isinstance(ssh_command, str) else list(ssh_command)
+    return [*prefix, *arguments]
+
+
 def build_remote_source_probe_script() -> str:
     return f"""\
 set -eu
@@ -505,7 +782,7 @@ fi
 
 
 def probe_remote_source_commit(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
 ) -> str | None:
     result = _run_remote_capture(
@@ -587,7 +864,7 @@ def create_source_bundle(
 
 
 def upload_source_bundle(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
     bundle: SourceBundle,
     *,
@@ -601,13 +878,13 @@ def upload_source_bundle(
     try:
         with bundle.path.open("rb") as source:
             completed = subprocess.run(
-                [
+                _ssh_argv(
                     ssh_binary,
                     *connection.options,
                     *_ssh_transport_options(),
                     connection.destination,
                     remote_command,
-                ],
+                ),
                 stdin=source,
                 check=False,
                 timeout=SOURCE_TRANSFER_TIMEOUT_SECONDS,
@@ -644,7 +921,7 @@ fi
 """
 
 
-def probe_remote_release_id(ssh_binary: str, connection: SshConnection) -> str | None:
+def probe_remote_release_id(ssh_binary: SshCommand, connection: SshConnection) -> str | None:
     result = _run_remote_capture(
         ssh_binary,
         connection,
@@ -661,7 +938,7 @@ def probe_remote_release_id(ssh_binary: str, connection: SshConnection) -> str |
 
 
 def upload_release_bundle(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
     bundle: ReleaseBundleReceipt,
 ) -> None:
@@ -673,13 +950,13 @@ def upload_release_bundle(
     try:
         with bundle.path.open("rb") as source:
             completed = subprocess.run(
-                [
+                _ssh_argv(
                     ssh_binary,
                     *connection.options,
                     *_ssh_transport_options(),
                     connection.destination,
                     remote_command,
-                ],
+                ),
                 stdin=source,
                 check=False,
                 timeout=SOURCE_TRANSFER_TIMEOUT_SECONDS,
@@ -753,10 +1030,18 @@ fi
 """
 
 
-def build_remote_host_setup_script(*, include_git: bool) -> str:
+def build_remote_host_setup_script(*, include_git: bool, enable_gpu: bool = True) -> str:
     """Prepare baseline tools and the NVIDIA container stack when applicable."""
 
     prerequisite_script = build_remote_prerequisite_script(include_git=include_git)
+    if not enable_gpu:
+        return """\
+set -eu
+umask 077
+
+""" + prerequisite_script + """
+echo "GPU runtime setup disabled by the client; using Codex subscription and CPU services only."
+"""
     return """\
 set -eu
 umask 077
@@ -1801,7 +2086,7 @@ echo "Remote development daemon is ready on loopback port $remote_port."
 
 
 def _run_remote_capture(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
     script: str,
     *,
@@ -1814,14 +2099,14 @@ def _run_remote_capture(
     script_bytes = script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     try:
         completed = subprocess.run(
-            [
+            _ssh_argv(
                 ssh_binary,
                 *connection.options,
                 *_ssh_transport_options(),
                 connection.destination,
                 "sh",
                 "-s",
-            ],
+            ),
             input=script_bytes,
             check=False,
             capture_output=True,
@@ -1859,7 +2144,7 @@ def _relay_remote_output(stream: BinaryIO, *, open_device_auth: bool) -> None:
 
 
 def _run_remote(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
     script: str,
     *,
@@ -1868,14 +2153,14 @@ def _run_remote(
 ) -> None:
     script_bytes = script.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
     process = subprocess.Popen(
-        [
+        _ssh_argv(
             ssh_binary,
             *connection.options,
             *_ssh_transport_options(),
             connection.destination,
             "sh",
             "-s",
-        ],
+        ),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1915,12 +2200,12 @@ def _run_remote(
 
 
 def _start_tunnel(
-    ssh_binary: str,
+    ssh_binary: SshCommand,
     connection: SshConnection,
     local_port: int,
     remote_port: int,
 ) -> subprocess.Popen[str]:
-    command = [
+    command = _ssh_argv(
         ssh_binary,
         *connection.options,
         *_ssh_transport_options(),
@@ -1930,7 +2215,7 @@ def _start_tunnel(
         "-L",
         f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
         connection.destination,
-    ]
+    )
     tunnel = subprocess.Popen(command, text=True)
     time.sleep(0.8)
     if tunnel.poll() is not None:
@@ -2157,6 +2442,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="SSH config to discover workspaces from (defaults to ~/.ssh/config)",
     )
     parser.add_argument(
+        "--ssh-client",
+        choices=sorted(SSH_CLIENTS),
+        default=os.environ.get("OPENEVO_SSH_CLIENT", "auto"),
+        help=(
+            "OpenSSH client to use: auto discovers aliases in native Windows and WSL "
+            "configs; system forces this OS; wsl keeps Linux keys and ProxyJump rules in WSL"
+        ),
+    )
+    parser.add_argument(
+        "--wsl-distribution",
+        default=os.environ.get("OPENEVO_WSL_DISTRIBUTION"),
+        help="WSL distribution containing the SSH config (auto prefers Ubuntu)",
+    )
+    parser.add_argument(
         "--preferences-file",
         help=argparse.SUPPRESS,
     )
@@ -2225,6 +2524,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--evolution-model", default="gpt-5.5")
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="skip NVIDIA, Docker, and local-model runtime setup on the Linux server",
+    )
     parser.add_argument(
         "--state-root",
         type=Path,
@@ -2299,11 +2603,14 @@ def main(argv: list[str] | None = None) -> int:
         or args.user is not None
         or args.ssh_port != 22
         or args.ssh_config is not None
+        or args.ssh_client != "auto"
+        or args.wsl_distribution is not None
     ):
         raise LauncherError("--local cannot be combined with SSH connection options")
     if args.local and (
         args.web_layer
         or args.deploy_only
+        or args.no_gpu
         or args.release_bundle is not None
         or args.source_action != "auto"
     ):
@@ -2331,10 +2638,7 @@ def main(argv: list[str] | None = None) -> int:
             raise LauncherError(
                 f"--{lifecycle_action} cannot be combined with deployment or browser acceptance"
             )
-        connection = resolve_launcher_connection(args)
-        ssh_binary = shutil.which("ssh")
-        if not ssh_binary:
-            raise LauncherError("system OpenSSH client was not found")
+        connection, ssh_binary = resolve_launcher_ssh(args)
         print(
             "Managing the EvoLab remote stack through SSH "
             f"{connection.display_name}...",
@@ -2356,7 +2660,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.web_layer:
             local_ports.append(args.web_port)
         ensure_local_ports_available(local_ports)
-    connection = resolve_launcher_connection(args)
+    connection, ssh_binary = resolve_launcher_ssh(args)
     release_bundle: ReleaseBundleReceipt | None = None
     if args.release_bundle is not None:
         if args.branch is not None:
@@ -2382,10 +2686,6 @@ def main(argv: list[str] | None = None) -> int:
     token = secrets.token_urlsafe(32)
     web_session_token = secrets.token_hex(32) if args.self_hosted_webui else ""
     web_bootstrap_token = secrets.token_hex(32) if args.self_hosted_webui else ""
-    ssh_binary = shutil.which("ssh")
-    if not ssh_binary:
-        raise LauncherError("system OpenSSH client was not found")
-
     delivery_label = "release" if release_bundle is not None else "source"
     print(
         f"Checking installed EvoLab {delivery_label} through SSH {connection.display_name}...",
@@ -2414,11 +2714,17 @@ def main(argv: list[str] | None = None) -> int:
             "run --source-action update first"
         )
 
-    print("Preparing required server tools and GPU runtime when applicable...", flush=True)
+    if args.no_gpu:
+        print("Preparing required server tools without touching GPU runtime configuration...", flush=True)
+    else:
+        print("Preparing required server tools and GPU runtime when applicable...", flush=True)
     _run_remote(
         ssh_binary,
         connection,
-        build_remote_host_setup_script(include_git=release_bundle is None),
+        build_remote_host_setup_script(
+            include_git=release_bundle is None,
+            enable_gpu=not args.no_gpu,
+        ),
         timeout=REMOTE_HOST_SETUP_TIMEOUT_SECONDS,
     )
 

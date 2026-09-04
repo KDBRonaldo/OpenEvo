@@ -16,13 +16,13 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Install without the repository
 
-The current installable pre-release supports macOS and WSL with one shared
-package. Download `evolab-launcher.zip` from the matching GitHub Release. Do not download
+The current installable pre-release supports native Windows PowerShell, macOS,
+Linux, and WSL with one shared package. Download `evolab-launcher.zip` from the matching GitHub Release. Do not download
 GitHub's automatically generated source-code archives; they are repository
 snapshots, not EvoLab installers.
 
-The release page contains the complete first-install guide. In short, the Mac
-needs Python 3.11+ and system OpenSSH. The remote Linux account needs root or
+The release page contains the complete first-install guide. The client needs
+Python 3.11+ and OpenSSH, either natively or inside WSL on Windows. The remote Linux account needs root or
 passwordless `sudo` and a supported package manager (`apt-get`, `dnf`, `yum`,
 or `apk`); EvoLab installs missing server tools itself. Then install the downloaded archive:
 
@@ -31,6 +31,17 @@ unzip evolab-launcher.zip
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
+
+On native Windows, expand the ZIP and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\evolab-launcher\install.ps1
+evolab webui
+```
+
+When an SSH alias exists only in WSL, the Windows launcher automatically uses
+that distribution's OpenSSH. It prefers `Ubuntu`; use
+`--ssh-client wsl --wsl-distribution <name>` to choose another distribution.
 
 On the first run, EvoLab installs the official Codex CLI on the server when it
 is missing, along with Python, curl, certificates, and core utilities when
@@ -56,8 +67,7 @@ active launcher receipt. The installer refuses to overwrite an unrelated
 
 Pushing a tag that exactly matches `v<pyproject version>` runs the launcher
 release workflow. It verifies the committed WebUI and release tests, then
-installs the same archive on clean macOS and Ubuntu runners (the latter covers
-the WSL-compatible POSIX path). It publishes exactly one custom
+installs the same archive on clean Windows, macOS, and Ubuntu runners. It publishes exactly one custom
 asset, `evolab-launcher.zip`, after those smoke tests pass. The
 Release body combines a fixed first-install guide with GitHub's generated
 changelog. GitHub still displays its two automatic source-code links, which
@@ -73,7 +83,7 @@ uv run openevo webui
 ```
 
 OpenEvo lists the configured hosts, remembers the last selection in
-`~/.openevo/launcher.json`, connects through system OpenSSH, and opens the
+`~/.openevo/launcher.json`, connects through the owning native or WSL OpenSSH client, and opens the
 loopback WebUI in the default browser. An explicit host remains available for
 development and automation:
 

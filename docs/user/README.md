@@ -7,14 +7,13 @@ the old DMG or packaged Tauri Desktop application.
 
 Requirements on the user's computer:
 
-- macOS or WSL (native Windows PowerShell is not supported by this pre-release);
+- native Windows PowerShell, macOS, Linux, or WSL;
 - Python 3.11 or newer;
-- POSIX `sh` and `tar`;
-- system OpenSSH (`ssh`);
-- a literal host alias in `~/.ssh/config`.
+- OpenSSH on the local OS, or OpenSSH in WSL on Windows;
+- a literal host alias in the native or WSL `~/.ssh/config`.
 
 Download `evolab-launcher.zip` from the matching GitHub Release. The same
-package is tested on macOS and the WSL-compatible Linux path. Do not
+package is tested on Windows, macOS, and Linux. Do not
 download GitHub's `Source code (zip)` or `Source code (tar.gz)` links; those are
 repository snapshots rather than the installer. Install the archive with:
 
@@ -27,6 +26,13 @@ sh evolab-launcher/install.sh
 Add `~/.local/bin` to `PATH` to use `evolab webui` directly. The archive
 already contains the matching server Release Bundle. Git, uv, Node/npm, and an
 OpenEvo checkout are not required on the user's computer.
+
+For native Windows, expand the ZIP and run this from PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\evolab-launcher\install.ps1
+evolab webui
+```
 
 ## SSH configuration
 
@@ -51,6 +57,11 @@ evolab webui
 The launcher discovers concrete aliases from the SSH config (including common
 `Include` files), asks which workspace to use, remembers the last selection,
 uploads its verified server Release Bundle when needed, and opens the WebUI.
+On native Windows it searches both the Windows OpenSSH config and WSL configs.
+If an alias belongs to WSL, the full SSH operation stays inside WSL so Linux
+key paths, agents, `ProxyJump`, and `known_hosts` continue to work. Ubuntu is
+preferred automatically; another distribution can be selected with
+`--ssh-client wsl --wsl-distribution <name>`.
 The explicit source-development form remains valid:
 
 ```bash
@@ -114,6 +125,10 @@ in the daemon's private state root; the browser receives only model identity
 and progress records. If a model download receives no new data for 90 seconds,
 EvoLab marks it as stalled and offers **Resume download** in Project setup.
 Matching partial files are preserved and reused by the retry.
+
+Use `evolab webui --no-gpu` when the server has visible NVIDIA hardware but
+this EvoLab deployment must remain CPU/Codex-subscription only. The launcher
+then avoids NVIDIA probes, Docker setup, and local-model runtime changes.
 
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,

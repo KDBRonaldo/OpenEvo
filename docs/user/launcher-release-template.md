@@ -1,6 +1,6 @@
-# EvoLab {{VERSION}} for macOS and WSL
+# EvoLab {{VERSION}} for Windows, macOS, Linux, and WSL
 
-> **Supported local platforms:** macOS and WSL. Native Windows PowerShell is not supported in this pre-release. Both supported environments use the same ZIP package.
+> **Supported local platforms:** native Windows PowerShell, macOS, Linux, and WSL. Every platform uses the same ZIP package.
 
 ## Download this file
 
@@ -10,13 +10,13 @@ Under **Assets**, download exactly:
 
 Do not download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** files. Those are repository snapshots, not the EvoLab launcher package.
 
-## 1. Prepare your Mac or WSL environment
+## 1. Prepare your client environment
 
 Your local environment needs:
 
 - Python 3.11 or newer: `python3 --version`
-- the system OpenSSH client: `ssh -V`
-- `unzip`
+- OpenSSH on this OS, or OpenSSH in WSL on Windows
+- an archive extractor (`Expand-Archive` is built into PowerShell)
 
 You do **not** need Git, uv, Node.js, npm, or an OpenEvo/EvoLab source checkout.
 
@@ -25,6 +25,10 @@ You do **not** need Git, uv, Node.js, npm, or an OpenEvo/EvoLab source checkout.
 The server must be reachable over SSH, provide `apt-get`, `dnf`, `yum`, or `apk`, and allow the selected account to use root or passwordless `sudo`. It also needs outbound HTTPS access to install dependencies, download Codex, and complete ChatGPT authentication. EvoLab automatically installs missing Python, curl, certificates, and core utilities.
 
 On full Ubuntu virtual machines with an NVIDIA GPU, EvoLab also automatically installs a missing recommended NVIDIA compute driver, Docker, and NVIDIA Container Toolkit, configures Docker GPU access, and grants the SSH user access. A newly installed driver can require one reboot; reboot the server once and run the same `evolab webui` command again. CPU-only servers skip these GPU packages. On container-style GPU rentals, EvoLab does not change GPU drivers, Docker configuration, services, or user permissions; these rentals must already expose a user-accessible Docker daemon with the NVIDIA runtime. GPU model serving requires enough disk and VRAM plus outbound access to Docker Hub, NVIDIA's signed package repository, and Hugging Face.
+
+Pass `--no-gpu` for a CPU/Codex-subscription-only deployment on a host whose
+NVIDIA devices belong to other workloads. EvoLab then does not probe or modify
+the NVIDIA and Docker runtime.
 
 You do not need to install or log in to Codex on the server manually. On the first `evolab webui` run, EvoLab installs the official Codex CLI for the **exact same SSH user that EvoLab will use**. It then prints a one-time device code in the terminal and opens the ChatGPT verification page on this computer. Enter the displayed code in the browser; EvoLab continues automatically after login succeeds.
 
@@ -58,6 +62,19 @@ unzip evolab-launcher.zip
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
+
+On native Windows PowerShell instead run:
+
+```powershell
+Expand-Archive .\evolab-launcher.zip -DestinationPath . -Force
+powershell -ExecutionPolicy Bypass -File .\evolab-launcher\install.ps1
+evolab webui
+```
+
+Windows automatically discovers aliases from both its native SSH config and
+installed WSL distributions. If the alias is in WSL, EvoLab keeps SSH keys,
+agents, ProxyJump rules, and known-host records inside WSL. It prefers Ubuntu;
+override this with `--ssh-client wsl --wsl-distribution <name>`.
 
 After opening a new terminal, the formal command is normally available directly:
 

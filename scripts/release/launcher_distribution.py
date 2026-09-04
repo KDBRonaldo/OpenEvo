@@ -140,8 +140,8 @@ def _installer_readme(version: str) -> bytes:
 
 Requirements on this computer:
 - Python 3.11 or newer
-- system OpenSSH client
-- a configured ~/.ssh/config host
+- OpenSSH on this OS, or OpenSSH in a WSL distribution on Windows
+- a configured SSH Host alias (Windows and WSL configs are auto-discovered)
 
 Linux, macOS, or WSL installation:
   sh install.sh
@@ -151,6 +151,9 @@ Choose another per-user prefix:
 
 Windows PowerShell installation:
   powershell -ExecutionPolicy Bypass -File .\\install.ps1
+
+If the SSH config is in WSL, EvoLab prefers an installed Ubuntu distribution.
+Override it when needed with `--ssh-client wsl --wsl-distribution NAME`.
 
 After installation:
   evolab webui
@@ -541,8 +544,9 @@ function Quote-Cmd([string]$Value) {
 if (-not [IO.Path]::IsPathRooted($Prefix)) {
     throw "installation prefix must be an absolute path"
 }
-if ($null -eq (Get-Command ssh -ErrorAction SilentlyContinue)) {
-    throw "The system OpenSSH client is required on this computer."
+if ($null -eq (Get-Command ssh -ErrorAction SilentlyContinue) -and
+    $null -eq (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+    throw "OpenSSH or WSL with OpenSSH is required on this computer."
 }
 $python = Find-Python311
 $packageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path

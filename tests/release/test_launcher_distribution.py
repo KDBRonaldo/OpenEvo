@@ -115,6 +115,7 @@ def test_installer_runs_without_repository_and_is_idempotent(
     assert help_result.returncode == 0, help_result.stderr
     assert "--release-bundle" in help_result.stdout
     assert "--ssh-alias" in help_result.stdout
+    assert "--ssh-client" in help_result.stdout
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell installer is exercised on Windows")
@@ -160,6 +161,7 @@ def test_windows_installer_runs_without_repository_and_is_idempotent(tmp_path: P
     )
     assert help_result.returncode == 0, help_result.stderr
     assert "--release-bundle" in help_result.stdout
+    assert "--ssh-client" in help_result.stdout
 
 
 @pytest.mark.skipif(

@@ -140,9 +140,35 @@ jobs:
             --prefix "$prefix"
           "$prefix/bin/evolab" webui --help
 
+  windows-install-smoke:
+    name: Install and launch help on native Windows
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: evolab-${{ github.ref_name }}-launcher
+
+      - name: Install the same package with PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $packageRoot = Join-Path $env:RUNNER_TEMP "evolab-package"
+          $prefix = Join-Path $env:RUNNER_TEMP "evolab-installed"
+          Expand-Archive -LiteralPath "evolab-launcher.zip" -DestinationPath $packageRoot
+          & (Join-Path $packageRoot "evolab-launcher\install.ps1") `
+            -Prefix $prefix `
+            -NoPathUpdate
+          & (Join-Path $prefix "bin\evolab.cmd") webui --help
+
   publish:
     name: Publish immutable GitHub pre-release
-    needs: [build, macos-install-smoke, wsl-install-smoke]
+    needs: [build, macos-install-smoke, wsl-install-smoke, windows-install-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

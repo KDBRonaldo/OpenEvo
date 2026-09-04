@@ -49,6 +49,107 @@ def test_resolves_direct_ssh_connection_without_config_alias() -> None:
     assert connection.display_name == "root@js4.blockelite.cn:27104"
 
 
+def test_windows_auto_uses_wsl_client_for_alias_owned_by_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    args = remote_launcher.parse_args(
+        ["--ssh-alias", "openevo-lab", "--no-remember"]
+    )
+    system = remote_launcher.SshClientEnvironment(
+        command="C:/Windows/System32/OpenSSH/ssh.exe",
+        profiles=(),
+        config_path=tmp_path / "windows-config",
+        label="system OpenSSH",
+    )
+    wsl = remote_launcher.SshClientEnvironment(
+        command=("wsl.exe", "-d", "Ubuntu", "--", "ssh"),
+        profiles=(
+            remote_launcher.SshHostProfile(
+                "openevo-lab",
+                "linux.example.test",
+                "root",
+                27104,
+                tmp_path / "wsl-config",
+            ),
+        ),
+        config_path=tmp_path / "wsl-config",
+        label="OpenSSH in WSL Ubuntu",
+    )
+    monkeypatch.setattr(remote_launcher.os, "name", "nt")
+    monkeypatch.setattr(remote_launcher, "_system_ssh_environment", lambda _: system)
+    monkeypatch.setattr(remote_launcher, "_wsl_ssh_environment", lambda _: wsl)
+
+    connection, command = remote_launcher.resolve_launcher_ssh(args)
+
+    assert connection.destination == "openevo-lab"
+    assert command == ("wsl.exe", "-d", "Ubuntu", "--", "ssh")
+
+
+def test_wsl_ssh_command_prefix_wraps_remote_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        observed["args"] = args
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout=b"Linux\n", stderr=b"")
+
+    monkeypatch.setattr(remote_launcher.subprocess, "run", run)
+    connection = remote_launcher.SshConnection((), "openevo-lab", "openevo-lab")
+    command = ("wsl.exe", "-d", "Ubuntu", "--", "ssh")
+
+    output = remote_launcher._run_remote_capture(command, connection, "uname -s\n")
+
+    assert output == "Linux\n"
+    arguments = observed["args"]
+    assert isinstance(arguments, list)
+    assert arguments[:5] == ["wsl.exe", "-d", "Ubuntu", "--", "ssh"]
+    assert arguments[-3:] == ["openevo-lab", "sh", "-s"]
+    assert observed["input"] == b"uname -s\n"
+
+
+def test_wsl_distribution_discovery_prefers_ubuntu_and_ignores_docker_desktop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = "docker-desktop\r\nUbuntu\r\n".encode("utf-16-le")
+    monkeypatch.setattr(
+        remote_launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["wsl.exe"], 0, stdout=output, stderr=b""
+        ),
+    )
+
+    assert remote_launcher._resolve_wsl_distribution("wsl.exe", None) == "Ubuntu"
+
+
+def test_explicit_ssh_config_is_forwarded_to_selected_client(tmp_path: Path) -> None:
+    config = tmp_path / "config"
+    config.write_text("Host lab\n", encoding="utf-8")
+    args = remote_launcher.parse_args(
+        [
+            "--ssh-alias",
+            "lab",
+            "--ssh-config",
+            str(config),
+            "--ssh-client",
+            "system",
+        ]
+    )
+    environment = remote_launcher.SshClientEnvironment(
+        command="ssh",
+        profiles=(),
+        config_path=config,
+        label="system OpenSSH",
+    )
+
+    connection = remote_launcher._connection_with_config(args, environment)
+
+    assert connection.options == ("-F", str(config))
+
+
 def test_web_layer_is_an_explicit_opt_in() -> None:
     regular = remote_launcher.parse_args(["--host", "example.com", "--user", "root"])
     web = remote_launcher.parse_args(["--host", "example.com", "--user", "root", "--web-layer"])
@@ -309,6 +410,19 @@ def test_gpu_host_setup_is_automatic_only_for_detected_nvidia_hardware() -> None
             check=False,
         )
         assert syntax.returncode == 0, syntax.stderr
+
+
+def test_no_gpu_host_setup_keeps_cpu_services_and_never_probes_nvidia() -> None:
+    script = remote_launcher.build_remote_host_setup_script(
+        include_git=False,
+        enable_gpu=False,
+    )
+
+    assert "python3" in script
+    assert "GPU runtime setup disabled by the client" in script
+    assert "nvidia-smi" not in script
+    assert "nvidia-ctk" not in script
+    assert "docker info" not in script
 
 
 def test_release_install_uses_verified_bundle_without_checkout_delivery(
