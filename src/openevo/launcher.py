@@ -872,8 +872,8 @@ def upload_source_bundle(
 ) -> None:
     remote_command = (
         "set -eu; umask 077; "
-        'mkdir -p "$HOME/.openevo/dev-agent/incoming"; '
-        f'cat > "$HOME/.openevo/dev-agent/incoming/source-{expected_commit}.bundle"'
+        "mkdir -p ~/.openevo/dev-agent/incoming; "
+        f"cat > ~/.openevo/dev-agent/incoming/source-{expected_commit}.bundle"
     )
     try:
         with bundle.path.open("rb") as source:
@@ -944,8 +944,8 @@ def upload_release_bundle(
 ) -> None:
     remote_command = (
         "set -eu; umask 077; "
-        'mkdir -p "$HOME/.openevo/dev-agent/incoming"; '
-        f'cat > "$HOME/.openevo/dev-agent/incoming/release-{bundle.release_id}.oevobundle"'
+        "mkdir -p ~/.openevo/dev-agent/incoming; "
+        f"cat > ~/.openevo/dev-agent/incoming/release-{bundle.release_id}.oevobundle"
     )
     try:
         with bundle.path.open("rb") as source:

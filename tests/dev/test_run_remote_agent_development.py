@@ -150,6 +150,45 @@ def test_explicit_ssh_config_is_forwarded_to_selected_client(tmp_path: Path) -> 
     assert connection.options == ("-F", str(config))
 
 
+def test_upload_paths_do_not_expand_client_home_through_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_path = tmp_path / "release.oevobundle"
+    bundle_path.write_bytes(b"bundle")
+    receipt = ReleaseBundleReceipt(
+        path=bundle_path,
+        release_id="a" * 64,
+        product_version="0.2.1",
+        source_commit="b" * 40,
+        sha256="c" * 64,
+        byte_size=6,
+        file_count=1,
+    )
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(remote_launcher.subprocess, "run", run)
+    remote_launcher.upload_release_bundle(
+        ("wsl.exe", "-d", "Ubuntu", "--", "ssh"),
+        remote_launcher.SshConnection((), "openevo-lab", "openevo-lab"),
+        receipt,
+    )
+    remote_launcher.upload_source_bundle(
+        ("wsl.exe", "-d", "Ubuntu", "--", "ssh"),
+        remote_launcher.SshConnection((), "openevo-lab", "openevo-lab"),
+        remote_launcher.SourceBundle(bundle_path, "d" * 64, 6),
+        expected_commit="e" * 40,
+    )
+
+    assert all("$HOME" not in command[-1] for command in commands)
+    assert "~/.openevo/dev-agent/incoming/release-" in commands[0][-1]
+    assert "~/.openevo/dev-agent/incoming/source-" in commands[1][-1]
+
+
 def test_web_layer_is_an_explicit_opt_in() -> None:
     regular = remote_launcher.parse_args(["--host", "example.com", "--user", "root"])
     web = remote_launcher.parse_args(["--host", "example.com", "--user", "root", "--web-layer"])
