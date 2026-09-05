@@ -12,6 +12,7 @@ import time
 import pytest
 
 from openevo.backend.contracts.v2.models import ScienceProjectConfigV2
+from openevo.daemon import model_manager as model_manager_module
 from openevo.daemon.errors import StateConflictError
 from openevo.daemon.model_manager import HuggingFaceModelManager, VLLM_IMAGE, VllmModelRuntime
 
@@ -254,6 +255,62 @@ def test_restart_marks_an_interrupted_download_failed(tmp_path: Path) -> None:
     assert recovered["state"] == "failed"
     assert "interrupted" in str(recovered["error"])
     assert recovered["downloaded_bytes"] == len(b"partial")
+
+
+def test_existing_models_do_not_probe_runtime_until_user_requests_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_called = threading.Event()
+    setup_script = tmp_path / "model-runtime-setup.sh"
+    setup_script.write_text("placeholder", encoding="utf-8")
+    setup_script.chmod(0o700)
+
+    class Runtime:
+        def image_available(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            return
+
+    def run_setup(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == [str(setup_script)]
+        setup_called.set()
+        return subprocess.CompletedProcess(command, 0, stdout="ready", stderr="")
+
+    monkeypatch.setattr(model_manager_module.subprocess, "run", run_setup)
+    state_path = tmp_path / "state.sqlite3"
+    initial = HuggingFaceModelManager(
+        state_path=state_path,
+        root=tmp_path / "models",
+        runtime=Runtime(),  # type: ignore[arg-type]
+        runtime_setup_script=setup_script,
+    )
+    with initial._connection() as connection:
+        now = "2026-09-05T00:00:00Z"
+        connection.execute(
+            "INSERT INTO development_models(model_resource_id, repository_id, "
+            "requested_revision, resolved_revision, state, created_at, updated_at) "
+            "VALUES ('model-existing', 'OpenEvo/Fixture-0.1B', 'main', ?, "
+            "'ready', ?, ?)",
+            (REVISION, now, now),
+        )
+    initial.close()
+
+    restarted = HuggingFaceModelManager(
+        state_path=state_path,
+        root=tmp_path / "models",
+        runtime=Runtime(),  # type: ignore[arg-type]
+        runtime_setup_script=setup_script,
+    )
+    assert setup_called.wait(0.05) is False
+
+    restarted.register(
+        action_id="select-existing-model",
+        repository_id="OpenEvo/Fixture-0.1B",
+    )
+    assert setup_called.wait(5) is True
+    assert _wait_for_runtime(restarted, "ready")["error"] is None
 
 
 def test_download_progress_counts_incomplete_weight_but_not_cache_metadata(

@@ -1030,23 +1030,25 @@ fi
 """
 
 
-def build_remote_host_setup_script(*, include_git: bool, enable_gpu: bool = True) -> str:
-    """Prepare baseline tools and the NVIDIA container stack when applicable."""
+def build_remote_host_setup_script(*, include_git: bool) -> str:
+    """Prepare only the baseline tools required to start EvoLab."""
 
     prerequisite_script = build_remote_prerequisite_script(include_git=include_git)
-    if not enable_gpu:
-        return """\
-set -eu
-umask 077
-
-""" + prerequisite_script + """
-echo "GPU runtime setup disabled by the client; using Codex subscription and CPU services only."
-"""
     return """\
 set -eu
 umask 077
 
-""" + prerequisite_script + r"""
+""" + prerequisite_script + """
+echo "Required EvoLab server tools are ready. Self-deployed model checks are deferred until requested."
+"""
+
+
+def build_remote_model_runtime_setup_script() -> str:
+    """Build the NVIDIA container setup invoked only by a model operation."""
+
+    return r"""set -eu
+umask 077
+
 has_nvidia_gpu=0
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   has_nvidia_gpu=1
@@ -1065,8 +1067,8 @@ else
 fi
 
 if [ "$has_nvidia_gpu" -ne 1 ]; then
-  echo "No NVIDIA GPU detected; skipping the self-deployed model runtime setup."
-  exit 0
+  echo "No NVIDIA GPU is available for the requested self-deployed model." >&2
+  exit 69
 fi
 
 echo "NVIDIA GPU detected; checking the self-deployed model runtime..."
@@ -1648,7 +1650,6 @@ def build_remote_script(
     browser_endpoint: str = "http://127.0.0.1:8765",
     release_id: str = "",
     allow_device_auth: bool = True,
-    enable_self_deployed_models: bool = True,
 ) -> str:
     values = {
         "branch": branch,
@@ -1666,10 +1667,10 @@ def build_remote_script(
         "release_id": release_id,
         "delivery_mode": "release" if release_id else "git",
         "allow_device_auth": "1" if allow_device_auth else "0",
-        "disable_self_deployed_models": "0" if enable_self_deployed_models else "1",
     }
     quoted = {key: shlex.quote(value) for key, value in values.items()}
     prerequisite_script = build_remote_prerequisite_script(include_git=not release_id)
+    model_runtime_setup = build_remote_model_runtime_setup_script()
     webui_script = ""
     if self_hosted_webui:
         webui_script = f"""
@@ -1746,7 +1747,6 @@ source_bundle_sha256={quoted['source_bundle_sha256']}
 prepare_runtime={quoted['prepare_runtime']}
 start_services={quoted['start_services']}
 allow_device_auth={quoted['allow_device_auth']}
-disable_self_deployed_models={quoted['disable_self_deployed_models']}
 agent_token={quoted['token']}
 remote_port={quoted['remote_port']}
 evolution_model={quoted['evolution_model']}
@@ -1762,8 +1762,14 @@ source_marker="$state_root/managed-source-v1"
 source_bundle="$state_root/incoming/source-$expected_commit.bundle"
 pid_file="$state_root/daemon.pid"
 log_file="$state_root/daemon.log"
+model_runtime_setup_file="$state_root/model-runtime-setup.sh"
 
 mkdir -p "$state_root" "$state_root/incoming"
+
+cat > "$model_runtime_setup_file" <<'OPENEVO_MODEL_RUNTIME_SETUP'
+{model_runtime_setup}
+OPENEVO_MODEL_RUNTIME_SETUP
+chmod 700 "$model_runtime_setup_file"
 
 {prerequisite_script}
 
@@ -2057,7 +2063,7 @@ nohup env \
   "PATH=$codex_dir:$PATH" \
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
-  "OPENEVO_DISABLE_SELF_DEPLOYED_MODELS=$disable_self_deployed_models" \
+  "OPENEVO_MODEL_RUNTIME_SETUP_SCRIPT=$model_runtime_setup_file" \
   "$uv_bin" run --frozen --no-sync --python 3.11 python \
   -m openevo.daemon.product_app \
   --port "$remote_port" --codex-binary "$codex_bin" --timeout-seconds 900 \
@@ -2535,14 +2541,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--evolution-model", default="gpt-5.5")
     parser.add_argument(
-        "--no-gpu",
-        action="store_true",
-        help=(
-            "disable self-deployed models and skip NVIDIA, Docker, and local-model "
-            "runtime setup on the Linux server"
-        ),
-    )
-    parser.add_argument(
         "--state-root",
         type=Path,
         default=LOCAL_DEVELOPMENT_STATE_ROOT,
@@ -2623,7 +2621,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.local and (
         args.web_layer
         or args.deploy_only
-        or args.no_gpu
         or args.release_bundle is not None
         or args.source_action != "auto"
     ):
@@ -2727,17 +2724,14 @@ def main(argv: list[str] | None = None) -> int:
             "run --source-action update first"
         )
 
-    if args.no_gpu:
-        print("Preparing required server tools without touching GPU runtime configuration...", flush=True)
-    else:
-        print("Preparing required server tools and GPU runtime when applicable...", flush=True)
+    print(
+        "Preparing required server tools; GPU and model runtime checks remain deferred...",
+        flush=True,
+    )
     _run_remote(
         ssh_binary,
         connection,
-        build_remote_host_setup_script(
-            include_git=release_bundle is None,
-            enable_gpu=not args.no_gpu,
-        ),
+        build_remote_host_setup_script(include_git=release_bundle is None),
         timeout=REMOTE_HOST_SETUP_TIMEOUT_SECONDS,
     )
 
@@ -2784,7 +2778,6 @@ def main(argv: list[str] | None = None) -> int:
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
                 release_id=release_bundle.release_id,
                 allow_device_auth=not args.non_interactive,
-                enable_self_deployed_models=not args.no_gpu,
             ),
             open_device_auth=not args.no_open and not args.non_interactive,
         )
@@ -2820,7 +2813,6 @@ def main(argv: list[str] | None = None) -> int:
                 remote_web_port=args.remote_web_port,
                 browser_endpoint=f"http://127.0.0.1:{args.local_port}",
                 allow_device_auth=not args.non_interactive,
-                enable_self_deployed_models=not args.no_gpu,
             )
             _run_remote(
                 ssh_binary,
@@ -2847,7 +2839,6 @@ def main(argv: list[str] | None = None) -> int:
             remote_web_port=args.remote_web_port,
             browser_endpoint=f"http://127.0.0.1:{args.local_port}",
             allow_device_auth=not args.non_interactive,
-            enable_self_deployed_models=not args.no_gpu,
         )
         _run_remote(
             ssh_binary,

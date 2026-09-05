@@ -5268,7 +5268,7 @@ def create_product_daemon(
     state_path: Path,
     model: str | None = None,
     evolution_model: str | None = None,
-    self_deployed_models_enabled: bool = True,
+    model_runtime_setup_script: Path | None = None,
 ) -> ProductDaemonComposition:
     """Compose every durable and process-local service owned by the daemon."""
 
@@ -5289,23 +5289,16 @@ def create_product_daemon(
     runner.check_cli_ready()
     resolved_state_path = state_path.expanduser().resolve()
     store = DevelopmentStateStore(resolved_state_path)
-    model_manager = (
-        HuggingFaceModelManager(
-            state_path=resolved_state_path,
-            root=resolved_state_path.parent / "models",
-        )
-        if self_deployed_models_enabled
-        else None
+    model_manager = HuggingFaceModelManager(
+        state_path=resolved_state_path,
+        root=resolved_state_path.parent / "models",
+        runtime_setup_script=model_runtime_setup_script,
     )
 
     def prepare_project_inference(project_id: str) -> dict[str, str] | None:
         execution = store.project_config(project_id).get("execution", {})
         if not isinstance(execution, dict) or execution.get("mode") != "self-deployed":
             return None
-        if model_manager is None:
-            raise EvolutionRunError(
-                "Self-deployed model execution is disabled for this daemon launch"
-            )
         model_resource_id = execution.get("model_resource_id")
         repository_id = execution.get("repository_id")
         model_revision = execution.get("model_revision")
@@ -5342,9 +5335,6 @@ def create_product_daemon(
         evolution_runner,
         model_manager,
     )
-    active_project_id = store.state_v2().active_project_id
-    if active_project_id is not None:
-        server.warm_project_model(store.project_config(active_project_id))
     return ProductDaemonComposition(
         server=server,
         state_path=resolved_state_path,
@@ -5402,9 +5392,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     evolution_model = (
         os.environ.get("OPENEVO_DEV_EVOLUTION_MODEL", "").strip() or model or "gpt-5.5"
     )
-    self_deployed_models_enabled = os.environ.get(
-        "OPENEVO_DISABLE_SELF_DEPLOYED_MODELS", ""
-    ).strip().casefold() not in {"1", "true", "yes", "on"}
+    runtime_setup_value = os.environ.get("OPENEVO_MODEL_RUNTIME_SETUP_SCRIPT", "").strip()
+    model_runtime_setup_script = Path(runtime_setup_value) if runtime_setup_value else None
     try:
         composition = create_product_daemon(
             port=args.port,
@@ -5414,7 +5403,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             state_path=args.state_path,
             model=model,
             evolution_model=evolution_model,
-            self_deployed_models_enabled=self_deployed_models_enabled,
+            model_runtime_setup_script=model_runtime_setup_script,
         )
     except (EvolutionRunError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc

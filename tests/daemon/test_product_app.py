@@ -72,12 +72,13 @@ def test_product_composition_initializes_all_authoritative_services(
     assert observed["models"] == {
         "state_path": (tmp_path / "state.sqlite3").resolve(),
         "root": tmp_path / "models",
+        "runtime_setup_script": None,
     }
     assert composition.evolution_model == "evolution-model"
     assert composition.evidence_failures == ("legacy evidence fixture",)
 
 
-def test_product_composition_can_disable_all_self_deployed_model_runtime(
+def test_product_composition_defers_model_runtime_and_forwards_setup_script(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -95,7 +96,7 @@ def test_product_composition_can_disable_all_self_deployed_model_runtime(
             pass
 
         def state_v2(self) -> SimpleNamespace:
-            return SimpleNamespace(active_project_id=None)
+            raise AssertionError("daemon startup must not inspect an active model project")
 
     class Evolution:
         def __init__(self, **_kwargs: object) -> None:
@@ -111,27 +112,36 @@ def test_product_composition_can_disable_all_self_deployed_model_runtime(
         def __init__(self, _address, _token, _runner, _store, _evolution, models) -> None:
             observed["models"] = models
 
+        def warm_project_model(self, _config: object) -> None:
+            raise AssertionError("daemon startup must not prewarm a historical model")
+
+    class Models:
+        def __init__(self, **kwargs: object) -> None:
+            observed["model_args"] = kwargs
+
     monkeypatch.setattr(product_app.shutil, "which", lambda _: "/usr/bin/codex")
     monkeypatch.setattr(product_app, "CodexRunner", Runner)
     monkeypatch.setattr(product_app, "DevelopmentStateStore", Store)
     monkeypatch.setattr(product_app, "DocumentEvolutionRunner", Evolution)
-    monkeypatch.setattr(
-        product_app,
-        "HuggingFaceModelManager",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("model manager must stay disabled")),
-    )
+    monkeypatch.setattr(product_app, "HuggingFaceModelManager", Models)
     monkeypatch.setattr(product_app, "DevelopmentAgentServer", Server)
 
+    setup_script = tmp_path / "model-runtime-setup.sh"
     product_app.create_product_daemon(
         port=8787,
         token="t" * 32,
         codex_binary="codex",
         timeout_seconds=300,
         state_path=tmp_path / "state.sqlite3",
-        self_deployed_models_enabled=False,
+        model_runtime_setup_script=setup_script,
     )
 
-    assert observed["models"] is None
+    assert observed["models"] is not None
+    assert observed["model_args"] == {
+        "state_path": (tmp_path / "state.sqlite3").resolve(),
+        "root": tmp_path / "models",
+        "runtime_setup_script": setup_script,
+    }
 
 
 def test_product_daemon_exposes_public_loopback_health() -> None:

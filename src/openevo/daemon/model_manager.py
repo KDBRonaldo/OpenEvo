@@ -48,6 +48,7 @@ VLLM_IMAGE = (
     "sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14"
 )
 VLLM_IMAGE_PULL_TIMEOUT_SECONDS = 1_800
+MODEL_RUNTIME_SETUP_TIMEOUT_SECONDS = 1_800
 VLLM_GPU_MEMORY_UTILIZATION = 0.85
 
 
@@ -601,6 +602,7 @@ class HuggingFaceModelManager:
         api_factory: Callable[[], Any] | None = None,
         snapshot_download: Callable[..., str] | None = None,
         runtime: VllmModelRuntime | None = None,
+        runtime_setup_script: Path | None = None,
         download_stall_timeout_seconds: float = MODEL_DOWNLOAD_STALL_TIMEOUT_SECONDS,
         download_poll_seconds: float = MODEL_DOWNLOAD_POLL_SECONDS,
     ) -> None:
@@ -617,6 +619,11 @@ class HuggingFaceModelManager:
         self._runtime = runtime or VllmModelRuntime(
             owner_id=hashlib.sha256(os.fspath(self.state_path.resolve()).encode()).hexdigest()[:16]
         )
+        self._runtime_setup_script = (
+            runtime_setup_script.expanduser().resolve(strict=False)
+            if runtime_setup_script is not None
+            else None
+        )
         self._lock = threading.RLock()
         self._workers: dict[str, threading.Thread] = {}
         self._download_processes: dict[str, subprocess.Popen[bytes]] = {}
@@ -630,8 +637,6 @@ class HuggingFaceModelManager:
             except OSError:
                 pass
         self._initialize()
-        if self.list():
-            self._start_runtime_worker(force_check=True)
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.state_path, timeout=30)
@@ -945,15 +950,13 @@ class HuggingFaceModelManager:
             self._workers[model_resource_id] = thread
             thread.start()
 
-    def _start_runtime_worker(self, *, force_check: bool = False) -> None:
+    def _start_runtime_worker(self) -> None:
         with self._lock:
             if self._runtime_worker is not None and self._runtime_worker.is_alive():
                 return
             current_state = self.runtime_status()["state"]
-            if current_state == "ready" and not force_check:
-                return
             if current_state == "ready":
-                self._set_runtime_state("queued")
+                return
             thread = threading.Thread(
                 target=self._prepare_runtime,
                 name="openevo-vllm-image",
@@ -965,6 +968,7 @@ class HuggingFaceModelManager:
     def _prepare_runtime(self) -> None:
         try:
             self._set_runtime_state("checking")
+            self._prepare_runtime_host()
             if not self._runtime.image_available():
                 self._set_runtime_state("downloading")
                 self._runtime.prepare_image()
@@ -976,6 +980,39 @@ class HuggingFaceModelManager:
                 self._runtime_worker = None
             if self.runtime_status()["state"] == "queued":
                 self._start_runtime_worker()
+
+    def _prepare_runtime_host(self) -> None:
+        script = self._runtime_setup_script
+        if script is None:
+            return
+        try:
+            metadata = script.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise StateConflictError(
+                f"self-deployed model host setup is unavailable: {exc}"
+            ) from exc
+        if script.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+            raise StateConflictError("self-deployed model host setup is not a regular file")
+        if metadata.st_mode & 0o022:
+            raise StateConflictError("self-deployed model host setup is writable by other users")
+        try:
+            result = subprocess.run(
+                [os.fspath(script)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=MODEL_RUNTIME_SETUP_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise StateConflictError(
+                f"self-deployed model host setup could not complete: {exc}"
+            ) from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[-4_000:]
+            raise StateConflictError(
+                "self-deployed model host setup failed"
+                + (f": {detail}" if detail else "")
+            )
 
     def _set_runtime_state(self, state: str, *, error: str | None = None) -> None:
         with self._lock, self._connection() as connection:

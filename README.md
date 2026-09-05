@@ -150,18 +150,19 @@ revision to an immutable commit, verifies content-addressed safetensors, and
 stores the model in the daemon's private model cache. Projects pin the managed
 model resource and commit rather than a mutable branch name.
 
-Serving requires an NVIDIA GPU on the daemon computer. During launcher setup,
-EvoLab detects NVIDIA hardware and, on Ubuntu GPU servers, automatically
-installs a missing recommended compute driver, Docker, and NVIDIA Container
-Toolkit, configures Docker GPU access, and grants the SSH user Docker access.
-A newly installed driver can require one server reboot; after reboot, rerun the
-same `evolab webui` command and setup resumes automatically. CPU-only servers
-skip this container stack. On container-style GPU rentals, the launcher never
+Serving requires an NVIDIA GPU on the daemon computer. Ordinary
+`evolab webui` startup never probes the GPU or Docker runtime. When the user
+first registers or retries a self-deployed model, EvoLab performs those checks
+in the model task and, on Ubuntu GPU servers, can install a missing recommended
+compute driver, Docker, and NVIDIA Container Toolkit. A newly installed driver
+can require one server reboot; after reboot, retry the model runtime from the
+Project dialog. CPU-only subscription projects remain unaffected. On
+container-style GPU rentals, the model preparation task never
 changes GPU drivers, Docker configuration, services, or user permissions: they
 must already expose a user-accessible Docker daemon with the NVIDIA runtime, or
-the launcher stops with guidance to use a Docker-enabled container or a full
-Ubuntu GPU virtual machine. The first Session pulls the release-pinned vLLM
-image, starts it on daemon loopback, and uses the selected model for both
+the model task fails with guidance to use a Docker-enabled container or a full
+Ubuntu GPU virtual machine. Model preparation pulls the release-pinned vLLM
+image; the first self-deployed Session starts it on daemon loopback and uses the selected model for both
 Sessions and supported Evolution reflectors. Only one managed model server is
 kept active at a time. The server must be able to reach Hugging Face, Docker
 Hub, and NVIDIA's signed package repository; administrators in mirrored

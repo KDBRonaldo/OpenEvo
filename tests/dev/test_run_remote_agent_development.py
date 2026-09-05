@@ -417,12 +417,22 @@ def test_remote_prerequisites_are_installed_without_an_interactive_sudo_prompt()
     assert "git" in source_script
 
 
-def test_gpu_host_setup_is_automatic_only_for_detected_nvidia_hardware() -> None:
+def test_host_setup_never_probes_gpu_or_docker_during_launcher_startup() -> None:
     script = remote_launcher.build_remote_host_setup_script(include_git=False)
+
+    assert "python3" in script
+    assert "checks are deferred until requested" in script
+    assert "nvidia-smi" not in script
+    assert "nvidia-ctk" not in script
+    assert "docker info" not in script
+
+
+def test_model_operation_setup_checks_nvidia_and_container_runtime_on_demand() -> None:
+    script = remote_launcher.build_remote_model_runtime_setup_script()
 
     assert "/sys/bus/pci/devices/*/vendor" in script
     assert 'vendor_id" = "0x10de' in script
-    assert "No NVIDIA GPU detected; skipping" in script
+    assert "No NVIDIA GPU is available for the requested self-deployed model" in script
     assert "ubuntu-drivers install --gpgpu" in script
     assert "timeout 15 docker info" in script
     assert "apt-get install -y docker.io" in script
@@ -449,19 +459,6 @@ def test_gpu_host_setup_is_automatic_only_for_detected_nvidia_hardware() -> None
             check=False,
         )
         assert syntax.returncode == 0, syntax.stderr
-
-
-def test_no_gpu_host_setup_keeps_cpu_services_and_never_probes_nvidia() -> None:
-    script = remote_launcher.build_remote_host_setup_script(
-        include_git=False,
-        enable_gpu=False,
-    )
-
-    assert "python3" in script
-    assert "GPU runtime setup disabled by the client" in script
-    assert "nvidia-smi" not in script
-    assert "nvidia-ctk" not in script
-    assert "docker info" not in script
 
 
 def test_release_install_uses_verified_bundle_without_checkout_delivery(
@@ -515,7 +512,8 @@ def test_release_install_uses_verified_bundle_without_checkout_delivery(
     assert result == 0
     assert uploaded == [receipt]
     assert len(remote_scripts) == 3
-    assert "NVIDIA GPU detected" in remote_scripts[0]
+    assert "NVIDIA GPU detected" not in remote_scripts[0]
+    assert "checks are deferred until requested" in remote_scripts[0]
     assert receipt.release_id in remote_scripts[1]
     assert "delivery_mode=release" in remote_scripts[2]
     assert "start_services=0" in remote_scripts[2]
@@ -1024,21 +1022,19 @@ def test_non_interactive_remote_script_does_not_wait_for_device_login() -> None:
     assert "Run interactively without --non-interactive" in script
 
 
-def test_no_gpu_remote_script_disables_model_manager_during_daemon_start() -> None:
+def test_remote_script_installs_deferred_model_runtime_setup_without_running_it() -> None:
     script = remote_launcher.build_remote_script(
         branch="stable",
         expected_commit="a" * 40,
         token="daemon-token",
         remote_port=8787,
         evolution_model="gpt-5.5",
-        enable_self_deployed_models=False,
     )
 
-    assert "disable_self_deployed_models=1" in script
-    assert (
-        '"OPENEVO_DISABLE_SELF_DEPLOYED_MODELS=$disable_self_deployed_models"'
-        in script
-    )
+    assert "model_runtime_setup_file=\"$state_root/model-runtime-setup.sh\"" in script
+    assert "cat > \"$model_runtime_setup_file\"" in script
+    assert '"OPENEVO_MODEL_RUNTIME_SETUP_SCRIPT=$model_runtime_setup_file"' in script
+    assert "OPENEVO_DISABLE_SELF_DEPLOYED_MODELS" not in script
 
 
 def test_remote_script_can_only_install_source_without_starting_services() -> None:

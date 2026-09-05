@@ -109,13 +109,14 @@ settings or by the ChatGPT workspace administrator.
 
 Public Hugging Face models can be registered from a Project's **Execution
 model** settings. Self-deployed execution requires an NVIDIA GPU and enough
-disk/VRAM for the selected vLLM-compatible safetensors model. On Ubuntu GPU
-servers, the launcher automatically installs a missing recommended NVIDIA
-compute driver, Docker, and NVIDIA Container Toolkit and configures access for
-the SSH user. If a new driver requires a reboot, reboot once and rerun the same
-`evolab webui` command; preparation then resumes automatically. CPU-only
-servers skip the GPU container stack. On container-style GPU rentals, the
-launcher does not change GPU drivers, Docker configuration, services, or user
+disk/VRAM for the selected vLLM-compatible safetensors model. Ordinary
+`evolab webui` startup does not inspect the GPU or Docker. Registering or
+retrying a self-deployed model starts the runtime preparation task; on Ubuntu
+GPU servers that task can install a missing recommended NVIDIA compute driver,
+Docker, and NVIDIA Container Toolkit. If a new driver requires a reboot,
+reboot once and use **Resume download** in Project setup. CPU-only subscription
+projects do not trigger the GPU path. On container-style GPU rentals, the model
+task does not change GPU drivers, Docker configuration, services, or user
 permissions. These rentals must already expose a user-accessible Docker daemon
 with the NVIDIA runtime; otherwise use a Docker-enabled container or a full
 Ubuntu GPU virtual machine. GPU setup needs access to Docker Hub and
@@ -124,13 +125,8 @@ Face (or an administrator-configured `HF_ENDPOINT` mirror). Model files remain
 in the daemon's private state root; the browser receives only model identity
 and progress records. If a model download receives no new data for 90 seconds,
 EvoLab marks it as stalled and offers **Resume download** in Project setup.
-Matching partial files are preserved and reused by the retry.
-
-Use `evolab webui --no-gpu` when the server has visible NVIDIA hardware but
-this EvoLab deployment must remain CPU/Codex-subscription only. The launcher
-then disables self-deployed model management and avoids NVIDIA probes, Docker
-setup, and local-model runtime changes. Existing model files and unrelated
-containers are left untouched.
+Matching partial files are preserved and reused by the retry. Merely starting
+EvoLab or opening a Codex-subscription Project never starts this preparation.
 
 The remote host does not fetch OpenEvo from GitHub. A first installation may
 still need access to the configured Python package sources if uv, Python 3.11,
