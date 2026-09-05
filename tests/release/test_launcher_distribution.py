@@ -11,6 +11,7 @@ import pytest
 
 from scripts.release.launcher_distribution import (
     LAUNCHER_DISTRIBUTION_ROOT,
+    LauncherDistributionError,
     build_launcher_distribution,
     verify_launcher_distribution,
 )
@@ -60,6 +61,53 @@ def test_launcher_distribution_is_deterministic_and_runtime_complete(
         f"{LAUNCHER_DISTRIBUTION_ROOT}/openevo.pyz",
         f"{LAUNCHER_DISTRIBUTION_ROOT}/openevo-server.oevobundle",
     }
+
+
+def test_builds_separate_windows_and_macos_archives(tmp_path: Path) -> None:
+    windows_path = tmp_path / "evolab-launcher-windows.zip"
+    macos_path = tmp_path / "evolab-launcher-macos.tar.gz"
+
+    build_launcher_distribution(
+        REPOSITORY_ROOT,
+        windows_path,
+        target_platform="windows",
+    )
+    build_launcher_distribution(
+        REPOSITORY_ROOT,
+        macos_path,
+        target_platform="macos",
+    )
+
+    with zipfile.ZipFile(windows_path) as archive:
+        windows_readme = archive.read(
+            f"{LAUNCHER_DISTRIBUTION_ROOT}/README.txt"
+        ).decode("utf-8")
+    with tarfile.open(macos_path, "r:gz") as archive:
+        readme = archive.extractfile(f"{LAUNCHER_DISTRIBUTION_ROOT}/README.txt")
+        assert readme is not None
+        macos_readme = readme.read().decode("utf-8")
+    assert "targets native Windows PowerShell" in windows_readme
+    assert "targets native macOS" in macos_readme
+    assert verify_launcher_distribution(windows_path).distribution_id != (
+        verify_launcher_distribution(macos_path).distribution_id
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_platform", "name"),
+    [("windows", "launcher.tar.gz"), ("macos", "launcher.zip")],
+)
+def test_platform_archive_format_is_enforced(
+    tmp_path: Path,
+    target_platform: str,
+    name: str,
+) -> None:
+    with pytest.raises(LauncherDistributionError, match="launcher output must end with"):
+        build_launcher_distribution(
+            REPOSITORY_ROOT,
+            tmp_path / name,
+            target_platform=target_platform,
+        )
 
 
 @pytest.mark.skipif(
@@ -121,7 +169,11 @@ def test_installer_runs_without_repository_and_is_idempotent(
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell installer is exercised on Windows")
 def test_windows_installer_runs_without_repository_and_is_idempotent(tmp_path: Path) -> None:
     archive_path = tmp_path / "evolab-launcher.zip"
-    receipt = build_launcher_distribution(REPOSITORY_ROOT, archive_path)
+    receipt = build_launcher_distribution(
+        REPOSITORY_ROOT,
+        archive_path,
+        target_platform="windows",
+    )
     verified = verify_launcher_distribution(archive_path)
     assert receipt.distribution_id == verified.distribution_id
 

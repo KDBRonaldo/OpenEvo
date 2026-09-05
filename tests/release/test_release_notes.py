@@ -23,7 +23,8 @@ def test_release_notes_make_the_supported_download_unambiguous() -> None:
 
     assert "Supported local platforms" in text
     assert "native Windows PowerShell, macOS, Linux, and WSL" in text
-    assert "evolab-launcher.zip" in text
+    assert "evolab-launcher-windows.zip" in text
+    assert "evolab-launcher-macos.tar.gz" in text
     assert "Do not download" in text
     assert "Source code (zip)" in text
     assert "Windows" in text
@@ -58,13 +59,14 @@ def test_renderer_combines_fixed_guide_with_generated_changelog() -> None:
         changelog="* Fixed launcher startup",
     )
 
-    assert "evolab-launcher.zip" in rendered
+    assert "evolab-launcher-windows.zip" in rendered
+    assert "evolab-launcher-macos.tar.gz" in rendered
     assert "* Fixed launcher startup" in rendered
     assert "{{VERSION}}" not in rendered
     assert "{{CHANGELOG}}" not in rendered
 
 
-def test_release_workflow_publishes_one_custom_launcher_asset() -> None:
+def test_release_workflow_publishes_platform_launcher_assets() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
 
     release_command = text.split('gh release create "$GITHUB_REF_NAME"', 1)[1]
@@ -72,7 +74,10 @@ def test_release_workflow_publishes_one_custom_launcher_asset() -> None:
     asset_lines = [line.strip().rstrip(" \\") for line in release_command.splitlines()]
     asset_lines = [line for line in asset_lines if line]
 
-    assert asset_lines == ["evolab-launcher.zip"]
+    assert asset_lines == [
+        "evolab-launcher-windows.zip",
+        "evolab-launcher-macos.tar.gz",
+    ]
     assert "macos-latest" in text
     assert "ubuntu-latest" in text
     assert "windows-latest" in text

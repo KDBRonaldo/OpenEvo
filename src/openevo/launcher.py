@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from typing import BinaryIO, Callable, Iterator, TypeAlias
+from typing import BinaryIO, Callable, Iterator
 
 from openevo.release_bundle import (
     RELEASE_ID_PATTERN,
@@ -32,6 +32,17 @@ from openevo.release_bundle import (
     ReleaseBundleReceipt,
     verify_release_bundle,
 )
+from openevo.launcher_platforms import (
+    LauncherError,
+    SshClientEnvironment,
+    SshCommand,
+    SshConnection,
+    SshHostProfile,
+    SshResolutionServices,
+)
+from openevo.launcher_platforms import macos as macos_platform
+from openevo.launcher_platforms import posix as posix_platform
+from openevo.launcher_platforms import windows as windows_platform
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -73,43 +84,7 @@ CODEX_DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 SSH_CONFIG_MAX_INCLUDE_DEPTH = 8
 SSH_CONFIG_MAX_FILES = 64
 LAUNCHER_PREFERENCES_SCHEMA_VERSION = 1
-WSL_DISTRIBUTION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,127}")
 _LOOPBACK_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-SshCommand: TypeAlias = str | tuple[str, ...]
-
-
-class LauncherError(RuntimeError):
-    """A user-actionable EvoLab launcher failure."""
-
-
-@dataclass(frozen=True)
-class SshConnection:
-    options: tuple[str, ...]
-    destination: str
-    display_name: str
-
-
-@dataclass(frozen=True)
-class SshHostProfile:
-    """A concrete Host alias discovered in the user's OpenSSH configuration."""
-
-    alias: str
-    hostname: str | None
-    user: str | None
-    port: int | None
-    source: Path
-
-
-@dataclass(frozen=True)
-class SshClientEnvironment:
-    """One OpenSSH installation and the config catalog it owns."""
-
-    command: SshCommand
-    profiles: tuple[SshHostProfile, ...]
-    config_path: Path
-    label: str
-
 
 @dataclass(frozen=True)
 class SourceBundle:
@@ -296,51 +271,18 @@ def discover_ssh_hosts(
 
 
 def _decode_subprocess_output(value: bytes) -> str:
-    """Decode ordinary output plus WSL's UTF-16 distribution listing."""
-
-    if b"\x00" in value[:256]:
-        return value.decode("utf-16-le", errors="replace").lstrip("\ufeff")
-    return value.decode("utf-8", errors="replace")
+    return windows_platform.decode_subprocess_output(value)
 
 
 def _validate_wsl_distribution(value: str) -> str:
-    distribution = value.strip()
-    if not WSL_DISTRIBUTION_PATTERN.fullmatch(distribution):
-        raise LauncherError("WSL distribution name contains unsupported characters")
-    return distribution
+    return windows_platform.validate_wsl_distribution(value)
 
 
 def _resolve_wsl_distribution(wsl_binary: str, explicit: str | None) -> str:
-    if explicit:
-        return _validate_wsl_distribution(explicit)
-    try:
-        completed = subprocess.run(
-            [wsl_binary, "--list", "--quiet"],
-            check=False,
-            capture_output=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise LauncherError(f"could not enumerate WSL distributions: {exc}") from exc
-    if completed.returncode != 0:
-        detail = _decode_subprocess_output(completed.stderr).strip()
-        raise LauncherError(f"could not enumerate WSL distributions: {detail or completed.returncode}")
-    distributions = [
-        line.strip().rstrip("\x00")
-        for line in _decode_subprocess_output(completed.stdout).splitlines()
-        if line.strip().rstrip("\x00")
-        and not line.strip().rstrip("\x00").casefold().startswith("docker-desktop")
-    ]
-    ubuntu = next((item for item in distributions if item.casefold() == "ubuntu"), None)
-    if ubuntu is not None:
-        return _validate_wsl_distribution(ubuntu)
-    if len(distributions) == 1:
-        return _validate_wsl_distribution(distributions[0])
-    if not distributions:
-        raise LauncherError("no ordinary Linux WSL distribution is installed")
-    raise LauncherError(
-        "multiple WSL distributions are installed; pass --wsl-distribution with the one "
-        "that owns your SSH config"
+    return windows_platform.resolve_wsl_distribution(
+        wsl_binary,
+        explicit,
+        run=subprocess.run,
     )
 
 
@@ -349,47 +291,12 @@ def _wsl_config_windows_path(
     distribution: str,
     linux_config_path: str | None,
 ) -> Path:
-    if linux_config_path:
-        command = [
-            wsl_binary,
-            "-d",
-            distribution,
-            "--",
-            "sh",
-            "-c",
-            'wslpath -w -- "$1"',
-            "openevo-wsl-config",
-            linux_config_path,
-        ]
-    else:
-        command = [
-            wsl_binary,
-            "-d",
-            distribution,
-            "--",
-            "sh",
-            "-lc",
-            'wslpath -w "$HOME/.ssh/config"',
-        ]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise LauncherError(f"could not locate the {distribution} WSL SSH config: {exc}") from exc
-    if completed.returncode != 0:
-        detail = _decode_subprocess_output(completed.stderr).strip()
-        raise LauncherError(
-            f"could not locate the {distribution} WSL SSH config: "
-            f"{detail or completed.returncode}"
-        )
-    rendered = _decode_subprocess_output(completed.stdout).strip()
-    if not rendered:
-        raise LauncherError(f"{distribution} WSL returned an empty SSH config path")
-    return Path(rendered)
+    return windows_platform.wsl_config_windows_path(
+        wsl_binary,
+        distribution,
+        linux_config_path,
+        run=subprocess.run,
+    )
 
 
 def _system_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
@@ -406,30 +313,20 @@ def _system_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
 
 
 def _wsl_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
-    command, distribution = _wsl_ssh_command(args)
-    config_path = _wsl_config_windows_path(command[0], distribution, args.ssh_config)
-    config_home = config_path.parent.parent
-    filesystem_root = Path(config_path.anchor)
-    return SshClientEnvironment(
-        command=command,
-        profiles=discover_ssh_hosts(
-            config_path,
-            config_home=config_home,
-            filesystem_root=filesystem_root,
-        ),
-        config_path=config_path,
-        label=f"OpenSSH in WSL {distribution}",
+    return windows_platform.build_wsl_environment(
+        args,
+        command_resolver=_wsl_ssh_command,
+        config_path_resolver=_wsl_config_windows_path,
+        discover_hosts=discover_ssh_hosts,
     )
 
 
 def _wsl_ssh_command(args: argparse.Namespace) -> tuple[tuple[str, ...], str]:
-    """Resolve WSL OpenSSH without opening or translating its config file."""
-
-    wsl_binary = shutil.which("wsl.exe") or shutil.which("wsl")
-    if not wsl_binary:
-        raise LauncherError("wsl.exe was not found; install WSL or use --ssh-client system")
-    distribution = _resolve_wsl_distribution(wsl_binary, args.wsl_distribution)
-    return (wsl_binary, "-d", distribution, "--", "ssh"), distribution
+    return windows_platform.wsl_ssh_command(
+        args,
+        which=shutil.which,
+        distribution_resolver=_resolve_wsl_distribution,
+    )
 
 
 def load_last_ssh_alias(preferences_path: Path | None = None) -> str | None:
@@ -602,97 +499,25 @@ def _select_connection_from_environment(
 
 
 def resolve_launcher_ssh(args: argparse.Namespace) -> tuple[SshConnection, SshCommand]:
-    """Resolve the connection and the OpenSSH installation owning its config.
+    """Resolve SSH through the local operating system's explicit adapter."""
 
-    Native Windows can transparently use OpenSSH inside WSL. Linux key paths,
-    ProxyJump rules, agents, and known_hosts then remain in their configured
-    environment instead of being partially translated into Windows semantics.
-    """
-
-    requested_client = args.ssh_client
-    if os.name != "nt":
-        if requested_client == "wsl":
-            raise LauncherError("--ssh-client wsl is available only from native Windows")
-        environment = _system_ssh_environment(args)
-        return _select_connection_from_environment(args, environment), environment.command
-    if requested_client == "system":
-        environment = _system_ssh_environment(args)
-        return _select_connection_from_environment(args, environment), environment.command
-    if requested_client == "wsl":
-        if args.ssh_alias or args.host or args.user or args.ssh_port != 22:
-            command, distribution = _wsl_ssh_command(args)
-            connection = resolve_ssh_connection(args)
-            if args.ssh_config:
-                connection = SshConnection(
-                    options=("-F", args.ssh_config, *connection.options),
-                    destination=connection.destination,
-                    display_name=connection.display_name,
-                )
-            print(f"Using OpenSSH in WSL {distribution}.", flush=True)
-            return connection, command
-        environment = _wsl_ssh_environment(args)
-        return _select_connection_from_environment(args, environment), environment.command
-
-    # Direct endpoints do not require an alias catalog. Windows OpenSSH remains
-    # the historical default unless the caller explicitly requests WSL.
-    if args.host or args.user or args.ssh_port != 22:
-        environment = _system_ssh_environment(args)
-        return _select_connection_from_environment(args, environment), environment.command
-
-    system_environment: SshClientEnvironment | None = None
-    system_error: LauncherError | None = None
-    try:
-        system_environment = _system_ssh_environment(args)
-    except LauncherError as exc:
-        system_error = exc
-    wsl_environment: SshClientEnvironment | None = None
-    wsl_error: LauncherError | None = None
-    try:
-        wsl_environment = _wsl_ssh_environment(args)
-    except LauncherError as exc:
-        wsl_error = exc
-
-    if args.ssh_alias:
-        alias = validate_ssh_alias(args.ssh_alias)
-        for environment in (system_environment, wsl_environment):
-            if environment is not None and any(item.alias == alias for item in environment.profiles):
-                connection = _connection_with_config(args, environment)
-                print(f"Using {environment.label} for SSH alias {alias}.", flush=True)
-                return connection, environment.command
-        # Match and CanonicalizeHost rules need not appear as literal Host entries.
-        if system_environment is not None:
-            return _connection_with_config(args, system_environment), system_environment.command
-        if wsl_environment is not None:
-            return _connection_with_config(args, wsl_environment), wsl_environment.command
-
-    environments = [item for item in (system_environment, wsl_environment) if item is not None]
-    owners: dict[str, SshClientEnvironment] = {}
-    profiles: dict[str, SshHostProfile] = {}
-    for environment in environments:
-        for profile in environment.profiles:
-            if profile.alias not in profiles:
-                profiles[profile.alias] = profile
-                owners[profile.alias] = environment
-    if profiles:
-        preferences_path = Path(args.preferences_file).expanduser() if args.preferences_file else None
-        last_alias = None if args.no_remember else load_last_ssh_alias(preferences_path)
-        alias = select_ssh_alias(
-            tuple(sorted(profiles.values(), key=lambda item: item.alias.casefold())),
-            last_alias=last_alias,
-            interactive=not args.non_interactive and sys.stdin.isatty(),
-        )
-        args.ssh_alias = alias
-        if not args.no_remember:
-            save_last_ssh_alias(alias, preferences_path)
-        environment = owners[alias]
-        print(f"Using {environment.label} for SSH alias {alias}.", flush=True)
-        return _connection_with_config(args, environment), environment.command
-
-    details = "; ".join(str(error) for error in (system_error, wsl_error) if error is not None)
-    raise LauncherError(
-        "no literal Host aliases were found in the Windows or WSL SSH configs"
-        + (f": {details}" if details else "")
+    services = SshResolutionServices(
+        system_environment=_system_ssh_environment,
+        wsl_environment=_wsl_ssh_environment,
+        wsl_command=_wsl_ssh_command,
+        resolve_connection=resolve_ssh_connection,
+        connection_with_config=_connection_with_config,
+        select_from_environment=_select_connection_from_environment,
+        validate_alias=validate_ssh_alias,
+        select_alias=select_ssh_alias,
+        load_last_alias=load_last_ssh_alias,
+        save_last_alias=save_last_ssh_alias,
     )
+    if os.name == "nt":
+        return windows_platform.resolve_launcher_ssh(args, services)
+    if sys.platform == "darwin":
+        return macos_platform.resolve_launcher_ssh(args, services)
+    return posix_platform.resolve_launcher_ssh(args, services)
 
 
 def validate_branch(value: str) -> str:

@@ -57,7 +57,11 @@ uv run pytest \
   tests/release/test_launcher_distribution.py \
   tests/release/test_online_installer.py
 uv run python scripts/release/build_launcher_distribution.py \
-  --output dist/openevo-launcher.tar.gz
+  --platform macos \
+  --output dist/evolab-launcher-macos.tar.gz
+uv run python scripts/release/build_launcher_distribution.py \
+  --platform windows \
+  --output dist/evolab-launcher-windows.zip
 ```
 
 Extract the result into a clean directory, run the following commands, and
@@ -72,8 +76,10 @@ The online bootstrap is tested against a local HTTP release fixture, including
 checksum rejection. To publish a real release, update `project.version`, commit
 the exact tree, and push the matching `v<version>` tag. The
 `openevo-launcher-release.yml` workflow refuses mismatched tags and existing
-GitHub Releases. It installs the same archive on clean Windows, macOS, and Ubuntu runners, then
-publishes exactly one custom asset named `evolab-launcher.zip`. The
+GitHub Releases. It installs the target archive on clean Windows and macOS
+runners, smoke-tests the POSIX archive on Ubuntu, then publishes exactly two
+custom assets named `evolab-launcher-windows.zip` and
+`evolab-launcher-macos.tar.gz`. The
 Release body is rendered from the fixed first-install guide plus GitHub's
 generated changelog.
 

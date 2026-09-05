@@ -86,6 +86,34 @@ def test_windows_auto_uses_wsl_client_for_alias_owned_by_wsl(
     assert command == ("wsl.exe", "-d", "Ubuntu", "--", "ssh")
 
 
+def test_macos_uses_only_native_system_openssh(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    args = remote_launcher.parse_args(
+        ["--ssh-alias", "mac-lab", "--ssh-client", "auto", "--no-remember"]
+    )
+    native = remote_launcher.SshClientEnvironment(
+        command="/usr/bin/ssh",
+        profiles=(),
+        config_path=tmp_path / "config",
+        label="system OpenSSH",
+    )
+    monkeypatch.setattr(remote_launcher.os, "name", "posix")
+    monkeypatch.setattr(remote_launcher.sys, "platform", "darwin")
+    monkeypatch.setattr(remote_launcher, "_system_ssh_environment", lambda _: native)
+    monkeypatch.setattr(
+        remote_launcher,
+        "_wsl_ssh_environment",
+        lambda _: pytest.fail("macOS must not inspect WSL"),
+    )
+
+    connection, command = remote_launcher.resolve_launcher_ssh(args)
+
+    assert connection.destination == "mac-lab"
+    assert command == "/usr/bin/ssh"
+
+
 def test_explicit_wsl_alias_does_not_open_or_translate_the_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

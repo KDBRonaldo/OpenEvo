@@ -1,12 +1,13 @@
-# EvoLab {{VERSION}} for Windows, macOS, Linux, and WSL
+# EvoLab {{VERSION}} for Windows and macOS
 
-> **Supported local platforms:** native Windows PowerShell, macOS, Linux, and WSL. Every platform uses the same ZIP package.
+> **Supported local platforms:** native Windows PowerShell and macOS use separate platform packages. The macOS POSIX installer is also smoke-tested on Linux and WSL.
 
 ## Download this file
 
-Under **Assets**, download exactly:
+Under **Assets**, download the file for your client:
 
-**`evolab-launcher.zip`**
+- Windows: **`evolab-launcher-windows.zip`**
+- macOS: **`evolab-launcher-macos.tar.gz`**
 
 Do not download GitHub's automatically generated **Source code (zip)** or **Source code (tar.gz)** files. Those are repository snapshots, not the EvoLab launcher package.
 
@@ -51,10 +52,10 @@ exit
 
 ## 4. Install and run EvoLab
 
-From the directory where the ZIP was downloaded:
+On macOS, from the download directory:
 
 ```bash
-unzip evolab-launcher.zip
+tar -xzf evolab-launcher-macos.tar.gz
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
@@ -62,7 +63,7 @@ sh evolab-launcher/install.sh
 On native Windows PowerShell instead run:
 
 ```powershell
-Expand-Archive .\evolab-launcher.zip -DestinationPath . -Force
+Expand-Archive .\evolab-launcher-windows.zip -DestinationPath . -Force
 powershell -ExecutionPolicy Bypass -File .\evolab-launcher\install.ps1
 evolab webui
 ```

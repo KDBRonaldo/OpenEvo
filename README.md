@@ -16,8 +16,9 @@ service, and managed deployment stack have been removed from the experimental
 
 ## Install without the repository
 
-The current installable pre-release supports native Windows PowerShell, macOS,
-Linux, and WSL with one shared package. Download `evolab-launcher.zip` from the matching GitHub Release. Do not download
+The current installable pre-release has separate native Windows and macOS
+packages. Download `evolab-launcher-windows.zip` or
+`evolab-launcher-macos.tar.gz` from the matching GitHub Release. Do not download
 GitHub's automatically generated source-code archives; they are repository
 snapshots, not EvoLab installers.
 
@@ -27,7 +28,7 @@ passwordless `sudo` and a supported package manager (`apt-get`, `dnf`, `yum`,
 or `apk`); EvoLab installs missing server tools itself. Then install the downloaded archive:
 
 ```bash
-unzip evolab-launcher.zip
+tar -xzf evolab-launcher-macos.tar.gz
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```
@@ -55,7 +56,11 @@ can build the deterministic macOS archive from an exact commit:
 
 ```bash
 uv run python scripts/release/build_launcher_distribution.py \
-  --output dist/evolab-launcher.zip
+  --platform macos \
+  --output dist/evolab-launcher-macos.tar.gz
+uv run python scripts/release/build_launcher_distribution.py \
+  --platform windows \
+  --output dist/evolab-launcher-windows.zip
 ```
 
 The archive contains a standard-library Python launcher and the matching
@@ -67,8 +72,9 @@ active launcher receipt. The installer refuses to overwrite an unrelated
 
 Pushing a tag that exactly matches `v<pyproject version>` runs the launcher
 release workflow. It verifies the committed WebUI and release tests, then
-installs the same archive on clean Windows, macOS, and Ubuntu runners. It publishes exactly one custom
-asset, `evolab-launcher.zip`, after those smoke tests pass. The
+installs each platform archive on clean Windows and macOS runners, with an
+additional POSIX smoke test on Ubuntu. It publishes exactly two custom assets,
+`evolab-launcher-windows.zip` and `evolab-launcher-macos.tar.gz`, after those smoke tests pass. The
 Release body combines a fixed first-install guide with GitHub's generated
 changelog. GitHub still displays its two automatic source-code links, which
 cannot be removed from a tag release.

@@ -12,13 +12,14 @@ Requirements on the user's computer:
 - OpenSSH on the local OS, or OpenSSH in WSL on Windows;
 - a literal host alias in the native or WSL `~/.ssh/config`.
 
-Download `evolab-launcher.zip` from the matching GitHub Release. The same
-package is tested on Windows, macOS, and Linux. Do not
+Download `evolab-launcher-windows.zip` on native Windows or
+`evolab-launcher-macos.tar.gz` on macOS. The POSIX installer is also tested on
+Linux and WSL. Do not
 download GitHub's `Source code (zip)` or `Source code (tar.gz)` links; those are
 repository snapshots rather than the installer. Install the archive with:
 
 ```bash
-unzip evolab-launcher.zip
+tar -xzf evolab-launcher-macos.tar.gz
 sh evolab-launcher/install.sh
 ~/.local/bin/evolab webui
 ```

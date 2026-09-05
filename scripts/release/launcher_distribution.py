@@ -28,6 +28,8 @@ from openevo.release_bundle import (
 LAUNCHER_DISTRIBUTION_SCHEMA_VERSION = "1"
 LAUNCHER_DISTRIBUTION_ROOT = "evolab-launcher"
 LAUNCHER_DISTRIBUTION_SUFFIXES = (".tar.gz", ".zip")
+LAUNCHER_TARGET_PLATFORMS = frozenset({"universal", "windows", "macos"})
+LAUNCHER_PLATFORM_SUFFIX = {"windows": ".zip", "macos": ".tar.gz"}
 MAX_DISTRIBUTION_FILE_BYTES = 512 * 1024 * 1024
 MAX_DISTRIBUTION_BYTES = 600 * 1024 * 1024
 REQUIRED_DISTRIBUTION_FILES = frozenset(
@@ -44,6 +46,11 @@ LAUNCHER_SOURCE_PATHS = (
     "src/openevo/__init__.py",
     "src/openevo/cli.py",
     "src/openevo/launcher.py",
+    "src/openevo/launcher_platforms/__init__.py",
+    "src/openevo/launcher_platforms/common.py",
+    "src/openevo/launcher_platforms/macos.py",
+    "src/openevo/launcher_platforms/posix.py",
+    "src/openevo/launcher_platforms/windows.py",
     "src/openevo/release_bundle.py",
 )
 MANAGED_WRAPPER_MARKER = "# managed by EvoLab launcher installer"
@@ -135,8 +142,15 @@ def _build_launcher_zipapp(repository_root: Path, commit: str) -> bytes:
     return output.getvalue()
 
 
-def _installer_readme(version: str) -> bytes:
+def _installer_readme(version: str, target_platform: str) -> bytes:
+    platform_note = {
+        "windows": "This archive targets native Windows PowerShell.",
+        "macos": "This archive targets native macOS.",
+        "universal": "This archive supports Windows, macOS, Linux, and WSL.",
+    }[target_platform]
     return f"""EvoLab launcher {version}
+
+{platform_note}
 
 Requirements on this computer:
 - Python 3.11 or newer
@@ -652,10 +666,16 @@ def build_launcher_distribution(
     output_path: Path,
     *,
     commit: str = "HEAD",
+    target_platform: str = "universal",
 ) -> LauncherDistributionReceipt:
-    """Build one deterministic ordinary-user archive from an exact commit."""
+    """Build one deterministic platform-targeted archive from an exact commit."""
 
     root = repository_root.resolve()
+    if target_platform not in LAUNCHER_TARGET_PLATFORMS:
+        raise LauncherDistributionError(
+            "launcher target platform must be one of "
+            + ", ".join(sorted(LAUNCHER_TARGET_PLATFORMS))
+        )
     resolved_commit = _git(root, "rev-parse", f"{commit}^{{commit}}")
     assert isinstance(resolved_commit, str)
     resolved_commit = resolved_commit.strip()
@@ -671,6 +691,11 @@ def build_launcher_distribution(
             "launcher distribution output must end with "
             + " or ".join(LAUNCHER_DISTRIBUTION_SUFFIXES)
         )
+    required_suffix = LAUNCHER_PLATFORM_SUFFIX.get(target_platform)
+    if required_suffix is not None and archive_kind != required_suffix:
+        raise LauncherDistributionError(
+            f"{target_platform} launcher output must end with {required_suffix}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="openevo-launcher-build-") as temporary_name:
@@ -682,7 +707,7 @@ def build_launcher_distribution(
             raise LauncherDistributionError(f"server release build failed: {exc}") from exc
         payload: dict[str, bytes] = {
             "LICENSE": _git_file(root, resolved_commit, "LICENSE"),
-            "README.txt": _installer_readme(server.product_version),
+            "README.txt": _installer_readme(server.product_version, target_platform),
             "install.ps1": INSTALLER_POWERSHELL.encode("utf-8"),
             "install.sh": INSTALLER_SCRIPT.encode("utf-8"),
             "openevo.pyz": _build_launcher_zipapp(root, resolved_commit),

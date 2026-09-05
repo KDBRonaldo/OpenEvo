@@ -73,20 +73,27 @@ jobs:
             tests/release/test_release_notes.py \
             -q
 
-      - name: Build the launcher ZIP
+      - name: Build platform launchers
         run: |
           set -euo pipefail
           mkdir -p dist
           python scripts/release/build_launcher_distribution.py \
             --commit HEAD \
-            --output dist/evolab-launcher.zip
+            --platform windows \
+            --output dist/evolab-launcher-windows.zip
+          python scripts/release/build_launcher_distribution.py \
+            --commit HEAD \
+            --platform macos \
+            --output dist/evolab-launcher-macos.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
           name: evolab-${{ github.ref_name }}-launcher
           if-no-files-found: error
           retention-days: 7
-          path: dist/evolab-launcher.zip
+          path: |
+            dist/evolab-launcher-windows.zip
+            dist/evolab-launcher-macos.tar.gz
 
   macos-install-smoke:
     name: Install and launch help on macOS
@@ -109,7 +116,7 @@ jobs:
           package_root="$RUNNER_TEMP/evolab-package"
           prefix="$RUNNER_TEMP/evolab-installed"
           mkdir -p "$package_root"
-          unzip -q evolab-launcher.zip -d "$package_root"
+          tar -xzf evolab-launcher-macos.tar.gz -C "$package_root"
           sh "$package_root/evolab-launcher/install.sh" \
             --prefix "$prefix"
           "$prefix/bin/evolab" webui --help
@@ -128,14 +135,14 @@ jobs:
         with:
           name: evolab-${{ github.ref_name }}-launcher
 
-      - name: Install the same package on Linux
+      - name: Smoke-test the POSIX package on Linux
         shell: bash
         run: |
           set -euo pipefail
           package_root="$RUNNER_TEMP/evolab-package"
           prefix="$RUNNER_TEMP/evolab-installed"
           mkdir -p "$package_root"
-          unzip -q evolab-launcher.zip -d "$package_root"
+          tar -xzf evolab-launcher-macos.tar.gz -C "$package_root"
           sh "$package_root/evolab-launcher/install.sh" \
             --prefix "$prefix"
           "$prefix/bin/evolab" webui --help
@@ -154,13 +161,13 @@ jobs:
         with:
           name: evolab-${{ github.ref_name }}-launcher
 
-      - name: Install the same package with PowerShell
+      - name: Install the Windows package with PowerShell
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $packageRoot = Join-Path $env:RUNNER_TEMP "evolab-package"
           $prefix = Join-Path $env:RUNNER_TEMP "evolab-installed"
-          Expand-Archive -LiteralPath "evolab-launcher.zip" -DestinationPath $packageRoot
+          Expand-Archive -LiteralPath "evolab-launcher-windows.zip" -DestinationPath $packageRoot
           & (Join-Path $packageRoot "evolab-launcher\install.ps1") `
             -Prefix $prefix `
             -NoPathUpdate
@@ -198,7 +205,8 @@ jobs:
             --changelog "$RUNNER_TEMP/generated-notes.md" \
             --output "$RUNNER_TEMP/release-notes.md"
           gh release create "$GITHUB_REF_NAME" \
-            evolab-launcher.zip \
+            evolab-launcher-windows.zip \
+            evolab-launcher-macos.tar.gz \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --prerelease \
