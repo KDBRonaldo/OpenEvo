@@ -782,6 +782,80 @@ def test_tunnel_enables_keepalive_so_dead_forwarding_does_not_hang(
     assert "TCPKeepAlive=yes" in command
 
 
+def test_self_hosted_tunnel_reconnects_after_transient_ssh_reset(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class ResetTunnel:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is None
+            return 255
+
+        def poll(self) -> int:
+            return 255
+
+    class RestoredTunnel:
+        def wait(self, timeout: float | None = None) -> int:
+            if timeout is None:
+                raise KeyboardInterrupt
+            return 0
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+    restored = RestoredTunnel()
+    starts: list[tuple[object, ...]] = []
+    health_checks: list[int] = []
+    monkeypatch.setattr(remote_launcher.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        remote_launcher,
+        "_start_tunnel",
+        lambda *args: starts.append(args) or restored,
+    )
+    monkeypatch.setattr(
+        remote_launcher,
+        "_wait_for_local_webui",
+        lambda port: health_checks.append(port),
+    )
+    connection = remote_launcher.SshConnection((), "server", "server")
+
+    result = remote_launcher._maintain_self_hosted_tunnel(
+        "ssh", connection, 8765, 8788, ResetTunnel()  # type: ignore[arg-type]
+    )
+
+    assert result == 0
+    assert starts == [("ssh", connection, 8765, 8788)]
+    assert health_checks == [8765]
+    assert "SSH tunnel restored" in capsys.readouterr().out
+
+
+def test_self_hosted_tunnel_stops_after_bounded_reconnect_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResetTunnel:
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is None
+            return 255
+
+        def poll(self) -> int:
+            return 255
+
+    def unavailable(*_args: object) -> None:
+        raise remote_launcher.LauncherError("network unavailable")
+
+    monkeypatch.setattr(remote_launcher.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(remote_launcher, "_start_tunnel", unavailable)
+    connection = remote_launcher.SshConnection((), "server", "server")
+
+    with pytest.raises(remote_launcher.LauncherError, match="after 8 attempts"):
+        remote_launcher._maintain_self_hosted_tunnel(
+            "ssh", connection, 8765, 8788, ResetTunnel()  # type: ignore[arg-type]
+        )
+
+
 def test_local_webui_health_check_never_uses_environment_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

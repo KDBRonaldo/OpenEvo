@@ -65,6 +65,9 @@ REMOTE_COMMAND_TIMEOUT_SECONDS = 1200
 REMOTE_HOST_SETUP_TIMEOUT_SECONDS = 3600
 SOURCE_TRANSFER_TIMEOUT_SECONDS = 180
 LOOPBACK_HEALTH_REQUEST_TIMEOUT_SECONDS = 3
+TUNNEL_RECONNECT_ATTEMPTS = 8
+TUNNEL_STABLE_SECONDS = 60
+TUNNEL_RECONNECT_MAX_DELAY_SECONDS = 10
 CODEX_INSTALL_URL = "https://chatgpt.com/codex/install.sh"
 CODEX_DEVICE_AUTH_URL = "https://auth.openai.com/codex/device"
 SSH_CONFIG_MAX_INCLUDE_DEPTH = 8
@@ -2298,6 +2301,70 @@ def _wait_for_local_webui(local_port: int) -> None:
     raise LauncherError(f"local EvoLab WebUI health check failed: {last_error}")
 
 
+def _maintain_self_hosted_tunnel(
+    ssh_binary: SshCommand,
+    connection: SshConnection,
+    local_port: int,
+    remote_port: int,
+    initial_tunnel: subprocess.Popen[str],
+) -> int:
+    """Keep the browser tunnel available across bounded transient SSH failures."""
+
+    tunnel = initial_tunnel
+    consecutive_failures = 0
+    connected_at = time.monotonic()
+    try:
+        while True:
+            try:
+                returncode = tunnel.wait()
+            except KeyboardInterrupt:
+                return 0
+
+            connected_for = time.monotonic() - connected_at
+            if connected_for >= TUNNEL_STABLE_SECONDS:
+                consecutive_failures = 0
+            consecutive_failures += 1
+            if consecutive_failures > TUNNEL_RECONNECT_ATTEMPTS:
+                raise LauncherError(
+                    "SSH tunnel could not be restored after "
+                    f"{TUNNEL_RECONNECT_ATTEMPTS} attempts; the remote EvoLab services "
+                    "remain running. Check the network, then run the same command again."
+                )
+
+            delay = min(
+                2 ** (consecutive_failures - 1),
+                TUNNEL_RECONNECT_MAX_DELAY_SECONDS,
+            )
+            print(
+                f"SSH tunnel stopped unexpectedly (exit code {returncode}). "
+                f"Reconnecting in {delay}s "
+                f"({consecutive_failures}/{TUNNEL_RECONNECT_ATTEMPTS})...",
+                flush=True,
+            )
+            time.sleep(delay)
+
+            try:
+                tunnel = _start_tunnel(
+                    ssh_binary,
+                    connection,
+                    local_port,
+                    remote_port,
+                )
+                _wait_for_local_webui(local_port)
+            except LauncherError as exc:
+                _stop_process(tunnel)
+                print(f"SSH tunnel reconnect failed: {exc}", flush=True)
+                continue
+
+            connected_at = time.monotonic()
+            print(
+                "SSH tunnel restored; the open EvoLab browser page can continue.",
+                flush=True,
+            )
+    finally:
+        _stop_process(tunnel)
+
+
 def open_browser(url: str) -> bool:
     """Best-effort browser opening; the printed URL remains the reliable fallback."""
 
@@ -2922,10 +2989,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.no_open and not open_browser(browser_url):
                 print("The browser could not be opened automatically; use the URL above.")
             print("Keep this launcher running; press Ctrl+C to close the local tunnel.")
-            try:
-                return tunnel.wait()
-            except KeyboardInterrupt:
-                return 0
+            maintained_tunnel = tunnel
+            tunnel = None
+            return _maintain_self_hosted_tunnel(
+                ssh_binary,
+                connection,
+                args.local_port,
+                args.remote_web_port,
+                maintained_tunnel,
+            )
 
         _wait_for_local_health(args.local_port, token)
         npm_binary = shutil.which("npm.cmd") or shutil.which("npm")
