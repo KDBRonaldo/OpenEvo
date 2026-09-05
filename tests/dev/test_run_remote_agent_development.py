@@ -86,6 +86,34 @@ def test_windows_auto_uses_wsl_client_for_alias_owned_by_wsl(
     assert command == ("wsl.exe", "-d", "Ubuntu", "--", "ssh")
 
 
+def test_explicit_wsl_alias_does_not_open_or_translate_the_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    args = remote_launcher.parse_args(
+        [
+            "--ssh-client",
+            "wsl",
+            "--wsl-distribution",
+            "Ubuntu",
+            "--ssh-alias",
+            "openevo-lab",
+        ]
+    )
+    monkeypatch.setattr(remote_launcher.os, "name", "nt")
+    monkeypatch.setattr(remote_launcher.shutil, "which", lambda _: "wsl.exe")
+    monkeypatch.setattr(
+        remote_launcher,
+        "_wsl_config_windows_path",
+        lambda *_: pytest.fail("an explicit WSL alias must stay inside WSL"),
+    )
+
+    connection, command = remote_launcher.resolve_launcher_ssh(args)
+
+    assert connection.destination == "openevo-lab"
+    assert connection.options == ()
+    assert command == ("wsl.exe", "-d", "Ubuntu", "--", "ssh")
+
+
 def test_wsl_ssh_command_prefix_wraps_remote_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

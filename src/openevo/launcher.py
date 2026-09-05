@@ -403,15 +403,12 @@ def _system_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
 
 
 def _wsl_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
-    wsl_binary = shutil.which("wsl.exe") or shutil.which("wsl")
-    if not wsl_binary:
-        raise LauncherError("wsl.exe was not found; install WSL or use --ssh-client system")
-    distribution = _resolve_wsl_distribution(wsl_binary, args.wsl_distribution)
-    config_path = _wsl_config_windows_path(wsl_binary, distribution, args.ssh_config)
+    command, distribution = _wsl_ssh_command(args)
+    config_path = _wsl_config_windows_path(command[0], distribution, args.ssh_config)
     config_home = config_path.parent.parent
     filesystem_root = Path(config_path.anchor)
     return SshClientEnvironment(
-        command=(wsl_binary, "-d", distribution, "--", "ssh"),
+        command=command,
         profiles=discover_ssh_hosts(
             config_path,
             config_home=config_home,
@@ -420,6 +417,16 @@ def _wsl_ssh_environment(args: argparse.Namespace) -> SshClientEnvironment:
         config_path=config_path,
         label=f"OpenSSH in WSL {distribution}",
     )
+
+
+def _wsl_ssh_command(args: argparse.Namespace) -> tuple[tuple[str, ...], str]:
+    """Resolve WSL OpenSSH without opening or translating its config file."""
+
+    wsl_binary = shutil.which("wsl.exe") or shutil.which("wsl")
+    if not wsl_binary:
+        raise LauncherError("wsl.exe was not found; install WSL or use --ssh-client system")
+    distribution = _resolve_wsl_distribution(wsl_binary, args.wsl_distribution)
+    return (wsl_binary, "-d", distribution, "--", "ssh"), distribution
 
 
 def load_last_ssh_alias(preferences_path: Path | None = None) -> str | None:
@@ -609,6 +616,17 @@ def resolve_launcher_ssh(args: argparse.Namespace) -> tuple[SshConnection, SshCo
         environment = _system_ssh_environment(args)
         return _select_connection_from_environment(args, environment), environment.command
     if requested_client == "wsl":
+        if args.ssh_alias or args.host or args.user or args.ssh_port != 22:
+            command, distribution = _wsl_ssh_command(args)
+            connection = resolve_ssh_connection(args)
+            if args.ssh_config:
+                connection = SshConnection(
+                    options=("-F", args.ssh_config, *connection.options),
+                    destination=connection.destination,
+                    display_name=connection.display_name,
+                )
+            print(f"Using OpenSSH in WSL {distribution}.", flush=True)
+            return connection, command
         environment = _wsl_ssh_environment(args)
         return _select_connection_from_environment(args, environment), environment.command
 
