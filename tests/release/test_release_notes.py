@@ -22,7 +22,8 @@ def test_release_notes_make_the_supported_download_unambiguous() -> None:
     text = TEMPLATE.read_text(encoding="utf-8")
 
     assert "Supported local platforms" in text
-    assert "native Windows PowerShell, macOS, Linux, and WSL" in text
+    assert "native Windows PowerShell and macOS" in text
+    assert "Linux and WSL" in text
     assert "evolab-launcher-windows.zip" in text
     assert "evolab-launcher-macos.tar.gz" in text
     assert "Do not download" in text
